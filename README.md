@@ -1,6 +1,6 @@
 # chatgpt-exec-mcp
 
-An unofficial stdio [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for running shell commands, keeping long-lived PTY sessions, and recovering full output when a response is too large to return inline.
+An stdio MCP server for running shell commands
 
 The server is intentionally small: it provides execution primitives, not an approval layer or a sandbox.
 
@@ -84,10 +84,6 @@ The MCP layer does **not** provide:
 Those controls belong outside this process. A reasonable deployment runs the server as an unprivileged account with only the workspace, network access, and credentials the client actually needs.
 
 The server writes MCP JSON-RPC only to stdout; diagnostics go to stderr.
-
-## Packaging
-
-This repository is currently intended to be built from source rather than published as a crates.io package. `codex-utils-pty` is vendored as a local path dependency so the pinned upstream code and local output-capture fixes are reproducible.
 
 ## License
 
