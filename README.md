@@ -39,6 +39,10 @@ remaps builder paths out of runtime diagnostics:
 python3 scripts/build-standalone.py --output /tmp/chatgpt-exec-mcp
 ```
 
+Published Linux x86_64 binaries are built by GitHub Actions and carry GitHub
+artifact attestations. See [release verification](docs/releases.md) for checking
+the repository, workflow, and exact source commit before executing a download.
+
 Run the server over stdio:
 
 ```bash

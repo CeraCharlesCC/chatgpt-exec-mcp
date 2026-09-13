@@ -895,6 +895,24 @@ mod tests {
 
     #[test]
     fn restart_turns_active_artifact_into_retained_orphan() {
+        // Other unit tests fork shell processes. Between fork and exec those
+        // children temporarily retain a copy of our flock's open file
+        // description, even with CLOEXEC. Model a server restart in a process
+        // with no concurrent spawns so dropping the manager releases the lock.
+        const ISOLATED: &str = "OUTPUT_STORE_RESTART_TEST_CHILD";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "output_store::tests::restart_turns_active_artifact_into_retained_orphan",
+                    "--test-threads=1",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("outputs");
         let raw_path = {
