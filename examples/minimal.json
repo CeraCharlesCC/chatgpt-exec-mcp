@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "workspace": "..",
+  "shell": "/bin/bash",
+  "output_store_dir": "../.chatgpt-exec-outputs",
+  "child_env": { "inherit": [], "rules": [] }
+}

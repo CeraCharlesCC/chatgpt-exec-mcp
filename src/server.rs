@@ -106,12 +106,7 @@ impl ServerHandler for ExecMcpServer {
                 Implementation::new("chatgpt-exec-mcp", env!("CARGO_PKG_VERSION"))
                     .with_title("Exec MCP"),
             )
-            .with_instructions(
-                concat!(
-                    "Use exec_command for ordinary stateless commands and start_session only when state must persist. When a returned session only needs time to finish, prefer wait_for_exit; ordinary stdout/stderr does not wake that wait. Use write_stdin when input, interruption, or immediate output polling is needed. ",
-                    "Oversized output uses head/tail and an output_ref raw-log path.",
-                ),
-            )
+            .with_instructions(self.manager.instructions())
     }
 
     fn list_tools(

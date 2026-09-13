@@ -7,7 +7,8 @@ use chatgpt_exec_mcp::ProcessManager;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = Config::parse();
+    let cli = chatgpt_exec_mcp::config::Cli::parse();
+    let config = Config::load(&cli.config)?;
     let manager = ProcessManager::new(config)?;
     let reaper = manager.spawn_reaper();
     let service = ExecMcpServer::new(manager.clone());

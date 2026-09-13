@@ -68,33 +68,22 @@ pub struct ProcessManager {
 
 impl ProcessManager {
     pub fn new(mut config: Config) -> anyhow::Result<Arc<Self>> {
-        if config.output_cap_bytes == 0 {
-            bail!("output_cap_bytes must be greater than zero");
-        }
-        if config.max_explicit_sessions == 0 || config.max_exec_continuations == 0 {
-            bail!("session quotas must be greater than zero");
-        }
-        validate_directory(&config.workspace)
-            .with_context(|| format!("invalid workspace `{}`", config.workspace.display()))?;
+        config.validate_limits()?;
+        validate_directory(&config.workspace).context("invalid workspace")?;
+        config.workspace =
+            std::fs::canonicalize(&config.workspace).context("workspace canonicalize failed")?;
         if !config.shell.is_file() {
-            bail!(
-                "shell `{}` does not exist or is not a file",
-                config.shell.display()
-            );
+            bail!("shell must be a regular executable file");
         }
-        let output_store_dir = config
-            .output_store_dir
-            .clone()
-            .unwrap_or_else(|| config.workspace.join(".chatgpt-exec-outputs"));
-        config.output_store_dir = Some(output_store_dir.clone());
         let output_store_manager = OutputStoreManager::open(
-            &output_store_dir,
+            &config.output_store_dir,
             config.output_store_retention,
             config.output_store_min_retention,
             config.output_store_max_bytes,
             config.output_store_headroom_bytes,
             config.output_store_max_files,
-        )?;
+        )
+        .context("output_store_dir initialization failed")?;
         Ok(Arc::new(Self {
             config,
             output_store_manager,
@@ -102,6 +91,18 @@ impl ProcessManager {
             shutting_down: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         }))
+    }
+
+    pub(crate) fn instructions(&self) -> String {
+        let mut instructions = concat!(
+            "Use exec_command for ordinary stateless commands and start_session only when state must persist. When a returned session only needs time to finish, prefer wait_for_exit; ordinary stdout/stderr does not wake that wait. Use write_stdin when input, interruption, or immediate output polling is needed. ",
+            "Oversized output uses head/tail and an output_ref raw-log path.",
+        ).to_owned();
+        if let Some(extra) = &self.config.additional_instructions {
+            instructions.push_str("\n\n");
+            instructions.push_str(extra);
+        }
+        instructions
     }
 
     pub fn spawn_reaper(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -141,9 +142,12 @@ impl ProcessManager {
 
     pub async fn start_session(&self, args: StartSessionArgs) -> anyhow::Result<ExecResponse> {
         validate_output_tokens(args.max_output_tokens)?;
-        let command = args
-            .cmd
-            .unwrap_or_else(|| self.config.shell.to_string_lossy().into_owned());
+        let command = args.cmd.unwrap_or_else(|| {
+            format!(
+                "exec '{}'",
+                self.config.shell.to_string_lossy().replace('\'', "'\\''")
+            )
+        });
         if command.trim().is_empty() {
             bail!("cmd must not be empty");
         }
@@ -181,7 +185,7 @@ impl ProcessManager {
                 return Err(error.into());
             }
         };
-        let spawned = match self.spawn(&id, &command, &cwd, tty).await {
+        let spawned = match self.spawn(&id, origin, &command, &cwd, tty).await {
             Ok(spawned) => spawned,
             Err(error) => {
                 self.release_reservation(&id).await;
@@ -591,20 +595,23 @@ impl ProcessManager {
     async fn spawn(
         &self,
         id: &SessionId,
+        origin: SessionOrigin,
         command: &str,
         cwd: &Path,
         tty: bool,
     ) -> anyhow::Result<codex_utils_pty::SpawnedProcess> {
-        let mut environment: HashMap<String, String> = std::env::vars().collect();
+        let cwd = std::fs::canonicalize(cwd).context("workdir canonicalize failed before spawn")?;
+        validate_directory(&cwd).context("invalid spawn workdir")?;
+        let mut environment = self.config.child_env.for_spawn(origin, &cwd);
         environment.insert("CHATGPT_EXEC_SESSION".into(), id.to_string());
         let program = self.config.shell.to_string_lossy();
-        let arguments = vec!["-lc".to_owned(), command.to_owned()];
+        let arguments = vec!["-c".to_owned(), command.to_owned()];
         let arg0 = None;
         if tty {
             spawn_pty_process(
                 &program,
                 &arguments,
-                cwd,
+                &cwd,
                 &environment,
                 &arg0,
                 TerminalSize::default(),
@@ -612,14 +619,15 @@ impl ProcessManager {
             )
             .await
         } else {
-            spawn_pipe_process(&program, &arguments, cwd, &environment, &arg0, &[]).await
+            spawn_pipe_process(&program, &arguments, &cwd, &environment, &arg0, &[]).await
         }
         .with_context(|| format!("failed to spawn command in `{}`", cwd.display()))
     }
 
     fn resolve_workdir(&self, workdir: Option<&str>) -> anyhow::Result<PathBuf> {
         let path = match workdir {
-            None | Some("") => self.config.workspace.clone(),
+            None => self.config.workspace.clone(),
+            Some("") => bail!("workdir must not be empty"),
             Some(value) => {
                 let supplied = PathBuf::from(value);
                 if supplied.is_absolute() {
@@ -631,7 +639,7 @@ impl ProcessManager {
         };
         validate_directory(&path)
             .with_context(|| format!("invalid workdir `{}`", path.display()))?;
-        Ok(path)
+        std::fs::canonicalize(&path).context("workdir canonicalize failed")
     }
 
     async fn reserve(&self, origin: SessionOrigin) -> anyhow::Result<SessionId> {
@@ -820,12 +828,17 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_manager(workspace: &TempDir) -> Arc<ProcessManager> {
-        let config = Config {
-            workspace: workspace.path().to_owned(),
-            output_store_dir: Some(workspace.path().join("outputs")),
-            output_store_min_retention: Duration::from_secs(1),
-            ..Default::default()
-        };
+        let path = workspace.path().join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 1, "workspace": ".", "shell": "/bin/bash", "output_store_dir": "outputs",
+                "child_env": { "inherit": [], "rules": [] }, "output_store_min_retention": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
         ProcessManager::new(config).unwrap()
     }
 

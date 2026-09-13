@@ -12,22 +12,21 @@ use chatgpt_exec_mcp::tools::WriteStdinArgs;
 use tempfile::TempDir;
 
 fn test_config(workspace: &TempDir) -> Config {
-    Config {
-        workspace: workspace.path().to_owned(),
-        shell: "/bin/bash".into(),
-        max_explicit_sessions: 3,
-        max_exec_continuations: 3,
-        explicit_session_idle_timeout: Duration::from_secs(60),
-        exec_continuation_idle_timeout: Duration::from_secs(60),
-        reaper_interval: Duration::from_secs(30),
-        output_cap_bytes: 1_048_576,
-        output_store_dir: Some(workspace.path().join("outputs")),
-        output_store_retention: Duration::from_secs(60),
-        output_store_min_retention: Duration::from_secs(1),
-        output_store_max_bytes: 64 * 1024 * 1024,
-        output_store_headroom_bytes: 1024 * 1024,
-        output_store_max_files: 128,
-    }
+    let path = workspace.path().join("config.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "version": 1, "workspace": ".", "shell": "/bin/bash", "output_store_dir": "outputs",
+            "child_env": { "inherit": [], "rules": [] },
+            "explicit_session_idle_timeout": 60, "exec_continuation_idle_timeout": 60,
+            "output_store_retention": 60, "output_store_min_retention": 1,
+            "output_store_max_bytes": 67108864, "output_store_headroom_bytes": 1048576,
+            "output_store_max_files": 128
+        })
+        .to_string(),
+    )
+    .unwrap();
+    Config::load(&path).unwrap()
 }
 
 fn exec_args(cmd: &str) -> ExecCommandArgs {
@@ -611,8 +610,8 @@ async fn build_summary_is_opt_in_and_raw_recovery_survives_later_polls() {
 async fn idle_reaper_expires_and_kills_session() {
     let workspace = TempDir::new().unwrap();
     let mut config = test_config(&workspace);
-    config.explicit_session_idle_timeout = Duration::from_millis(30);
-    config.reaper_interval = Duration::from_millis(10);
+    config.explicit_session_idle_timeout = Duration::from_secs(1);
+    config.reaper_interval = Duration::from_secs(1);
     let manager = ProcessManager::new(config).unwrap();
     let started = manager
         .start_session(StartSessionArgs {
@@ -625,7 +624,7 @@ async fn idle_reaper_expires_and_kills_session() {
     let session_id = started.session_id.unwrap();
     let reaper = manager.spawn_reaper();
 
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::sleep(Duration::from_millis(2200)).await;
     let error = manager
         .write_stdin(write_args(&session_id, ""))
         .await
@@ -682,5 +681,63 @@ async fn explicit_and_continuation_quotas_are_separate() {
         .await
         .unwrap_err();
     assert!(second_explicit.to_string().contains("quota reached"));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn invalid_workdir_never_spawns_a_child() {
+    let workspace = TempDir::new().unwrap();
+    let manager = ProcessManager::new(test_config(&workspace)).unwrap();
+    for workdir in ["", "missing", "config.json"] {
+        for tty in [false, true] {
+            let mut args = exec_args("touch child-was-spawned");
+            args.workdir = Some(workdir.into());
+            args.tty = tty;
+            assert!(manager.exec_command(args).await.is_err());
+            assert!(
+                manager
+                    .start_session(StartSessionArgs {
+                        cmd: Some("touch child-was-spawned".into()),
+                        workdir: Some(workdir.into()),
+                        tty: Some(tty),
+                        ..Default::default()
+                    })
+                    .await
+                    .is_err()
+            );
+            assert!(!workspace.path().join("child-was-spawned").exists());
+        }
+    }
+    let good = manager
+        .exec_command(exec_args("printf valid"))
+        .await
+        .unwrap();
+    assert_eq!(good.output, "valid");
+    manager.shutdown_all().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn default_session_handles_an_executable_shell_path_with_spaces_and_quotes() {
+    let workspace = TempDir::new().unwrap();
+    let shell = workspace.path().join("shell with 'quotes'");
+    std::fs::copy("/bin/bash", &shell).unwrap();
+    let mut config = test_config(&workspace);
+    config.shell = shell.canonicalize().unwrap();
+    let manager = ProcessManager::new(config).unwrap();
+    let started = manager
+        .start_session(StartSessionArgs {
+            tty: Some(false),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let id = started.session_id.unwrap();
+    let result = manager
+        .write_stdin(write_args(&id, "printf quoted-shell; exit\n"))
+        .await
+        .unwrap();
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.output, "quoted-shell");
     manager.shutdown_all().await;
 }

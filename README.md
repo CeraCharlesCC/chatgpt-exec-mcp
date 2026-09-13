@@ -5,7 +5,7 @@ An stdio MCP server for running shell commands
 The server is intentionally small: it provides execution primitives, not an approval layer or a sandbox.
 
 > [!WARNING]
-> This server can execute arbitrary commands with the permissions and inherited environment of the server process. `--workspace` is a base directory for relative paths, **not** a security boundary; callers may use absolute paths, `..`, or shell commands that change directory. Run it only for trusted clients and put it inside an OS/container sandbox if you need filesystem, network, credential, or process isolation.
+> This server can execute arbitrary commands with the permissions of the server process and configured child environment. `workspace` is a base directory for relative paths, **not** a security boundary; callers may use absolute paths, `..`, or shell commands that change directory. Run it only for trusted clients and put it inside an OS/container sandbox if you need filesystem, network, credential, or process isolation.
 
 This project is not an official OpenAI or ChatGPT component. It vendors a small Apache-2.0-licensed PTY utility from OpenAI Codex; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
@@ -31,13 +31,21 @@ cargo build --release --locked
 cargo test --all-targets --locked
 ```
 
+For a distributable standalone binary, use the fixed offline build recipe after
+fetching the locked dependencies. It builds in an isolated target directory and
+remaps builder paths out of runtime diagnostics:
+
+```bash
+python3 scripts/build-standalone.py --output /tmp/chatgpt-exec-mcp
+```
+
 Run the server over stdio:
 
 ```bash
-./target/release/chatgpt-exec-mcp --workspace /path/to/workspace
+./target/release/chatgpt-exec-mcp --config examples/minimal.json
 ```
 
-The default workspace is the server's current directory. The default shell is `/bin/bash`. Run `chatgpt-exec-mcp --help` for session limits, output-store limits, retention settings, and environment-variable overrides.
+Versioned JSON configuration is required. Workspace, shell, output directory and child environment policy are explicit; see [configuration version 1](docs/configuration.md) for defaults, validation and the breaking changes from the old CLI.
 
 A typical stdio MCP client configuration has this shape (the exact configuration format depends on the client):
 
@@ -46,7 +54,7 @@ A typical stdio MCP client configuration has this shape (the exact configuration
   "mcpServers": {
     "exec": {
       "command": "/absolute/path/to/chatgpt-exec-mcp",
-      "args": ["--workspace", "/path/to/workspace"]
+      "args": ["--config", "/absolute/path/to/config.json"]
     }
   }
 }
@@ -54,11 +62,11 @@ A typical stdio MCP client configuration has this shape (the exact configuration
 
 ## Execution behavior
 
-`exec_command` invokes the configured shell with `-lc`. It waits up to 10 seconds by default; if the command is still running, the response includes a `session_id` that can be passed to `wait_for_exit` or `write_stdin`.
+`exec_command` invokes the configured shell with `-c` (without login profiles). It waits up to 10 seconds by default; if the command is still running, the response includes a `session_id` that can be passed to `wait_for_exit` or `write_stdin`.
 
 Use `start_session` when state must persist between calls, such as an interactive shell or REPL. Use `wait_for_exit` when a process only needs more time. Use `write_stdin` for input, Ctrl-C, or output polling.
 
-Child processes inherit the server environment, with `CHATGPT_EXEC_SESSION` added for the running session. The generic server does not inject credentials or build-tool-specific environment defaults.
+Child processes receive only the configured `child_env` allowlist and matching conditional rules, plus `CHATGPT_EXEC_SESSION`. Both pipe and PTY clear inherited environment. Credential values and host-specific runtime defaults belong in the deployment layer.
 
 ## Output behavior
 
@@ -68,7 +76,7 @@ The ordinary implicit display budget is approximately 8,000 tokens; recognized `
 
 For recognized builds, the projection can additionally preserve a few buried summary lines such as Cargo completion/test summaries or Gradle build status. Unknown or ambiguous shell commands use the generic output policy.
 
-Raw output can contain secrets printed by child processes. By default artifacts live under `.chatgpt-exec-outputs` in the workspace and are retained subject to the configured time, byte, and file-count limits. Treat that directory as sensitive data.
+Raw output can contain secrets printed by child processes. Artifacts live in the required `output_store_dir` and are retained subject to the configured time, byte, and file-count limits. Treat that directory as sensitive data.
 
 ## Security model
 
@@ -77,7 +85,6 @@ The MCP layer does **not** provide:
 - command approval or allowlisting;
 - filesystem confinement;
 - network isolation;
-- environment-variable filtering;
 - per-command containers or namespaces;
 - privilege dropping.
 

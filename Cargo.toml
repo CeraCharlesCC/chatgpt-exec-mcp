@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive"] }
 codex-utils-pty = { path = "vendor/codex-utils-pty" }
 rand = "0.9"
 libc = "0.2"
