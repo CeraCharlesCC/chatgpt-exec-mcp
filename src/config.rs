@@ -197,6 +197,9 @@ impl Config {
         }
         let workspace = canonical_directory(base, &raw.workspace, "workspace")?;
         let shell = canonical_path(base, &raw.shell, "shell")?;
+        shell
+            .to_str()
+            .context("shell canonical path must be UTF-8")?;
         if !shell.is_file() {
             bail!("shell must be a regular executable file");
         }
@@ -508,6 +511,32 @@ mod tests {
         for value in ["SECRET_SENTINEL", "allowed-original", "must-not-leak"] {
             assert!(!debug.contains(value));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_canonical_shell_is_rejected_before_spawn() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let shell = dir.path().join(std::ffi::OsString::from_vec(vec![255]));
+        std::fs::copy("/bin/bash", &shell).unwrap();
+        std::os::unix::fs::symlink(&shell, dir.path().join("shell-link")).unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            json!({
+                "version":1, "workspace":".", "shell":"shell-link", "output_store_dir":"outputs",
+                "child_env":{"inherit":[], "rules":[]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            Config::load_with_env(&path, &HashMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8")
+        );
     }
 
     #[cfg(unix)]
