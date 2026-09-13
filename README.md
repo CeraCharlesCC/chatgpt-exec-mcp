@@ -2,12 +2,7 @@
 
 An stdio MCP server for running shell commands
 
-The server is intentionally small: it provides execution primitives, not an approval layer or a sandbox.
-
-> [!WARNING]
-> This server can execute arbitrary commands with the permissions of the server process and configured child environment. `workspace` is a base directory for relative paths, **not** a security boundary; callers may use absolute paths, `..`, or shell commands that change directory. Run it only for trusted clients and put it inside an OS/container sandbox if you need filesystem, network, credential, or process isolation.
-
-This project is not an official OpenAI or ChatGPT component. It vendors a small Apache-2.0-licensed PTY utility from OpenAI Codex; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the vendored PTY utility.
 
 ## Tools
 
@@ -39,9 +34,7 @@ remaps builder paths out of runtime diagnostics:
 python3 scripts/build-standalone.py --output /tmp/chatgpt-exec-mcp
 ```
 
-Published Linux x86_64 binaries are built by GitHub Actions and carry GitHub
-artifact attestations. See [release verification](docs/releases.md) for checking
-the repository, workflow, and exact source commit before executing a download.
+Linux x86_64 binaries are available from [Releases](https://github.com/CeraCharlesCC/chatgpt-exec-mcp/releases). Optional provenance verification: `gh attestation verify <binary> --repo CeraCharlesCC/chatgpt-exec-mcp`.
 
 Run the server over stdio:
 
@@ -80,21 +73,9 @@ The ordinary implicit display budget is approximately 8,000 tokens; recognized `
 
 For recognized builds, the projection can additionally preserve a few buried summary lines such as Cargo completion/test summaries or Gradle build status. Unknown or ambiguous shell commands use the generic output policy.
 
-Raw output can contain secrets printed by child processes. Artifacts live in the required `output_store_dir` and are retained subject to the configured time, byte, and file-count limits. Treat that directory as sensitive data.
+Raw output is stored in `output_store_dir`, subject to the configured retention and capacity limits.
 
-## Security model
-
-The MCP layer does **not** provide:
-
-- command approval or allowlisting;
-- filesystem confinement;
-- network isolation;
-- per-command containers or namespaces;
-- privilege dropping.
-
-Those controls belong outside this process. A reasonable deployment runs the server as an unprivileged account with only the workspace, network access, and credentials the client actually needs.
-
-The server writes MCP JSON-RPC only to stdout; diagnostics go to stderr.
+The server writes MCP JSON-RPC to stdout and diagnostics to stderr.
 
 ## License
 
