@@ -87,7 +87,7 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
             "id": 1,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": "2026-07-28",
                 "capabilities": {},
                 "clientInfo": { "name": "integration-test", "version": "1" }
             }
@@ -98,6 +98,7 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         initialized["result"]["serverInfo"]["name"],
         "chatgpt-exec-mcp"
     );
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
     let instructions = initialized["result"]["instructions"].as_str().unwrap();
     assert!(instructions.contains("prefer wait_for_exit"));
     assert!(instructions.ends_with("Test workspace instructions."));
@@ -124,12 +125,18 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         names,
         [
             "exec_command",
+            "session_probe",
             "start_session",
             "wait_for_exit",
             "write_stdin"
         ]
     );
-    for tool in listed["result"]["tools"].as_array().unwrap() {
+    for tool in listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|tool| tool["name"] != "session_probe")
+    {
         let properties = tool["outputSchema"]["properties"].as_object().unwrap();
         assert!(properties.contains_key("call_wall_time_seconds"));
         assert!(!properties.contains_key("wall_time_seconds"));
@@ -166,6 +173,40 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
             ])
         );
     }
+    let probe_tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "session_probe")
+        .unwrap();
+    assert!(probe_tool["inputSchema"].is_object());
+    let probe_properties = probe_tool["outputSchema"]["properties"]
+        .as_object()
+        .unwrap();
+    for field in [
+        "request_transport",
+        "mcp_session_id",
+        "protocol_version",
+        "client_name",
+        "client_version",
+    ] {
+        assert!(
+            probe_properties.contains_key(field),
+            "missing probe field {field}"
+        );
+    }
+    let probe = request(
+        &mut stdin,
+        &mut stdout,
+        json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "session_probe", "arguments": {} } }),
+    )
+    .await;
+    let probe = &probe["result"]["structuredContent"];
+    assert_eq!(probe["request_transport"], "non_http");
+    assert!(probe.get("mcp_session_id").is_none());
+    assert_eq!(probe["protocol_version"], "2025-11-25");
+    assert_eq!(probe["client_name"], "integration-test");
+    assert_eq!(probe["client_version"], "1");
     let wait_tool = listed["result"]["tools"]
         .as_array()
         .unwrap()

@@ -1,12 +1,12 @@
 # chatgpt-exec-mcp
 
-An stdio MCP server for running shell commands
+An MCP server for running shell commands over stdio or Streamable HTTP on a Unix socket.
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the vendored PTY utility.
 
 ## Tools
 
-The MCP server exposes four tools:
+The MCP server exposes five tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -14,6 +14,7 @@ The MCP server exposes four tools:
 | `start_session` | Start an explicitly stateful shell, REPL, or long-running process. Uses a PTY by default. |
 | `write_stdin` | Send input, send Ctrl-C, or immediately poll output from a running session. |
 | `wait_for_exit` | Wait for a running session to finish without waking on ordinary stdout/stderr activity. |
+| `session_probe` | Report the request transport, MCP session ID, negotiated protocol version, and client implementation for session-isolation diagnostics. |
 
 Session IDs are short memorable handles such as `amber-river`. The server enforces separate quotas and idle timeouts for explicit sessions and `exec_command` continuations.
 
@@ -41,6 +42,25 @@ Run the server over stdio:
 ```bash
 ./target/release/chatgpt-exec-mcp --config examples/minimal.json
 ```
+
+On Unix, run the same server over Streamable HTTP using a Unix-domain socket:
+
+```bash
+./target/release/chatgpt-exec-mcp \
+  --config examples/minimal.json \
+  --listen-unix /absolute/path/to/chatgpt-exec-mcp.sock
+```
+
+The Streamable HTTP endpoint is `/mcp`. This deployment intentionally pins negotiation to
+MCP `2025-11-25`: an incoming `initialize` that requests a later revision is normalized to
+`2025-11-25` before rmcp classifies the request, so the connection uses the legacy stateful
+Streamable HTTP lifecycle and receives an `Mcp-Session-Id`. `session_probe` exposes exactly
+what the handler sees, which makes it useful for checking whether two client conversations
+are actually routed as distinct MCP sessions.
+
+This experiment did not achieve conversation-level isolation in ChatGPT: in observed use,
+ChatGPT changed `Mcp-Session-Id` between calls even within the same conversation. The ID
+therefore could not serve as the stable per-conversation key the design required.
 
 Versioned JSON configuration is required. Workspace, shell, output directory and child environment policy are explicit; see [configuration version 1](docs/configuration.md) for defaults, validation and the breaking changes from the old CLI.
 
@@ -80,7 +100,8 @@ share one byte capacity limit. See [configuration](docs/configuration.md#optiona
 Tool argument validation uses rmcp’s standard `isError: true` tool results; unknown
 tool names return a JSON-RPC invalid-params error.
 
-The server writes MCP JSON-RPC to stdout and diagnostics to stderr.
+In stdio mode the server writes MCP JSON-RPC to stdout and diagnostics to stderr. In
+Streamable HTTP mode MCP traffic is served only through the configured Unix socket.
 
 ## License
 

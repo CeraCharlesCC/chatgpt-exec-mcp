@@ -237,6 +237,29 @@ pub struct ExecResponse {
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
+pub struct SessionProbeResponse {
+    /// Transport visible to this request. Streamable HTTP requests carry HTTP request parts.
+    pub request_transport: String,
+    /// MCP logical session ID. Absent for stdio and for sessionless protocol revisions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", default)]
+    pub mcp_session_id: Option<String>,
+    /// Protocol version negotiated for this request/session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", default)]
+    pub protocol_version: Option<String>,
+    /// MCP client implementation name reported by the peer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", default)]
+    pub client_name: Option<String>,
+    /// MCP client implementation version reported by the peer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", default)]
+    pub client_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", deny_unknown_fields, inline)]
 pub struct OutputRef {
     pub path: String,

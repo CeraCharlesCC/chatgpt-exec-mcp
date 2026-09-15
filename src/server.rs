@@ -1,16 +1,22 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::handler::server::{
     router::tool::ToolRouter, tool::schema_for_output, wrapper::Parameters,
 };
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+};
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
 use crate::process_manager::ProcessManager;
 use crate::tools::{
-    ExecCommandArgs, ExecResponse, StartSessionArgs, WaitForExitArgs, WriteStdinArgs,
+    ExecCommandArgs, ExecResponse, SessionProbeResponse, StartSessionArgs, WaitForExitArgs,
+    WriteStdinArgs,
 };
+
+const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2025_11_25];
 
 #[derive(Clone)]
 pub struct ExecMcpServer {
@@ -72,6 +78,44 @@ impl ExecMcpServer {
         }
     }
 
+    /// Report the MCP transport/session identity visible to this request. Useful for verifying that parallel client conversations are isolated.
+    #[tool(output_schema = schema_for_output::<SessionProbeResponse>())]
+    async fn session_probe(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let http_parts = context.extensions.get::<axum::http::request::Parts>();
+        let mcp_session_id = http_parts
+            .and_then(|parts| parts.headers.get("mcp-session-id"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let client = context.client_info();
+        let response = SessionProbeResponse {
+            request_transport: if http_parts.is_some() {
+                "streamable_http".to_owned()
+            } else {
+                "non_http".to_owned()
+            },
+            mcp_session_id,
+            protocol_version: context
+                .protocol_version()
+                .map(|version| version.to_string()),
+            client_name: client
+                .as_ref()
+                .map(|implementation| implementation.name.clone()),
+            client_version: client.map(|implementation| implementation.version),
+        };
+        let text = format!(
+            "transport={}; mcp_session_id={}; protocol_version={}; client={}@{}",
+            response.request_transport,
+            response.mcp_session_id.as_deref().unwrap_or("none"),
+            response.protocol_version.as_deref().unwrap_or("unknown"),
+            response.client_name.as_deref().unwrap_or("unknown"),
+            response.client_version.as_deref().unwrap_or("unknown"),
+        );
+        Self::structured_success(&response, text)
+    }
+
     fn respond(result: anyhow::Result<ExecResponse>) -> Result<CallToolResult, McpError> {
         match result {
             Ok(response) => Self::success(response),
@@ -80,9 +124,16 @@ impl ExecMcpServer {
     }
 
     fn success(response: ExecResponse) -> Result<CallToolResult, McpError> {
-        let structured = serde_json::to_value(&response)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let text = Self::response_summary(&response);
+        Self::structured_success(&response, text)
+    }
+
+    fn structured_success<T: serde::Serialize>(
+        response: &T,
+        text: String,
+    ) -> Result<CallToolResult, McpError> {
+        let structured = serde_json::to_value(response)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
         result.structured_content = Some(structured);
         Ok(result)
@@ -118,6 +169,10 @@ impl ExecMcpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ExecMcpServer {
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
