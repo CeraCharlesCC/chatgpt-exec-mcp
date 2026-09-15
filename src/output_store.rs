@@ -1,17 +1,12 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
-
-const META_VERSION: u32 = 1;
-const INSTANCE_LOCK_FILE: &str = ".instance.lock";
-const META_FILE: &str = "meta.json";
 const RAW_FILE: &str = "raw.log";
-const FILE_HEADROOM: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -45,14 +40,11 @@ pub struct OutputStoreManager {
 
 struct OutputStoreManagerInner {
     root: PathBuf,
-    instance_id: String,
     retention: Duration,
-    min_retention: Duration,
     max_bytes: u64,
-    headroom_bytes: u64,
-    max_files: usize,
     used_bytes: AtomicU64,
-    used_files: AtomicUsize,
+    // Serializes GC with creation/deletion and protects all live stores.
+    active: Mutex<HashSet<PathBuf>>,
     _instance_lock: File,
 }
 
@@ -60,71 +52,24 @@ pub struct OutputStore {
     manager: OutputStoreManager,
     dir: PathBuf,
     file: Option<File>,
-    meta: ArtifactMeta,
-    headroom_admitted: bool,
-    deleted: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ArtifactMeta {
-    version: u32,
-    artifact_id: String,
-    owner_instance: String,
-    state: ArtifactState,
-    created_at_unix_millis: u64,
-    sealed_at_unix_millis: Option<u64>,
     committed_bytes: u64,
-    retention_sticky: bool,
-    retention_reason: Option<String>,
-    retain_until_unix_millis: Option<u64>,
-    expires_at_unix_millis: Option<u64>,
+    published: bool,
+    finished: bool,
     incomplete_reason: Option<String>,
-    recovery_path_published: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ArtifactState {
-    Active,
-    Complete,
-    Incomplete,
-}
-
-#[derive(Debug)]
-struct GcCandidate {
-    dir: PathBuf,
-    bytes: u64,
-    sealed_at: u64,
-    retain_until: u64,
-    expires_at: u64,
 }
 
 impl OutputStoreManager {
-    pub fn open(
-        root: &Path,
-        retention: Duration,
-        min_retention: Duration,
-        max_bytes: u64,
-        headroom_bytes: u64,
-        max_files: usize,
-    ) -> io::Result<Self> {
-        if retention < min_retention {
+    pub fn open(root: &Path, retention: Duration, max_bytes: u64) -> io::Result<Self> {
+        if max_bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "output retention must be at least the minimum retention",
+                "output capacity must be positive",
             ));
         }
-        if max_bytes == 0 || max_files == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "output store capacity limits must be greater than zero",
-            ));
-        }
-
         fs::create_dir_all(root)?;
         set_directory_mode(root)?;
         let root = fs::canonicalize(root)?;
-        let lock_path = root.join(INSTANCE_LOCK_FILE);
+        let lock_path = root.join(".instance.lock");
         let instance_lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -133,321 +78,144 @@ impl OutputStoreManager {
             .open(&lock_path)?;
         set_file_mode(&lock_path)?;
         lock_instance(&instance_lock)?;
-
         let manager = Self {
             inner: Arc::new(OutputStoreManagerInner {
                 root,
-                instance_id: unique_id(),
                 retention,
-                min_retention,
                 max_bytes,
-                headroom_bytes,
-                max_files,
                 used_bytes: AtomicU64::new(0),
-                used_files: AtomicUsize::new(0),
+                active: Mutex::new(HashSet::new()),
                 _instance_lock: instance_lock,
             }),
         };
-        manager.reconcile_startup()?;
+        let bytes = manager.logs()?.iter().map(|(_, meta)| meta.len()).sum();
+        manager.inner.used_bytes.store(bytes, Ordering::SeqCst);
         manager.gc()?;
         Ok(manager)
     }
 
-    pub fn root(&self) -> &Path {
-        &self.inner.root
+    fn logs(&self) -> io::Result<Vec<(PathBuf, fs::Metadata)>> {
+        let mut logs = Vec::new();
+        for entry in fs::read_dir(&self.inner.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.len() != 32
+                || !name.bytes().all(|b| b.is_ascii_hexdigit())
+                || !entry.file_type()?.is_dir()
+            {
+                continue;
+            }
+            if let Ok(meta) = fs::symlink_metadata(entry.path().join(RAW_FILE))
+                && meta.is_file()
+            {
+                logs.push((entry.path(), meta));
+            }
+        }
+        Ok(logs)
     }
 
     pub fn create_artifact(&self) -> io::Result<OutputStore> {
         self.gc()?;
-        let used_bytes = self.inner.used_bytes.load(Ordering::SeqCst);
-        let hard_bytes = self
-            .inner
-            .max_bytes
-            .saturating_add(self.inner.headroom_bytes);
-        if used_bytes >= hard_bytes {
-            return Err(capacity_error(format!(
-                "output store byte capacity exhausted ({} bytes plus {} bytes headroom)",
-                self.inner.max_bytes, self.inner.headroom_bytes
-            )));
+        let mut active = self.inner.active.lock().unwrap();
+        if self.inner.used_bytes.load(Ordering::SeqCst) >= self.inner.max_bytes {
+            return Err(io::Error::other("output store capacity exhausted"));
         }
-        let headroom_admitted = used_bytes >= self.inner.max_bytes;
-        let hard_files = self.inner.max_files.saturating_add(FILE_HEADROOM);
-        if self.inner.used_files.load(Ordering::SeqCst) >= hard_files {
-            return Err(capacity_error(format!(
-                "output store file capacity exhausted ({} files plus {} file headroom)",
-                self.inner.max_files, FILE_HEADROOM
-            )));
-        }
-
-        let (artifact_id, dir) = loop {
-            let artifact_id = unique_id();
-            let dir = self.inner.root.join(&artifact_id);
+        let dir = loop {
+            let dir = self
+                .inner
+                .root
+                .join(format!("{:032x}", rand::random::<u128>()));
             match fs::create_dir(&dir) {
-                Ok(()) => break (artifact_id, dir),
+                Ok(()) => break dir,
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
         };
-        if let Err(error) = set_directory_mode(&dir) {
-            let _ = fs::remove_dir(&dir);
-            return Err(error);
-        }
-
-        let raw_path = dir.join(RAW_FILE);
-        let file = match OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&raw_path)
-        {
+        let create = || {
+            set_directory_mode(&dir)?;
+            let path = dir.join(RAW_FILE);
+            let file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .append(true)
+                .open(&path)?;
+            set_file_mode(&path)?;
+            Ok(file)
+        };
+        let file = match create() {
             Ok(file) => file,
             Err(error) => {
-                let _ = fs::remove_dir(&dir);
+                let _ = remove_log(&dir);
                 return Err(error);
             }
         };
-        if let Err(error) = set_file_mode(&raw_path) {
-            drop(file);
-            let _ = fs::remove_file(&raw_path);
-            let _ = fs::remove_dir(&dir);
-            return Err(error);
-        }
-
-        let meta = ArtifactMeta {
-            version: META_VERSION,
-            artifact_id,
-            owner_instance: self.inner.instance_id.clone(),
-            state: ArtifactState::Active,
-            created_at_unix_millis: unix_millis(),
-            sealed_at_unix_millis: None,
-            committed_bytes: 0,
-            retention_sticky: false,
-            retention_reason: None,
-            retain_until_unix_millis: None,
-            expires_at_unix_millis: None,
-            incomplete_reason: None,
-            recovery_path_published: false,
-        };
-        if let Err(error) = write_meta(&dir, &meta) {
-            drop(file);
-            let _ = fs::remove_file(&raw_path);
-            let _ = fs::remove_dir(&dir);
-            return Err(error);
-        }
-
-        self.inner.used_files.fetch_add(1, Ordering::SeqCst);
+        active.insert(dir.clone());
         Ok(OutputStore {
             manager: self.clone(),
             dir,
             file: Some(file),
-            meta,
-            headroom_admitted,
-            deleted: false,
+            committed_bytes: 0,
+            published: false,
+            finished: false,
+            incomplete_reason: None,
         })
     }
 
     pub fn gc(&self) -> io::Result<()> {
-        let now = unix_millis();
-        let mut candidates = Vec::new();
-        for entry in fs::read_dir(&self.inner.root)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !is_managed_artifact_id(&name) {
-                continue;
-            }
-            let dir = entry.path();
-            let dir_meta = fs::symlink_metadata(&dir)?;
-            if !dir_meta.file_type().is_dir() || dir_meta.file_type().is_symlink() {
-                continue;
-            }
-            let Ok(meta) = read_meta(&dir) else {
-                continue;
-            };
-            if meta.state == ArtifactState::Active || !meta.retention_sticky {
-                continue;
-            }
-            let bytes = regular_file_len(&dir.join(RAW_FILE)).unwrap_or(0);
-            candidates.push(GcCandidate {
-                dir,
-                bytes,
-                sealed_at: meta
-                    .sealed_at_unix_millis
-                    .unwrap_or(meta.created_at_unix_millis),
-                retain_until: meta.retain_until_unix_millis.unwrap_or(u64::MAX),
-                expires_at: meta.expires_at_unix_millis.unwrap_or(u64::MAX),
-            });
-        }
-
-        candidates.sort_by_key(|candidate| candidate.sealed_at);
-        let mut deleted = vec![false; candidates.len()];
-        for (index, candidate) in candidates.iter().enumerate() {
-            if candidate.expires_at <= now && candidate.retain_until <= now {
-                // A corrupt or concurrently modified artifact should remain
-                // accounted for without making GC fail for every other artifact.
-                deleted[index] = self.delete_candidate(candidate).is_ok();
-            }
-        }
-
-        for (index, candidate) in candidates.iter().enumerate() {
-            if deleted[index] {
-                continue;
-            }
-            let over_bytes = self.inner.used_bytes.load(Ordering::SeqCst) > self.inner.max_bytes;
-            let over_files = self.inner.used_files.load(Ordering::SeqCst) > self.inner.max_files;
-            if !over_bytes && !over_files {
-                break;
-            }
-            if candidate.retain_until <= now {
-                let _ = self.delete_candidate(candidate);
-            }
-        }
-        Ok(())
-    }
-
-    fn reconcile_startup(&self) -> io::Result<()> {
-        let now = unix_millis();
-        let mut total_bytes = 0u64;
-        let mut total_files = 0usize;
-        for entry in fs::read_dir(&self.inner.root)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !is_managed_artifact_id(&name) {
-                continue;
-            }
-            let dir = entry.path();
-            let dir_meta = fs::symlink_metadata(&dir)?;
-            if !dir_meta.file_type().is_dir() || dir_meta.file_type().is_symlink() {
-                continue;
-            }
-            if let Some(bytes) = regular_file_len(&dir.join(RAW_FILE)) {
-                total_bytes = total_bytes.saturating_add(bytes);
-                total_files = total_files.saturating_add(1);
-                if let Ok(mut meta) = read_meta(&dir) {
-                    meta.committed_bytes = bytes;
-                    let was_active = meta.state == ArtifactState::Active;
-                    let needs_restart_retention = meta.state == ArtifactState::Active
-                        || (meta.state == ArtifactState::Complete && !meta.retention_sticky);
-                    if needs_restart_retention {
-                        meta.state = ArtifactState::Incomplete;
-                        meta.retention_sticky = true;
-                        meta.retention_reason = Some(if was_active {
-                            "server_restart_orphan".into()
-                        } else {
-                            "restart_unconfirmed_delivery".into()
-                        });
-                        meta.incomplete_reason = meta.retention_reason.clone();
-                        self.apply_retention_deadlines(&mut meta, now);
-                    }
-                    let _ = write_meta(&dir, &meta);
-                } else {
-                    let mut meta = ArtifactMeta {
-                        version: META_VERSION,
-                        artifact_id: name.into_owned(),
-                        owner_instance: "unknown".into(),
-                        state: ArtifactState::Incomplete,
-                        created_at_unix_millis: now,
-                        sealed_at_unix_millis: None,
-                        committed_bytes: bytes,
-                        retention_sticky: true,
-                        retention_reason: Some("restart_missing_or_invalid_metadata".into()),
-                        retain_until_unix_millis: None,
-                        expires_at_unix_millis: None,
-                        incomplete_reason: Some("restart_missing_or_invalid_metadata".into()),
-                        recovery_path_published: false,
-                    };
-                    self.apply_retention_deadlines(&mut meta, now);
-                    let _ = write_meta(&dir, &meta);
-                }
-            }
-        }
-        self.inner.used_bytes.store(total_bytes, Ordering::SeqCst);
-        self.inner.used_files.store(total_files, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn apply_retention_deadlines(&self, meta: &mut ArtifactMeta, sealed_at: u64) {
-        meta.sealed_at_unix_millis = Some(sealed_at);
-        meta.retain_until_unix_millis =
-            Some(sealed_at.saturating_add(duration_millis(self.inner.min_retention)));
-        meta.expires_at_unix_millis =
-            Some(sealed_at.saturating_add(duration_millis(self.inner.retention)));
-    }
-
-    fn reserve_bytes(&self, bytes: u64, allow_headroom: bool) -> io::Result<()> {
-        let hard_limit = if allow_headroom {
-            self.inner
-                .max_bytes
-                .saturating_add(self.inner.headroom_bytes)
-        } else {
-            self.inner.max_bytes
-        };
-        loop {
-            let current = self.inner.used_bytes.load(Ordering::SeqCst);
-            let next = current.saturating_add(bytes);
-            if next > hard_limit {
-                return Err(capacity_error(format!(
-                    "output store capacity exceeded: attempted {next} bytes with hard limit {hard_limit}"
-                )));
-            }
-            if self
-                .inner
-                .used_bytes
-                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
+        let active = self.inner.active.lock().unwrap();
+        for (dir, meta) in self.logs()? {
+            if !active.contains(&dir)
+                && meta.modified()?.elapsed().unwrap_or_default() >= self.inner.retention
+                && remove_log(&dir).is_ok()
             {
-                return Ok(());
+                self.release_bytes(meta.len());
             }
         }
+        Ok(())
+    }
+
+    fn reserve_bytes(&self, bytes: u64) -> io::Result<()> {
+        self.inner
+            .used_bytes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current
+                    .checked_add(bytes)
+                    .filter(|next| *next <= self.inner.max_bytes)
+            })
+            .map(|_| ())
+            .map_err(|_| io::Error::other("output store capacity exceeded"))
     }
 
     fn release_bytes(&self, bytes: u64) {
-        atomic_saturating_sub_u64(&self.inner.used_bytes, bytes);
-    }
-
-    fn delete_candidate(&self, candidate: &GcCandidate) -> io::Result<()> {
-        remove_managed_artifact(&candidate.dir)?;
-        self.release_bytes(candidate.bytes);
-        atomic_saturating_sub_usize(&self.inner.used_files, 1);
-        Ok(())
+        self.inner.used_bytes.fetch_sub(bytes, Ordering::SeqCst);
     }
 }
 
 impl OutputStore {
     pub fn append(&mut self, bytes: &[u8]) -> io::Result<u64> {
-        if self.deleted || self.meta.state != ArtifactState::Active {
+        if self.finished {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "output artifact is no longer writable",
+                "output capture is finished",
             ));
         }
-        if bytes.is_empty() {
-            return Ok(self.meta.committed_bytes);
-        }
-        self.manager
-            .reserve_bytes(bytes.len() as u64, self.headroom_admitted)?;
-        let before = self.meta.committed_bytes;
-        let file = self.file.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "output artifact file is closed")
-        })?;
-        file.seek(SeekFrom::End(0))?;
-        let result = file.write_all(bytes).and_then(|_| file.flush());
-        match result {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "output file is closed"))?;
+        self.manager.reserve_bytes(bytes.len() as u64)?;
+        let before = self.committed_bytes;
+        match file.write_all(bytes) {
             Ok(()) => {
-                self.meta.committed_bytes = before.saturating_add(bytes.len() as u64);
-                Ok(self.meta.committed_bytes)
+                self.committed_bytes += bytes.len() as u64;
+                Ok(self.committed_bytes)
             }
             Err(error) => {
-                let actual_len = file.metadata().map(|meta| meta.len()).unwrap_or(before);
-                let actual_delta = actual_len.saturating_sub(before).min(bytes.len() as u64);
-                let unused_reservation = (bytes.len() as u64).saturating_sub(actual_delta);
-                self.manager.release_bytes(unused_reservation);
-                self.meta.committed_bytes = actual_len;
-                self.meta.retention_sticky = true;
-                self.meta.retention_reason = Some("capture_write_error".into());
-                self.meta.incomplete_reason = Some(error.to_string());
-                let _ = write_meta(&self.dir, &self.meta);
+                self.committed_bytes = file.metadata().map(|m| m.len()).unwrap_or(before);
+                self.manager.release_bytes(
+                    bytes.len() as u64 - self.committed_bytes.saturating_sub(before),
+                );
                 Err(error)
             }
         }
@@ -455,9 +223,9 @@ impl OutputStore {
 
     pub fn snapshot(&self, start: u64) -> Snapshot {
         Snapshot {
-            start: start.min(self.meta.committed_bytes),
-            end: self.meta.committed_bytes,
-            stored_bytes: self.meta.committed_bytes,
+            start: start.min(self.committed_bytes),
+            end: self.committed_bytes,
+            stored_bytes: self.committed_bytes,
             path: self.dir.join(RAW_FILE),
         }
     }
@@ -533,184 +301,100 @@ impl OutputStore {
     }
 
     pub fn recovery_path_published(&self) -> bool {
-        self.meta.recovery_path_published
+        self.published
     }
 
-    pub fn mark_recovery_required(&mut self, reason: &str) -> io::Result<()> {
-        self.meta.retention_sticky = true;
-        self.meta.recovery_path_published = true;
-        if self.meta.retention_reason.is_none() {
-            self.meta.retention_reason = Some(reason.to_owned());
+    pub fn finish(&mut self, reason: Option<String>) -> io::Result<()> {
+        self.finished = true;
+        self.incomplete_reason = reason;
+        if let Some(file) = &self.file {
+            file.set_modified(SystemTime::now())?;
         }
-        self.meta.committed_bytes = self.current_len();
-        if self.meta.state != ArtifactState::Active && self.meta.retain_until_unix_millis.is_none()
-        {
-            let sealed_at = self.meta.sealed_at_unix_millis.unwrap_or_else(unix_millis);
-            self.manager
-                .apply_retention_deadlines(&mut self.meta, sealed_at);
-        }
-        write_meta(&self.dir, &self.meta)
+        Ok(())
     }
 
-    pub fn mark_incomplete_intent(&mut self, reason: &str) -> io::Result<()> {
-        self.meta.retention_sticky = true;
-        if self.meta.retention_reason.is_none() {
-            self.meta.retention_reason = Some(reason.to_owned());
-        }
-        self.meta.incomplete_reason = Some(reason.to_owned());
-        self.meta.committed_bytes = self.current_len();
-        write_meta(&self.dir, &self.meta)
-    }
-
-    pub fn seal_complete(&mut self) -> io::Result<()> {
-        self.meta.state = ArtifactState::Complete;
-        self.meta.committed_bytes = self.current_len();
-        if self.meta.retention_sticky {
-            let sealed_at = unix_millis();
-            self.manager
-                .apply_retention_deadlines(&mut self.meta, sealed_at);
-        } else {
-            self.meta.sealed_at_unix_millis = Some(unix_millis());
-        }
-        write_meta(&self.dir, &self.meta)
-    }
-
-    pub fn seal_incomplete(&mut self, reason: &str) -> io::Result<()> {
-        self.meta.state = ArtifactState::Incomplete;
-        self.meta.retention_sticky = true;
-        self.meta.incomplete_reason = Some(reason.to_owned());
-        if self.meta.retention_reason.is_none() {
-            self.meta.retention_reason = Some(reason.to_owned());
-        }
-        self.meta.committed_bytes = self.current_len();
-        let sealed_at = unix_millis();
-        self.manager
-            .apply_retention_deadlines(&mut self.meta, sealed_at);
-        write_meta(&self.dir, &self.meta)
+    pub fn publish(&mut self) {
+        self.published = true;
     }
 
     pub fn ref_info(&self) -> OutputRefInfo {
+        let expires = self
+            .finished
+            .then(|| {
+                self.file
+                    .as_ref()?
+                    .metadata()
+                    .ok()?
+                    .modified()
+                    .ok()?
+                    .checked_add(self.manager.inner.retention)?
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs())
+            })
+            .flatten();
         OutputRefInfo {
             path: self.dir.join(RAW_FILE),
-            stored_bytes: self.meta.committed_bytes,
-            capture_status: match self.meta.state {
-                ArtifactState::Active => "open",
-                ArtifactState::Complete => "complete",
-                ArtifactState::Incomplete => "incomplete",
+            stored_bytes: self.committed_bytes,
+            capture_status: if self.incomplete_reason.is_some() {
+                "incomplete"
+            } else if self.finished {
+                "complete"
+            } else {
+                "open"
             },
-            expires_at_unix_seconds: self.meta.expires_at_unix_millis.map(|millis| millis / 1000),
-            incomplete_reason: self.meta.incomplete_reason.clone(),
+            expires_at_unix_seconds: expires,
+            incomplete_reason: self.incomplete_reason.clone(),
         }
     }
 
     pub fn delete(&mut self) -> io::Result<()> {
-        if self.deleted {
+        if self.file.is_none() {
             return Ok(());
         }
-        let bytes = self.current_len();
+        let _active = self.manager.inner.active.lock().unwrap();
+        remove_log(&self.dir)?;
         self.file.take();
-        remove_managed_artifact(&self.dir)?;
-        self.manager.release_bytes(bytes);
-        atomic_saturating_sub_usize(&self.manager.inner.used_files, 1);
-        self.deleted = true;
+        self.manager.release_bytes(self.committed_bytes);
         Ok(())
     }
 
     pub fn committed_bytes(&self) -> u64 {
-        self.meta.committed_bytes
-    }
-
-    fn current_len(&self) -> u64 {
-        self.file
-            .as_ref()
-            .and_then(|file| file.metadata().ok())
-            .map(|meta| meta.len())
-            .unwrap_or(self.meta.committed_bytes)
+        self.committed_bytes
     }
 }
 
-fn read_meta(dir: &Path) -> io::Result<ArtifactMeta> {
-    let bytes = fs::read(dir.join(META_FILE))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-fn write_meta(dir: &Path, meta: &ArtifactMeta) -> io::Result<()> {
-    let tmp_path = dir.join("meta.json.tmp");
-    match fs::remove_file(&tmp_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+impl Drop for OutputStore {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = self.delete();
+        }
+        self.manager.inner.active.lock().unwrap().remove(&self.dir);
     }
-    let bytes = serde_json::to_vec_pretty(meta)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)?;
-    set_file_mode(&tmp_path)?;
-    file.write_all(&bytes)?;
-    file.write_all(b"\n")?;
-    file.flush()?;
-    drop(file);
-    fs::rename(&tmp_path, dir.join(META_FILE))
 }
 
-fn remove_managed_artifact(dir: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(dir)?;
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+fn remove_log(dir: &Path) -> io::Result<()> {
+    // Old sidecars can be discarded without reading or reconciling their state.
+    const FILES: [&str; 3] = [RAW_FILE, "meta.json", "meta.json.tmp"];
+    if !fs::symlink_metadata(dir)?.is_dir()
+        || fs::read_dir(dir)?.any(|entry| {
+            !entry.is_ok_and(|entry| FILES.iter().any(|name| entry.file_name() == *name))
+        })
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "refusing to remove non-directory output artifact",
+            "unexpected entry in output directory",
         ));
     }
-    for entry in fs::read_dir(dir)? {
-        let name = entry?.file_name();
-        let name = name.to_string_lossy();
-        if name != RAW_FILE && name != META_FILE && name != "meta.json.tmp" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected entry in output artifact: {name}"),
-            ));
-        }
-    }
-    for name in [RAW_FILE, META_FILE, "meta.json.tmp"] {
-        let path = dir.join(name);
-        match fs::remove_file(&path) {
+    // Remove sidecars first so any failure leaves the accounted raw log intact.
+    for name in FILES.iter().rev() {
+        match fs::remove_file(dir.join(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
-    match fs::remove_dir(dir) {
-        Ok(()) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn regular_file_len(path: &Path) -> Option<u64> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    (metadata.file_type().is_file() && !metadata.file_type().is_symlink()).then_some(metadata.len())
-}
-
-fn is_managed_artifact_id(value: &str) -> bool {
-    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn unique_id() -> String {
-    format!("{:032x}", rand::random::<u128>())
-}
-
-fn unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u64::MAX as u128) as u64
-}
-
-fn duration_millis(duration: Duration) -> u64 {
-    duration.as_millis().min(u64::MAX as u128) as u64
+    fs::remove_dir(dir)
 }
 
 pub(crate) fn read_utf8_safe_head(
@@ -783,22 +467,6 @@ fn truncate_string_bytes(value: &mut String, budget: usize) {
     value.truncate(boundary);
 }
 
-fn capacity_error(message: String) -> io::Error {
-    io::Error::other(message)
-}
-
-fn atomic_saturating_sub_u64(value: &AtomicU64, amount: u64) {
-    let _ = value.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-        Some(current.saturating_sub(amount))
-    });
-}
-
-fn atomic_saturating_sub_usize(value: &AtomicUsize, amount: usize) {
-    let _ = value.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-        Some(current.saturating_sub(amount))
-    });
-}
-
 #[cfg(unix)]
 fn set_directory_mode(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -847,188 +515,142 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn manager(
-        root: &Path,
-        retention: Duration,
-        min_retention: Duration,
-        max_bytes: u64,
-    ) -> OutputStoreManager {
-        OutputStoreManager::open(root, retention, min_retention, max_bytes, 0, 32).unwrap()
+    fn manager(root: &Path, max_bytes: u64) -> OutputStoreManager {
+        OutputStoreManager::open(root, Duration::from_secs(60), max_bytes).unwrap()
+    }
+
+    fn age(path: &Path) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
     }
 
     #[test]
-    fn published_artifact_is_sticky_and_gc_respects_minimum_retention() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("outputs");
-        let manager = manager(
-            &root,
-            Duration::from_millis(50),
-            Duration::from_millis(30),
-            1024,
-        );
+    fn only_published_logs_survive_drop_and_gc_uses_mtime() {
+        let root = TempDir::new().unwrap();
+        let manager = manager(root.path(), 1024);
+        for published in [false, true] {
+            let mut store = manager.create_artifact().unwrap();
+            store.append(b"hello").unwrap();
+            store.finish(None).unwrap();
+            let path = store.ref_info().path;
+            if published {
+                store.publish();
+            }
+            drop(store);
+            assert_eq!(path.exists(), published);
+            if published {
+                manager.gc().unwrap();
+                assert!(path.exists());
+                age(&path);
+                manager.gc().unwrap();
+                assert!(!path.exists());
+            }
+        }
+        assert_eq!(manager.inner.used_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn live_stores_are_protected_and_finish_refreshes_mtime() {
+        let root = TempDir::new().unwrap();
+        let manager = manager(root.path(), 1024);
         let mut store = manager.create_artifact().unwrap();
         store.append(b"hello").unwrap();
-        store.mark_recovery_required("truncated").unwrap();
-        store.seal_complete().unwrap();
+        store.publish();
         let path = store.ref_info().path;
+        age(&path);
+        manager.gc().unwrap();
+        assert!(path.exists());
+        store.finish(None).unwrap();
+        assert_eq!(store.ref_info().capture_status, "complete");
+        assert!(store.ref_info().expires_at_unix_seconds.is_some());
         drop(store);
-
         manager.gc().unwrap();
         assert!(path.exists());
-        std::thread::sleep(Duration::from_millis(70));
-        manager.gc().unwrap();
-        assert!(!path.exists());
     }
 
     #[test]
-    fn active_artifact_is_never_collected() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("outputs");
-        let manager = manager(&root, Duration::ZERO, Duration::ZERO, 1);
-        let mut store = manager.create_artifact().unwrap();
-        store.append(b"x").unwrap();
-        let path = store.ref_info().path;
-        manager.gc().unwrap();
-        assert!(path.exists());
-        store.delete().unwrap();
-    }
-
-    #[test]
-    fn restart_turns_active_artifact_into_retained_orphan() {
-        // Other unit tests fork shell processes. Between fork and exec those
-        // children temporarily retain a copy of our flock's open file
-        // description, even with CLOEXEC. Model a server restart in a process
-        // with no concurrent spawns so dropping the manager releases the lock.
-        const ISOLATED: &str = "OUTPUT_STORE_RESTART_TEST_CHILD";
-        if std::env::var_os(ISOLATED).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "output_store::tests::restart_turns_active_artifact_into_retained_orphan",
-                    "--test-threads=1",
-                ])
-                .env(ISOLATED, "1")
-                .status()
-                .unwrap();
-            assert!(status.success());
-            return;
+    fn startup_accounts_existing_raw_logs_and_expires_old_ones() {
+        let root = TempDir::new().unwrap();
+        for (id, expired) in [(1, true), (2, false)] {
+            let dir = root.path().join(format!("{id:032x}"));
+            fs::create_dir(&dir).unwrap();
+            let path = dir.join(RAW_FILE);
+            fs::write(&path, b"orphan").unwrap();
+            // The raw log's mtime remains the only expiration input even for
+            // captures left by older versions with unreadable metadata.
+            fs::write(dir.join("meta.json"), b"invalid metadata").unwrap();
+            if expired {
+                age(&path);
+            }
         }
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("outputs");
-        let raw_path = {
-            let manager = manager(
-                &root,
-                Duration::from_secs(60),
-                Duration::from_secs(60),
-                1024,
-            );
-            let mut store = manager.create_artifact().unwrap();
-            store.append(b"orphaned").unwrap();
-            store.ref_info().path
-        };
-
-        let manager = manager(
-            &root,
-            Duration::from_secs(60),
-            Duration::from_secs(60),
-            1024,
-        );
-        manager.gc().unwrap();
-        assert!(raw_path.exists());
-        let meta = read_meta(raw_path.parent().unwrap()).unwrap();
-        assert_eq!(meta.state, ArtifactState::Incomplete);
-        assert!(meta.retention_sticky);
-        assert!(
-            meta.incomplete_reason
-                .as_deref()
-                .unwrap()
-                .contains("restart")
-        );
+        let manager = manager(root.path(), 6);
+        assert_eq!(manager.inner.used_bytes.load(Ordering::SeqCst), 6);
+        assert!(manager.create_artifact().is_err());
+        assert!(!root.path().join(format!("{:032x}", 1)).exists());
+        let path = root.path().join(format!("{:032x}", 2)).join(RAW_FILE);
+        assert_eq!(fs::read(&path).unwrap(), b"orphan");
+        age(&path);
+        assert!(manager.create_artifact().is_ok());
     }
 
     #[test]
-    fn second_server_instance_is_rejected() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("outputs");
-        let _manager = manager(&root, Duration::from_secs(60), Duration::ZERO, 1024);
-        let error =
-            OutputStoreManager::open(&root, Duration::from_secs(60), Duration::ZERO, 1024, 0, 32)
-                .err()
-                .expect("second instance must fail");
+    fn single_capacity_limit_keeps_written_prefix_and_releases_deleted_bytes() {
+        let root = TempDir::new().unwrap();
+        let manager = manager(root.path(), 4);
+        let mut first = manager.create_artifact().unwrap();
+        let mut second = manager.create_artifact().unwrap();
+        first.append(b"abc").unwrap();
+        second.append(b"d").unwrap();
+        assert!(
+            first
+                .append(b"e")
+                .unwrap_err()
+                .to_string()
+                .contains("capacity")
+        );
+        first.finish(Some("capacity exceeded".into())).unwrap();
+        first.publish();
+        let reference = first.ref_info();
+        assert_eq!(reference.capture_status, "incomplete");
+        assert_eq!(fs::read(reference.path).unwrap(), b"abc");
+        drop(second);
+        let mut third = manager.create_artifact().unwrap();
+        third.append(b"f").unwrap();
+        assert!(third.append(b"g").is_err());
+    }
+
+    #[test]
+    fn second_instance_is_rejected() {
+        let root = TempDir::new().unwrap();
+        let _manager = manager(root.path(), 1024);
+        let error = OutputStoreManager::open(root.path(), Duration::ZERO, 1024)
+            .err()
+            .unwrap();
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
     }
 
     #[test]
-    fn capacity_failure_keeps_written_prefix() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("outputs");
-        let manager = manager(&root, Duration::from_secs(60), Duration::ZERO, 4);
-        let mut store = manager.create_artifact().unwrap();
-        store.append(b"abcd").unwrap();
-        let error = store.append(b"e").unwrap_err();
-        assert!(error.to_string().contains("capacity"));
-        assert_eq!(fs::read(store.ref_info().path).unwrap(), b"abcd");
-    }
-
-    #[test]
-    fn ordinary_capture_cannot_consume_recovery_headroom() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("outputs");
-        let manager =
-            OutputStoreManager::open(&root, Duration::from_secs(60), Duration::ZERO, 4, 4, 32)
-                .unwrap();
-
-        let mut ordinary = manager.create_artifact().unwrap();
-        ordinary.append(b"abcd").unwrap();
-        let error = ordinary.append(b"e").unwrap_err();
-        assert!(error.to_string().contains("capacity"));
-
-        let mut recovery = manager.create_artifact().unwrap();
-        recovery.append(b"ok").unwrap();
-        assert_eq!(fs::read(recovery.ref_info().path).unwrap(), b"ok");
-    }
-
-    #[test]
-    fn nonempty_artifact_directory_does_not_release_accounting() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("outputs");
-        let manager = manager(&root, Duration::from_secs(60), Duration::ZERO, 1024);
+    fn foreign_entries_are_preserved_without_losing_accounting() {
+        let root = TempDir::new().unwrap();
+        let manager = manager(root.path(), 1024);
         let mut store = manager.create_artifact().unwrap();
         store.append(b"hello").unwrap();
-        let artifact_dir = store.ref_info().path.parent().unwrap().to_path_buf();
-        fs::write(artifact_dir.join("unexpected"), b"foreign").unwrap();
-
-        let error = store.delete().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(artifact_dir.exists());
-        assert!(store.ref_info().path.exists());
-        assert!(artifact_dir.join(META_FILE).exists());
-        assert_eq!(manager.inner.used_bytes.load(Ordering::SeqCst), 5);
-        assert_eq!(manager.inner.used_files.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn corrupt_gc_candidate_does_not_block_new_artifacts() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("outputs");
-        let manager = manager(&root, Duration::ZERO, Duration::ZERO, 1024);
-        let mut store = manager.create_artifact().unwrap();
-        store.append(b"hello").unwrap();
-        store.mark_recovery_required("published").unwrap();
-        store.seal_complete().unwrap();
-        let artifact_dir = store.ref_info().path.parent().unwrap().to_path_buf();
-        fs::write(artifact_dir.join("unexpected"), b"foreign").unwrap();
+        fs::write(store.dir.join("foreign"), b"keep").unwrap();
+        store.publish();
+        let path = store.ref_info().path;
+        age(&path);
+        assert_eq!(
+            store.delete().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         drop(store);
-
         manager.gc().unwrap();
-        assert!(artifact_dir.join(RAW_FILE).exists());
-        assert!(artifact_dir.join(META_FILE).exists());
+        assert!(path.exists());
         assert_eq!(manager.inner.used_bytes.load(Ordering::SeqCst), 5);
-        assert_eq!(manager.inner.used_files.load(Ordering::SeqCst), 1);
-
-        let mut next = manager.create_artifact().unwrap();
-        next.append(b"ok").unwrap();
-        assert_eq!(manager.inner.used_bytes.load(Ordering::SeqCst), 7);
-        assert_eq!(manager.inner.used_files.load(Ordering::SeqCst), 2);
+        assert!(manager.create_artifact().is_ok());
     }
 }

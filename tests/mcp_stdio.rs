@@ -125,8 +125,8 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         [
             "exec_command",
             "start_session",
-            "write_stdin",
-            "wait_for_exit"
+            "wait_for_exit",
+            "write_stdin"
         ]
     );
     for tool in listed["result"]["tools"].as_array().unwrap() {
@@ -137,14 +137,17 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         assert!(properties.contains_key("output_encoding_loss"));
         assert!(properties.contains_key("capture_error"));
         let required = tool["outputSchema"]["required"].as_array().unwrap();
-        for field in [
-            "call_wall_time_seconds",
-            "output",
-            "output_truncated",
-            "output_encoding_loss",
-        ] {
-            assert!(required.iter().any(|value| value == field));
-        }
+        assert_eq!(
+            required,
+            json!([
+                "call_wall_time_seconds",
+                "output",
+                "output_truncated",
+                "output_encoding_loss"
+            ])
+            .as_array()
+            .unwrap()
+        );
         let output_ref = &tool["outputSchema"]["properties"]["output_ref"];
         assert_eq!(output_ref["type"], "object");
         assert_eq!(output_ref["additionalProperties"], false);
@@ -315,13 +318,25 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
             }),
         )
         .await;
-        assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
-        let message = invalid["error"]["message"].as_str().unwrap();
+        // rmcp reports argument deserialization failures as tool errors.
+        assert_eq!(invalid["result"]["isError"], true, "{invalid}");
+        let message = invalid["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
             message.contains(expected),
             "expected {expected:?} in {message:?}"
         );
     }
+
+    let unknown = request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0", "id": 27, "method": "tools/call",
+            "params": { "name": "unknown_tool", "arguments": {} }
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], -32602);
 
     let whitespace_only = request(
         &mut stdin,
@@ -365,6 +380,25 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         one_shot["result"]["content"][0]["text"],
         "exit_code=0; output_bytes=6"
     );
+
+    // start_session is the tool whose complete argument object may be omitted.
+    let default_shell = request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0", "id": 28, "method": "tools/call",
+            "params": { "name": "start_session" }
+        }),
+    )
+    .await;
+    let default_id = default_shell["result"]["structuredContent"]["session_id"]
+        .as_str()
+        .unwrap();
+    let stopped = request(&mut stdin, &mut stdout, json!({
+        "jsonrpc": "2.0", "id": 29, "method": "tools/call",
+        "params": { "name": "write_stdin", "arguments": { "session_id": default_id, "chars": "exit\n" } }
+    })).await;
+    assert_eq!(stopped["result"]["structuredContent"]["exit_code"], 0);
 
     let started = request(
         &mut stdin,

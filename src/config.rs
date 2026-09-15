@@ -3,18 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use clap::Parser;
 use serde::Deserialize;
 
 use crate::session::SessionOrigin;
-
-#[derive(Debug, Parser)]
-#[command(name = "chatgpt-exec-mcp", version, about)]
-pub struct Cli {
-    /// Required versioned JSON configuration; relative to the startup cwd.
-    #[arg(long)]
-    pub config: PathBuf,
-}
 
 /// Validated startup settings. Environment values are deliberately redacted.
 #[derive(Clone, Debug)]
@@ -29,10 +20,7 @@ pub struct Config {
     pub output_cap_bytes: usize,
     pub output_store_dir: PathBuf,
     pub output_store_retention: Duration,
-    pub output_store_min_retention: Duration,
     pub output_store_max_bytes: u64,
-    pub output_store_headroom_bytes: u64,
-    pub output_store_max_files: usize,
     pub(crate) additional_instructions: Option<String>,
     pub(crate) child_env: ChildEnv,
 }
@@ -61,14 +49,8 @@ struct FileConfig {
     output_cap_bytes: usize,
     #[serde(default = "week")]
     output_store_retention: u64,
-    #[serde(default = "hour")]
-    output_store_min_retention: u64,
     #[serde(default = "four_gigabytes")]
     output_store_max_bytes: u64,
-    #[serde(default = "headroom")]
-    output_store_headroom_bytes: u64,
-    #[serde(default = "files")]
-    output_store_max_files: usize,
 }
 fn present_path<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
     PathBuf::deserialize(d).map(Some)
@@ -94,13 +76,6 @@ fn week() -> u64 {
 fn four_gigabytes() -> u64 {
     4_294_967_296
 }
-fn headroom() -> u64 {
-    16_777_216
-}
-fn files() -> usize {
-    2048
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnvConfig {
@@ -234,10 +209,7 @@ impl Config {
             reaper_interval: Duration::from_secs(raw.reaper_interval),
             output_cap_bytes: raw.output_cap_bytes,
             output_store_retention: Duration::from_secs(raw.output_store_retention),
-            output_store_min_retention: Duration::from_secs(raw.output_store_min_retention),
             output_store_max_bytes: raw.output_store_max_bytes,
-            output_store_headroom_bytes: raw.output_store_headroom_bytes,
-            output_store_max_files: raw.output_store_max_files,
         };
         config.validate_limits()?;
         Ok(config)
@@ -277,30 +249,14 @@ impl Config {
                 31_536_000,
             ),
             (
-                "output_store_min_retention",
-                self.output_store_min_retention.as_secs(),
-                31_536_000,
-            ),
-            (
                 "output_store_max_bytes",
                 self.output_store_max_bytes,
                 1_125_899_906_842_624,
-            ),
-            (
-                "output_store_max_files",
-                self.output_store_max_files as u64,
-                1_000_000,
             ),
         ] {
             if !(1..=max).contains(&n) {
                 bail!("{name} must be in 1..={max}");
             }
-        }
-        if self.output_store_min_retention > self.output_store_retention {
-            bail!("output_store_min_retention exceeds output_store_retention");
-        }
-        if self.output_store_headroom_bytes > self.output_store_max_bytes {
-            bail!("output_store_headroom_bytes exceeds output_store_max_bytes");
         }
         Ok(())
     }

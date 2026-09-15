@@ -78,10 +78,7 @@ impl ProcessManager {
         let output_store_manager = OutputStoreManager::open(
             &config.output_store_dir,
             config.output_store_retention,
-            config.output_store_min_retention,
             config.output_store_max_bytes,
-            config.output_store_headroom_bytes,
-            config.output_store_max_files,
         )
         .context("output_store_dir initialization failed")?;
         Ok(Arc::new(Self {
@@ -193,7 +190,7 @@ impl ProcessManager {
                 return Err(error);
             }
         };
-        let session = Session::new(id.clone(), origin, tty, spawned, output_store, build_output);
+        let session = Session::new(id.clone(), origin, spawned, output_store, build_output);
         self.commit_reservation(id.clone(), Arc::clone(&session))
             .await?;
         session
@@ -381,7 +378,7 @@ impl ProcessManager {
         if let Some(read_error) = prepared.read_error.as_deref() {
             let reason = format!("output projection failed: {read_error}");
             merge_error(&mut capture_error, reason.clone());
-            let _ = session.mark_forced_incomplete(&reason).await;
+            session.mark_forced_incomplete(&reason);
             session.terminate().await;
         }
 
@@ -397,22 +394,9 @@ impl ProcessManager {
             if let Some(read_error) = prepared.read_error.as_deref() {
                 let reason = format!("output projection failed: {read_error}");
                 merge_error(&mut capture_error, reason.clone());
-                let _ = session.mark_forced_incomplete(&reason).await;
+                session.mark_forced_incomplete(&reason);
                 session.terminate().await;
             }
-        }
-
-        if prepared.truncated {
-            self.require_recovery(session, "output_truncated", &mut capture_error)
-                .await;
-        }
-        if prepared.encoding_loss {
-            self.require_recovery(session, "output_encoding_loss", &mut capture_error)
-                .await;
-        }
-        if capture_error.is_some() || session.terminal_reason().is_some() {
-            self.require_recovery(session, "capture_incomplete", &mut capture_error)
-                .await;
         }
 
         if terminal {
@@ -426,10 +410,8 @@ impl ProcessManager {
             } else if let Err(error) = session.seal_complete().await {
                 let reason = format!("failed to seal output artifact: {error}");
                 merge_error(&mut capture_error, reason.clone());
-                let _ = session.mark_forced_incomplete(&reason).await;
+                session.mark_forced_incomplete(&reason);
                 let _ = session.seal_incomplete(&reason).await;
-                self.require_recovery(session, "seal_failure", &mut capture_error)
-                    .await;
             }
         }
 
@@ -483,6 +465,9 @@ impl ProcessManager {
         if let Some(end) = prepared.commit_end {
             session.try_commit_output(end)?;
         }
+        if prepared.response.output_ref.is_some() {
+            session.publish_output_ref()?;
+        }
         if prepared.terminal {
             let state = state.expect("terminal response commit requires manager state lock");
             Self::remove_if_same_locked(state, id, session);
@@ -521,30 +506,20 @@ impl ProcessManager {
             merge_error(&mut prepared.response.capture_error, cleanup_error);
             // The response has already committed, so preserve the artifact as a
             // recovery target instead of leaving an unreachable complete spool.
-            match session.mark_recovery_required("cleanup_failure").await {
-                Ok(()) => {
-                    match Self::output_ref_for_range(
-                        session,
-                        prepared.range_start,
-                        prepared.range_end,
-                    )
-                    .await
-                    {
-                        Ok(output_ref) => prepared.response.output_ref = Some(output_ref),
-                        Err(error) => merge_error(
-                            &mut prepared.response.capture_error,
-                            format!(
-                                "failed to publish output recovery reference after cleanup failure: {error}"
-                            ),
-                        ),
-                    }
+            match Self::output_ref_for_range(session, prepared.range_start, prepared.range_end)
+                .await
+            {
+                Ok(output_ref) => {
+                    session.publish_output_ref()?;
+                    prepared.response.output_ref = Some(output_ref);
                 }
                 Err(error) => merge_error(
                     &mut prepared.response.capture_error,
-                    format!("failed to retain output after cleanup failure: {error}"),
+                    format!("failed to publish output recovery reference: {error}"),
                 ),
             }
         }
+
         prepared.response.call_wall_time_seconds = started.elapsed().as_secs_f64();
         if prepared.terminal {
             // Include post-commit cleanup errors before releasing the interaction
@@ -569,20 +544,6 @@ impl ProcessManager {
             expires_at_unix_seconds: info.expires_at_unix_seconds,
             incomplete_reason: info.incomplete_reason,
         })
-    }
-
-    async fn require_recovery(
-        &self,
-        session: &Arc<Session>,
-        reason: &str,
-        capture_error: &mut Option<String>,
-    ) {
-        if let Err(error) = session.mark_recovery_required(reason).await {
-            let message = format!("failed to persist output recovery metadata: {error}");
-            merge_error(capture_error, message.clone());
-            let _ = session.mark_forced_incomplete(&message).await;
-            session.terminate().await;
-        }
     }
 
     async fn create_output_store(&self) -> io::Result<OutputStore> {
@@ -833,7 +794,7 @@ mod tests {
             &path,
             serde_json::json!({
                 "version": 1, "workspace": ".", "shell": "/bin/bash", "output_store_dir": "outputs",
-                "child_env": { "inherit": [], "rules": [] }, "output_store_min_retention": 1
+                "child_env": { "inherit": [], "rules": [] }
             })
             .to_string(),
         )
@@ -919,10 +880,7 @@ mod tests {
             .await;
         assert!(session.is_capture_complete());
         if incomplete {
-            session
-                .mark_forced_incomplete("fixture capture failure")
-                .await
-                .unwrap();
+            session.mark_forced_incomplete("fixture capture failure");
         }
 
         let (first, second) = tokio::join!(first, second);
@@ -963,7 +921,7 @@ mod tests {
         let manager = test_manager(&workspace);
         let session_id = test_session(&manager, "read line; printf delivered").await;
         let session = pinned_session(&manager, &session_id).await;
-        let raw_path = session.output_ref_info().await.unwrap().path;
+        let raw_path = session.prepare_output(100).await.unwrap().snapshot.path;
         let artifact_dir = raw_path.parent().unwrap();
         std::fs::write(artifact_dir.join("unexpected"), b"foreign").unwrap();
 
@@ -1136,9 +1094,12 @@ mod tests {
 
         let wait_manager = Arc::clone(&manager);
         let wait_id = session_id.clone();
+        let session = pinned_session(&manager, &session_id).await;
         let waiter = tokio::spawn(async move {
+            let mut args = test_wait_args(&wait_id);
+            args.max_output_tokens = Some(1);
             wait_manager
-                .wait_for_exit_cancellable(test_wait_args(&wait_id), async move {
+                .wait_for_exit_cancellable(args, async move {
                     let _ = cancel_rx.await;
                 })
                 .await
@@ -1159,6 +1120,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(!session.recovery_path_published().await.unwrap());
         drop(state_guard);
 
         assert_eq!(manager.active_session_count().await, 1);
@@ -1168,6 +1130,7 @@ mod tests {
             .unwrap();
         assert_eq!(delivered.exit_code, Some(0));
         assert_eq!(delivered.output, "commit-output");
+        assert!(delivered.output_ref.is_none());
         assert_eq!(manager.active_session_count().await, 0);
         manager.shutdown_all().await;
     }

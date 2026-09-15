@@ -276,15 +276,9 @@ mod tests {
 
     fn store(bytes: &[u8]) -> (TempDir, OutputStore) {
         let root = TempDir::new().unwrap();
-        let manager = OutputStoreManager::open(
-            root.path(),
-            Duration::from_secs(60),
-            Duration::ZERO,
-            4 * 1024 * 1024,
-            0,
-            32,
-        )
-        .unwrap();
+        let manager =
+            OutputStoreManager::open(root.path(), Duration::from_secs(60), 4 * 1024 * 1024)
+                .unwrap();
         let mut store = manager.create_artifact().unwrap();
         store.append(bytes).unwrap();
         (root, store)

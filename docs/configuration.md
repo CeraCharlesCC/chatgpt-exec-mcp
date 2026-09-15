@@ -41,13 +41,15 @@ are rejected. Session and continuation quotas apply separately.
 | `reaper_interval` | 30 | 1–86400 |
 | `output_cap_bytes` | 1048576 | 1–1073741824 |
 | `output_store_retention` | 604800 | 1–31536000 |
-| `output_store_min_retention` | 3600 | 1–31536000 |
 | `output_store_max_bytes` | 4294967296 | 1–1125899906842624 |
-| `output_store_headroom_bytes` | 16777216 | 0–`output_store_max_bytes` |
-| `output_store_max_files` | 2048 | 1–1000000 |
 
-Minimum retention must not exceed retention. Headroom is additional storage
-reserved for output recovery.
+Raw output is captured in `raw.log`. After a session ends, only logs whose
+`output_ref` was returned are retained. GC deletes inactive logs when their mtime
+is older than `output_store_retention`; live sessions are protected. Finishing a
+capture refreshes its mtime. After a crash, leftover logs expire by the same rule.
+`output_store_max_bytes` is the single capacity limit for all raw logs, including
+active captures. If it is exhausted, capture stops and reports an incomplete
+output reference to the stored prefix. There is no early eviction of unexpired logs.
 
 ## Child environment
 

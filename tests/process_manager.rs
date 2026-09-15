@@ -19,9 +19,8 @@ fn test_config(workspace: &TempDir) -> Config {
             "version": 1, "workspace": ".", "shell": "/bin/bash", "output_store_dir": "outputs",
             "child_env": { "inherit": [], "rules": [] },
             "explicit_session_idle_timeout": 60, "exec_continuation_idle_timeout": 60,
-            "output_store_retention": 60, "output_store_min_retention": 1,
-            "output_store_max_bytes": 67108864, "output_store_headroom_bytes": 1048576,
-            "output_store_max_files": 128
+            "output_store_retention": 60,
+            "output_store_max_bytes": 67108864
         })
         .to_string(),
     )
@@ -631,21 +630,12 @@ async fn idle_reaper_expires_and_kills_session() {
         .unwrap_err();
     assert!(error.to_string().contains("unknown or expired"));
 
-    let artifact_dir = std::fs::read_dir(workspace.path().join("outputs"))
-        .unwrap()
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .expect("expired session artifact must be retained")
-        .path();
-    let meta: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(artifact_dir.join("meta.json")).unwrap()).unwrap();
-    assert_eq!(meta["state"], "incomplete");
-    assert_eq!(
-        meta["incomplete_reason"],
-        "session expired after idle timeout"
+    // No reference was returned, so an expired session leaves no retained log.
+    assert!(
+        std::fs::read_dir(workspace.path().join("outputs"))
+            .unwrap()
+            .all(|entry| !entry.unwrap().file_type().unwrap().is_dir())
     );
-    assert!(meta["retain_until_unix_millis"].is_number());
-    assert!(meta["expires_at_unix_millis"].is_number());
     manager.shutdown_all().await;
     reaper.abort();
 }
@@ -739,5 +729,170 @@ async fn default_session_handles_an_executable_shell_path_with_spaces_and_quotes
         .unwrap();
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.output, "quoted-shell");
+    manager.shutdown_all().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn process_cleanup_captures_late_output_and_preserves_peer_session() {
+    // Fixtures stop on a private file, including on assertion failure. The alarm
+    // also bounds their lifetime if the test process itself is killed.
+    struct Fixture(std::path::PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("stop"), b"");
+        }
+    }
+    fn running(directory: &std::path::Path) -> bool {
+        let identity = std::fs::read_to_string(directory.join("child")).unwrap();
+        let (pid, birth) = identity.split_once(' ').unwrap();
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let fields: Vec<_> = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        fields[19] == birth && !matches!(fields[0], "Z" | "X")
+    }
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(
+        workspace.path().join("fixture.py"),
+        r#"
+import os, pathlib, signal, sys, time
+mode = sys.argv[1]
+directory = pathlib.Path(mode)
+signal.alarm(15)
+pid = os.fork()
+if pid == 0:
+    signal.alarm(15)
+    if mode == 'detached':
+        os.setsid()
+    fields = pathlib.Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()
+    (directory / 'child.tmp').write_text(f'{os.getpid()} {fields[19]}')
+    (directory / 'child.tmp').replace(directory / 'child')
+    print('child-ready', flush=True)
+    if mode == 'delayed':
+        time.sleep(0.15)
+        print('delayed-output', flush=True)
+    else:
+        while not (directory / 'stop').exists():
+            time.sleep(0.02)
+    os._exit(0)
+while not (directory / 'child').exists():
+    time.sleep(0.005)
+print('root-ready', flush=True)
+if mode == 'ordinary':
+    os.waitpid(pid, 0)
+"#,
+    )
+    .unwrap();
+    let manager = ProcessManager::new(test_config(&workspace)).unwrap();
+    let peer = manager
+        .start_session(StartSessionArgs {
+            cmd: Some("exec /bin/bash --noprofile --norc".into()),
+            tty: Some(false),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .session_id
+        .unwrap();
+    for mode in ["ordinary", "delayed", "held-pipe", "detached"] {
+        let directory = workspace.path().join(mode);
+        std::fs::create_dir(&directory).unwrap();
+        let _fixture = Fixture(directory.clone());
+        let started = std::time::Instant::now();
+        let mut args = exec_args(&format!("exec /usr/bin/python3 fixture.py {mode}"));
+        args.yield_time_ms = Some(300);
+        let mut response = manager.exec_command(args).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !directory.join("child").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture did not start");
+        let mut output = response.output.clone();
+        if mode == "ordinary" {
+            response = manager
+                .write_stdin(write_args(response.session_id.as_ref().unwrap(), "\u{3}"))
+                .await
+                .unwrap();
+            output.push_str(&response.output);
+        }
+        if let Some(id) = response.session_id.as_deref() {
+            response = tokio::time::timeout(
+                Duration::from_secs(6),
+                manager.wait_for_exit(wait_args(id, 15)),
+            )
+            .await
+            .expect("cleanup did not finish")
+            .unwrap();
+            output.push_str(&response.output);
+        }
+        assert!(started.elapsed() < Duration::from_secs(8), "{mode}");
+        assert!(response.session_id.is_none(), "{mode}: {response:?}");
+        assert_eq!(
+            response.exit_code,
+            Some(if mode == "ordinary" { 130 } else { 0 })
+        );
+        match mode {
+            "delayed" => {
+                assert!(output.contains("delayed-output"), "{output}");
+                assert!(response.capture_error.is_none(), "{response:?}");
+                assert!(
+                    response
+                        .output_ref
+                        .as_ref()
+                        .is_none_or(|r| r.capture_status == "complete")
+                );
+            }
+            "held-pipe" | "detached" => {
+                let reference = response.output_ref.as_ref().unwrap();
+                assert_eq!(reference.capture_status, "incomplete");
+                assert!(
+                    reference
+                        .incomplete_reason
+                        .as_ref()
+                        .unwrap()
+                        .contains("drain deadline")
+                );
+                assert!(
+                    std::fs::read_to_string(&reference.path)
+                        .unwrap()
+                        .contains("child-ready")
+                );
+            }
+            _ => {}
+        }
+        // The detached child may survive group termination, but ordinary and
+        // held-pipe descendants must have stopped before fixture cleanup.
+        if mode != "detached" {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while running(&directory) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("descendant survived cleanup");
+        }
+        let check = manager
+            .write_stdin(write_args(&peer, &format!("printf 'peer-{mode}\\n'\n")))
+            .await
+            .unwrap();
+        assert!(check.output.contains(&format!("peer-{mode}")), "{check:?}");
+        assert_eq!(check.session_id.as_deref(), Some(peer.as_str()));
+        std::fs::write(directory.join("stop"), b"").unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while running(&directory) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fixture did not stop");
+    }
     manager.shutdown_all().await;
 }

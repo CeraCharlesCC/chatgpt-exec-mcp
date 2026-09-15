@@ -61,8 +61,6 @@ pub(crate) struct TerminalDelivery {
 pub struct Session {
     pub id: SessionId,
     pub origin: SessionOrigin,
-    pub tty: bool,
-    pub started_at: Instant,
     process: ProcessHandle,
     output_store: Arc<StdMutex<OutputStore>>,
     build_output: Option<BuildOutput>,
@@ -88,7 +86,6 @@ impl Session {
     pub(crate) fn new(
         id: SessionId,
         origin: SessionOrigin,
-        tty: bool,
         spawned: SpawnedProcess,
         output_store: OutputStore,
         build_output: Option<BuildOutput>,
@@ -103,8 +100,6 @@ impl Session {
         let session = Arc::new(Self {
             id,
             origin,
-            tty,
-            started_at: now,
             process,
             output_store: Arc::new(StdMutex::new(output_store)),
             build_output,
@@ -195,10 +190,7 @@ impl Session {
                     }
                     Err(error) => {
                         let message = format!("output capture failed on {stream:?}: {error}");
-                        session.record_capture_error(message.clone(), true);
-                        let _ = session
-                            .with_store(move |store| store.mark_incomplete_intent(&message))
-                            .await;
+                        session.record_capture_error(message, true);
                         break;
                     }
                 }
@@ -228,12 +220,12 @@ impl Session {
         }
     }
 
-    fn set_forced_incomplete_reason(&self, reason: String) {
+    pub(crate) fn mark_forced_incomplete(&self, reason: &str) {
         let mut changed = false;
         if let Ok(mut stored) = self.forced_incomplete_reason.lock()
             && stored.is_none()
         {
-            *stored = Some(reason);
+            *stored = Some(reason.to_owned());
             changed = true;
         }
         self.stop_capture.store(true, Ordering::SeqCst);
@@ -449,7 +441,7 @@ impl Session {
             && !self.wait_for_capture_tasks(DRAIN_TIMEOUT).await
         {
             let reason = "output drain deadline exceeded after root process exit".to_owned();
-            let _ = self.mark_forced_incomplete(&reason).await;
+            self.mark_forced_incomplete(&reason);
             self.process.terminate();
             let _ = self.wait_for_capture_tasks(FORCE_DRAIN_TIMEOUT).await;
         }
@@ -517,13 +509,6 @@ impl Session {
         }
     }
 
-    pub async fn commit_output(&self, end: u64) {
-        let mut cursor = self.output_cursor.lock().await;
-        if end >= *cursor {
-            *cursor = end;
-        }
-    }
-
     pub(crate) fn try_commit_output(&self, end: u64) -> io::Result<()> {
         let mut cursor = self.output_cursor.try_lock().map_err(|error| {
             io::Error::other(format!(
@@ -536,26 +521,13 @@ impl Session {
         Ok(())
     }
 
-    pub async fn mark_recovery_required(&self, reason: &str) -> io::Result<()> {
-        let reason = reason.to_owned();
-        self.with_store(move |store| store.mark_recovery_required(&reason))
-            .await
-    }
-
-    pub async fn mark_forced_incomplete(&self, reason: &str) -> io::Result<()> {
-        self.set_forced_incomplete_reason(reason.to_owned());
-        let reason = reason.to_owned();
-        self.with_store(move |store| store.mark_incomplete_intent(&reason))
-            .await
-    }
-
     pub async fn seal_complete(&self) -> io::Result<()> {
-        self.with_store(OutputStore::seal_complete).await
+        self.with_store(|store| store.finish(None)).await
     }
 
     pub async fn seal_incomplete(&self, reason: &str) -> io::Result<()> {
         let reason = reason.to_owned();
-        self.with_store(move |store| store.seal_incomplete(&reason))
+        self.with_store(move |store| store.finish(Some(reason)))
             .await
     }
 
@@ -566,6 +538,11 @@ impl Session {
 
     pub async fn output_ref_info(&self) -> io::Result<OutputRefInfo> {
         self.with_store(|store| Ok(store.ref_info())).await
+    }
+
+    pub fn publish_output_ref(&self) -> io::Result<()> {
+        lock_output_store(&self.output_store)?.publish();
+        Ok(())
     }
 
     pub async fn delete_output(&self) -> io::Result<()> {

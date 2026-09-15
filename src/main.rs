@@ -1,4 +1,3 @@
-use clap::Parser;
 use rmcp::ServiceExt;
 
 use chatgpt_exec_mcp::Config;
@@ -7,8 +6,29 @@ use chatgpt_exec_mcp::ProcessManager;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = chatgpt_exec_mcp::config::Cli::parse();
-    let config = Config::load(&cli.config)?;
+    let mut args = std::env::args_os().skip(1);
+    let first = args.next();
+    let config_path = match first.as_deref() {
+        Some(flag) if flag == "--config" => args.next().map(std::path::PathBuf::from),
+        Some(flag) if (flag == "--help" || flag == "-h") && args.len() == 0 => {
+            println!(
+                "Usage: chatgpt-exec-mcp --config <PATH>\n       chatgpt-exec-mcp --help | --version"
+            );
+            return Ok(());
+        }
+        Some(flag) if (flag == "--version" || flag == "-V") && args.len() == 0 => {
+            println!("chatgpt-exec-mcp {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        _ => None,
+    };
+    anyhow::ensure!(
+        args.next().is_none(),
+        "unexpected argument; use --config <PATH>"
+    );
+    let config_path =
+        config_path.ok_or_else(|| anyhow::anyhow!("usage: chatgpt-exec-mcp --config <PATH>"))?;
+    let config = Config::load(&config_path)?;
     let manager = ProcessManager::new(config)?;
     let reaper = manager.spawn_reaper();
     let service = ExecMcpServer::new(manager.clone());

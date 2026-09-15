@@ -73,7 +73,12 @@ The ordinary implicit display budget is approximately 8,000 tokens; recognized `
 
 For recognized builds, the projection can additionally preserve a few buried summary lines such as Cargo completion/test summaries or Gradle build status. Unknown or ambiguous shell commands use the generic output policy.
 
-Raw output is stored in `output_store_dir`, subject to the configured retention and capacity limits.
+Raw output is captured in `raw.log` under `output_store_dir`. Only logs exposed through
+`output_ref` are retained after a session ends. Inactive logs expire by mtime; all logs
+share one byte capacity limit. See [configuration](docs/configuration.md#optional-limits).
+
+Tool argument validation uses rmcp’s standard `isError: true` tool results; unknown
+tool names return a JSON-RPC invalid-params error.
 
 The server writes MCP JSON-RPC to stdout and diagnostics to stderr.
 

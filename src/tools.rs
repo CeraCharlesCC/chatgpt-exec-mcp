@@ -1,6 +1,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 
+use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -18,17 +19,31 @@ pub const MAX_YIELD_MS: u64 = 120_000;
 pub const MIN_WAIT_SECONDS: u64 = 15;
 pub const MAX_WAIT_SECONDS: u64 = 100;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct ExecCommandArgs {
+    /// Shell command passed to the server-configured shell with -c.
+    #[schemars(length(min = 1))]
     pub cmd: String,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    /// Absolute path, or relative to the workspace base directory. The workspace is not a sandbox boundary.
+    #[schemars(with = "String", skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
     #[serde(default)]
+    /// Allocate a PTY.
     pub tty: bool,
     #[serde(default, deserialize_with = "deserialize_optional_yield_ms")]
+    /// Initial wait before a still-running command becomes a continuation.
+    #[schemars(with = "u64", range(min = MIN_YIELD_MS, max = MAX_YIELD_MS), extend("default" = DEFAULT_EXEC_YIELD_MS))]
     pub yield_time_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_optional_positive_usize")]
+    /// Optional display budget: approximately four bytes per token.
+    #[schemars(
+        with = "usize",
+        range(min = 1),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_output_tokens: Option<usize>,
 }
 
@@ -38,39 +53,77 @@ impl ExecCommandArgs {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct StartSessionArgs {
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    /// Long-lived shell command. Omit to use the server-configured shell.
+    #[schemars(
+        with = "String",
+        length(min = 1),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cmd: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    /// Absolute path, or relative to the workspace base directory. The workspace is not a sandbox boundary.
+    #[schemars(with = "String", skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    /// Allocate a PTY (default true).
+    #[schemars(with = "bool", extend("default" = true))]
     pub tty: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_optional_positive_usize")]
+    /// Optional display budget: approximately four bytes per token.
+    #[schemars(
+        with = "usize",
+        range(min = 1),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_output_tokens: Option<usize>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct WriteStdinArgs {
+    /// Memorable process handle returned by exec_command or start_session.
+    #[schemars(regex(pattern = "^[a-z]+-[a-z]+$"))]
     pub session_id: String,
     #[serde(default)]
+    /// Raw input. Empty input returns pending output immediately.
     pub chars: String,
     #[serde(default, deserialize_with = "deserialize_optional_positive_usize")]
+    /// Optional display budget: approximately four bytes per token.
+    #[schemars(
+        with = "usize",
+        range(min = 1),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_output_tokens: Option<usize>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct WaitForExitArgs {
+    /// Memorable process handle returned by exec_command or start_session.
+    #[schemars(regex(pattern = "^[a-z]+-[a-z]+$"))]
     pub session_id: String,
     #[serde(
         default = "default_wait_seconds",
         deserialize_with = "deserialize_wait_seconds"
     )]
+    /// Maximum time to wait for process exit. Ordinary output does not end the wait.
+    #[schemars(with = "u64", range(min = MIN_WAIT_SECONDS, max = MAX_WAIT_SECONDS))]
     pub wait_seconds: u64,
     #[serde(default, deserialize_with = "deserialize_optional_positive_usize")]
+    /// Optional display budget: approximately four bytes per token.
+    #[schemars(
+        with = "usize",
+        range(min = 1),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_output_tokens: Option<usize>,
 }
 
@@ -160,32 +213,43 @@ where
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
 pub struct ExecResponse {
+    /// Wall-clock time servicing this call, not total session runtime.
+    #[schemars(range(min = 0))]
     pub call_wall_time_seconds: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "i32", default)]
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", default)]
     pub session_id: Option<String>,
     pub output: String,
     pub output_truncated: bool,
     pub output_encoding_loss: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", default)]
     pub capture_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "OutputRef", default)]
     pub output_ref: Option<OutputRef>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", deny_unknown_fields, inline)]
 pub struct OutputRef {
     pub path: String,
     pub range_start: u64,
     pub range_end: u64,
     pub stored_bytes: u64,
+    #[schemars(extend("enum" = ["open", "complete", "incomplete"]))]
     pub capture_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "u64", default)]
     pub expires_at_unix_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", default)]
     pub incomplete_reason: Option<String>,
 }
 
