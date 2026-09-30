@@ -39,15 +39,15 @@ pub struct PoolMembersArgs {
 pub struct PoolSendArgs {
     /// Pool name within this account.
     pub pool: String,
-    /// Member name, or global to send to all other active members.
-    pub agent: String,
+    /// Active member name, or global for all other active members.
+    pub target: String,
     /// Message text, up to 64 KiB.
     pub message: String,
     #[serde(default)]
     pub in_reply_to: Option<String>,
     #[serde(default)]
-    /// Required on the first send in a pool. Later sends infer the bound sender.
-    pub from_agent: Option<String>,
+    /// Agent name to claim on your first send to this pool; omit thereafter.
+    pub register_as: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
@@ -76,7 +76,14 @@ pub struct PoolMembersResult {
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct PoolSendResult {
-    pub message_id: String,
+    /// Effective sender identity inferred for this session.
+    pub sender: String,
+    /// Message id when at least one delivery was queued; null otherwise.
+    pub message_id: Option<String>,
+    /// Number of active members that received this message.
+    pub delivery_count: usize,
+    /// True when this call created the sender's pool membership.
+    pub membership_created: bool,
     pub recipients: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<PeerMessage>", default)]
@@ -439,16 +446,16 @@ impl AgentPoolStore {
     ) -> Result<PoolSendResult, McpError> {
         validate_name(principal, "principal")?;
         validate_name(&args.pool, "pool")?;
-        validate_name(&args.agent, "agent")?;
+        validate_name(&args.target, "target")?;
         if args.message.is_empty() || args.message.len() > 65_536 {
             return Err(invalid("message must contain 1 to 65536 bytes"));
         }
         if let Some(reply) = &args.in_reply_to {
             validate_name(reply, "in_reply_to")?;
         }
-        if let Some(from_agent) = &args.from_agent {
-            validate_name(from_agent, "from_agent")?;
-            if from_agent == "global" {
+        if let Some(register_as) = &args.register_as {
+            validate_name(register_as, "register_as")?;
+            if register_as == "global" {
                 return Err(invalid("global is reserved as the broadcast target"));
             }
         }
@@ -472,22 +479,20 @@ impl AgentPoolStore {
             .optional()
             .map_err(|_| storage_error())?;
 
-        let (sender_id, sender) = match bound {
+        let (sender_id, sender, membership_created) = match bound {
             Some((member_id, agent)) => {
-                if args
-                    .from_agent
-                    .as_ref()
-                    .is_some_and(|requested| requested != &agent)
-                {
-                    return Err(invalid("from_agent cannot override the correlated sender"));
+                if args.register_as.is_some() {
+                    return Err(invalid(
+                        "register_as is only valid on this session's first send to a pool",
+                    ));
                 }
-                (member_id, agent)
+                (member_id, agent, false)
             }
             None => {
                 let agent = args
-                    .from_agent
+                    .register_as
                     .as_deref()
-                    .ok_or_else(|| invalid("first pool_send in a pool requires from_agent"))?;
+                    .ok_or_else(|| invalid("first pool_send in a pool requires register_as"))?;
                 if transaction
                     .query_row(
                         "SELECT 1 FROM members
@@ -516,7 +521,7 @@ impl AgentPoolStore {
                         ],
                     )
                     .map_err(|_| agent_conflict())?;
-                (transaction.last_insert_rowid(), agent.to_owned())
+                (transaction.last_insert_rowid(), agent.to_owned(), true)
             }
         };
 
@@ -528,7 +533,7 @@ impl AgentPoolStore {
             .map_err(|_| storage_error())?;
 
         let targets: Vec<(i64, String)> = {
-            let mut statement = if args.agent == "global" {
+            let mut statement = if args.target == "global" {
                 transaction
                     .prepare(
                         "SELECT id,agent FROM members
@@ -545,7 +550,7 @@ impl AgentPoolStore {
                     )
                     .map_err(|_| storage_error())?
             };
-            if args.agent == "global" {
+            if args.target == "global" {
                 statement
                     .query_map(params![principal, args.pool, sender_id, now], |row| {
                         Ok((row.get(0)?, row.get(1)?))
@@ -555,7 +560,7 @@ impl AgentPoolStore {
                     .map_err(|_| storage_error())?
             } else {
                 statement
-                    .query_map(params![principal, args.pool, args.agent, now], |row| {
+                    .query_map(params![principal, args.pool, args.target, now], |row| {
                         Ok((row.get(0)?, row.get(1)?))
                     })
                     .map_err(|_| storage_error())?
@@ -563,7 +568,7 @@ impl AgentPoolStore {
                     .map_err(|_| storage_error())?
             }
         };
-        if args.agent != "global" && targets.is_empty() {
+        if args.target != "global" && targets.is_empty() {
             return Err(invalid("target agent is not an active pool member"));
         }
 
@@ -574,12 +579,14 @@ impl AgentPoolStore {
             return Err(invalid("agent pool inbox is full; retry later"));
         }
 
-        let message_id = format!("msg_{}", Uuid::new_v4());
         let recipients = targets
             .iter()
             .map(|(_, agent)| agent.clone())
             .collect::<Vec<_>>();
-        if !targets.is_empty() {
+        let message_id = if targets.is_empty() {
+            None
+        } else {
+            let message_id = format!("msg_{}", Uuid::new_v4());
             transaction
                 .execute(
                     "INSERT INTO messages(id,principal,pool,sender,target,body,in_reply_to,created)
@@ -589,7 +596,7 @@ impl AgentPoolStore {
                         principal,
                         args.pool,
                         sender,
-                        args.agent,
+                        args.target,
                         args.message,
                         args.in_reply_to,
                         now
@@ -604,10 +611,15 @@ impl AgentPoolStore {
                     )
                     .map_err(|_| storage_error())?;
             }
-        }
+            Some(message_id)
+        };
         transaction.commit().map_err(|_| storage_error())?;
+        let delivery_count = recipients.len();
         Ok(PoolSendResult {
+            sender,
             message_id,
+            delivery_count,
+            membership_created,
             recipients,
             peer_messages: None,
         })
@@ -693,13 +705,13 @@ mod tests {
         (directory, store)
     }
 
-    fn send(pool: &str, target: &str, from: Option<&str>, body: &str) -> PoolSendArgs {
+    fn send(pool: &str, target: &str, register_as: Option<&str>, body: &str) -> PoolSendArgs {
         PoolSendArgs {
             pool: pool.into(),
-            agent: target.into(),
+            target: target.into(),
             message: body.into(),
             in_reply_to: None,
-            from_agent: from.map(str::to_owned),
+            register_as: register_as.map(str::to_owned),
         }
     }
 
@@ -714,23 +726,49 @@ mod tests {
                 Some("a"),
             )
             .unwrap();
+        assert_eq!(first.sender, "alice");
         assert!(first.recipients.is_empty());
-        store
+        assert_eq!(first.delivery_count, 0);
+        assert!(first.membership_created);
+        assert!(first.message_id.is_none());
+
+        let empty_again = store
+            .send(
+                owner,
+                send("project", "global", None, "still alone"),
+                Some("a"),
+            )
+            .unwrap();
+        assert_eq!(empty_again.sender, "alice");
+        assert!(empty_again.recipients.is_empty());
+        assert_eq!(empty_again.delivery_count, 0);
+        assert!(!empty_again.membership_created);
+        assert!(empty_again.message_id.is_none());
+
+        let bob_join = store
             .send(
                 owner,
                 send("project", "global", Some("bob"), "joined"),
                 Some("b"),
             )
             .unwrap();
+        assert_eq!(bob_join.sender, "bob");
+        assert_eq!(bob_join.delivery_count, 1);
+        assert!(bob_join.membership_created);
+        assert!(bob_join.message_id.is_some());
         let broadcast = store
             .send(owner, send("project", "global", None, "team"), Some("a"))
             .unwrap();
+        assert_eq!(broadcast.sender, "alice");
         assert_eq!(broadcast.recipients, ["bob"]);
+        assert_eq!(broadcast.delivery_count, 1);
+        assert!(!broadcast.membership_created);
+        assert!(broadcast.message_id.is_some());
         assert!(
             store
                 .send(
                     owner,
-                    send("project", "alice", Some("bob"), "forged"),
+                    send("project", "alice", Some("alice"), "redundant"),
                     Some("a")
                 )
                 .is_err()

@@ -120,11 +120,14 @@ connector backed by this instance with other accounts. Deploy a separate core,
 tunnel, socket, and database for every account.
 
 Without agent_pool, pool tools are unavailable. A session joins a pool on its
-first pool_send, which requires from_agent and _meta["openai/session"]. The
-server atomically claims the agent name and binds it to that session. Later
-sends infer the sender; supplying a different from_agent is rejected. Agent
-names are unique among active members of a pool, and global is reserved as the
-broadcast target.
+first pool_send, which requires register_as and _meta["openai/session"]. The
+server atomically claims that agent name and binds it to the session. Later sends
+infer the sender, so register_as is omitted or null; supplying it again is
+rejected. target names one active member or global, which broadcasts to all
+other active members. Agent names are unique within a pool. A global send may
+have zero recipients and still create membership. PoolSendResult reports the
+effective sender, whether membership was created, delivery_count, recipients,
+and message_id (null when nothing was queued).
 
 Membership is a configurable inactivity lease (one day by default). Any ordinary tool call from
 the bound session refreshes all of that session's memberships. Expired members

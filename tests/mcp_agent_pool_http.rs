@@ -158,17 +158,17 @@ impl Server {
     async fn send(
         &self,
         session: &str,
-        from_agent: Option<&str>,
+        register_as: Option<&str>,
         target: &str,
         message: &str,
     ) -> Value {
         let mut arguments = json!({
             "pool": "Imperator",
-            "agent": target,
+            "target": target,
             "message": message
         });
-        if let Some(from_agent) = from_agent {
-            arguments["from_agent"] = json!(from_agent);
+        if let Some(register_as) = register_as {
+            arguments["register_as"] = json!(register_as);
         }
         self.tool("pool_send", arguments, Some(session)).await
     }
@@ -230,13 +230,42 @@ async fn piggyback_agent_pool_acceptance_path() {
         .unwrap();
     assert_eq!(
         send_schema["inputSchema"]["required"],
-        json!(["pool", "agent", "message"])
+        json!(["pool", "target", "message"])
     );
     assert!(
         send_schema["inputSchema"]["properties"]
-            .get("from_agent")
+            .get("register_as")
             .is_some()
     );
+    let send_description = send_schema["description"]
+        .as_str()
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        send_description,
+        "Send to target (an active member or global). On your first send to a pool, set register_as to claim your agent name; later sends infer it, so omit register_as. Typically use target=global first to announce your join; zero recipients still registers you."
+    );
+    let register_description =
+        send_schema["inputSchema"]["properties"]["register_as"]["description"]
+            .as_str()
+            .unwrap();
+    assert!(register_description.contains("first send"));
+    assert!(register_description.contains("omit thereafter"));
+    for property in [
+        "sender",
+        "message_id",
+        "delivery_count",
+        "membership_created",
+    ] {
+        assert!(
+            send_schema["outputSchema"]["properties"]
+                .get(property)
+                .is_some(),
+            "missing pool_send output property {property}"
+        );
+    }
     let exec_schema = tools
         .iter()
         .find(|tool| tool["name"] == "exec_command")
@@ -250,12 +279,29 @@ async fn piggyback_agent_pool_acceptance_path() {
     let augustus = server
         .send("session-a", Some("Augustus"), "global", "Augustus joined")
         .await;
+    assert_eq!(structured(&augustus)["sender"], "Augustus");
     assert_eq!(structured(&augustus)["recipients"], json!([]));
+    assert_eq!(structured(&augustus)["delivery_count"], 0);
+    assert_eq!(structured(&augustus)["membership_created"], true);
+    assert_eq!(structured(&augustus)["message_id"], Value::Null);
+
+    let empty_again = server
+        .send("session-a", None, "global", "still alone")
+        .await;
+    assert_eq!(structured(&empty_again)["sender"], "Augustus");
+    assert_eq!(structured(&empty_again)["recipients"], json!([]));
+    assert_eq!(structured(&empty_again)["delivery_count"], 0);
+    assert_eq!(structured(&empty_again)["membership_created"], false);
+    assert_eq!(structured(&empty_again)["message_id"], Value::Null);
 
     let tiberius = server
         .send("session-b", Some("Tiberius"), "global", "Tiberius joined")
         .await;
+    assert_eq!(structured(&tiberius)["sender"], "Tiberius");
     assert_eq!(structured(&tiberius)["recipients"], json!(["Augustus"]));
+    assert_eq!(structured(&tiberius)["delivery_count"], 1);
+    assert_eq!(structured(&tiberius)["membership_created"], true);
+    assert!(structured(&tiberius)["message_id"].as_str().is_some());
 
     let join_offer = server.exec("session-a").await;
     assert_eq!(
@@ -270,10 +316,30 @@ async fn piggyback_agent_pool_acceptance_path() {
             .contains("=== PEER MESSAGES ===")
     );
 
+    let redundant_registration = server
+        .send(
+            "session-b",
+            Some("Tiberius"),
+            "Augustus",
+            "redundant registration",
+        )
+        .await;
+    assert_eq!(redundant_registration["result"]["isError"], true);
+    assert!(
+        redundant_registration["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("register_as is only valid")
+    );
+
     let targeted = server
         .send("session-b", None, "Augustus", "API side is updated")
         .await;
+    assert_eq!(structured(&targeted)["sender"], "Tiberius");
     assert_eq!(structured(&targeted)["recipients"], json!(["Augustus"]));
+    assert_eq!(structured(&targeted)["delivery_count"], 1);
+    assert_eq!(structured(&targeted)["membership_created"], false);
+    assert!(structured(&targeted)["message_id"].as_str().is_some());
     let offered = server.exec("session-a").await;
     assert_eq!(
         structured(&offered)["peer_messages"]

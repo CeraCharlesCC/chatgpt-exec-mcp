@@ -19,10 +19,13 @@ The MCP server exposes four execution tools:
 Session IDs are short memorable handles such as `amber-river`. The server enforces separate quotas and idle timeouts for explicit sessions and `exec_command` continuations.
 
 With agent_pool configured, pool_members(pool) lists active members and
-pool_send(pool, agent, message) sends to a named member or to global for all
-other active members. A session joins a pool on its first pool_send; that call
-supplies from_agent, which is bound to _meta["openai/session"]. Later sends
-infer the sender and reject attempts to override it.
+pool_send(pool, target, message) sends to one active member or to global for all
+other active members. On a session's first send to a pool, register_as claims
+the agent name and binds it to _meta["openai/session"]. Later sends infer the
+sender, so register_as is omitted or null. Supplying it again is rejected. A
+global send can succeed with zero recipients and still create membership; the
+result reports sender, membership_created, delivery_count, recipients, and a
+message_id only when at least one delivery was queued.
 
 Membership is an inactivity lease refreshed by ordinary tool activity; the deployment default is one day and is configurable in agent_pool.
 Messages are stored in a durable SQLite inbox. exec_command, start_session,

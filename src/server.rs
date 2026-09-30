@@ -129,8 +129,10 @@ impl ExecMcpServer {
         Self::pool_result(result, peers)
     }
 
-    /// Queue a message to a named member, or to global for all other active members.
-    /// The first send in a pool binds from_agent to the current openai/session.
+    /// Send to target (an active member or global). On your first send to a pool,
+    /// set register_as to claim your agent name; later sends infer it, so omit
+    /// register_as. Typically use target=global first to announce your join; zero
+    /// recipients still registers you.
     #[tool(output_schema = schema_for_output::<PoolSendResult>(), annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true, idempotent_hint = false))]
     async fn pool_send(
         &self,
