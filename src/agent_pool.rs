@@ -25,11 +25,18 @@ const DEFAULT_TTL_MS: i64 = 86_400_000;
 const MAX_PENDING: i64 = 10_000;
 const MAX_BATCH_COUNT: usize = 32;
 const MAX_BATCH_BYTES: usize = 128 * 1024;
+const MAX_NAME_CHARS: usize = 128;
+const MAX_MESSAGE_BYTES: usize = 65_536;
+const NAME_SCHEMA_PATTERN: &str = r"^[^\u0000-\u0020\u007F-\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000](?:[^\u0000-\u001F\u007F-\u009F]*[^\u0000-\u0020\u007F-\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000])?$";
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct PoolMembersArgs {
+    #[schemars(
+        length(min = 1, max = MAX_NAME_CHARS),
+        regex(pattern = NAME_SCHEMA_PATTERN)
+    )]
     pub pool: String,
 }
 
@@ -38,20 +45,41 @@ pub struct PoolMembersArgs {
 #[schemars(crate = "rmcp::schemars")]
 pub struct PoolSendArgs {
     /// Pool name within this account.
+    #[schemars(
+        length(min = 1, max = MAX_NAME_CHARS),
+        regex(pattern = NAME_SCHEMA_PATTERN)
+    )]
     pub pool: String,
     /// Active member name, or global for all other active members.
+    #[schemars(
+        length(min = 1, max = MAX_NAME_CHARS),
+        regex(pattern = NAME_SCHEMA_PATTERN)
+    )]
     pub target: String,
-    /// Message text, up to 64 KiB.
+    /// Message text, 1 to 65,536 UTF-8 bytes.
+    #[schemars(length(min = 1, max = MAX_MESSAGE_BYTES))]
     pub message: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_non_null_string")]
+    #[schemars(
+        with = "String",
+        length(min = 1, max = MAX_NAME_CHARS),
+        regex(pattern = NAME_SCHEMA_PATTERN),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub in_reply_to: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_non_null_string")]
     /// Agent name to claim on your first send to this pool; omit thereafter.
+    #[schemars(
+        with = "String",
+        length(min = 1, max = MAX_NAME_CHARS),
+        regex(pattern = NAME_SCHEMA_PATTERN),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub register_as: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
-#[schemars(crate = "rmcp::schemars")]
+#[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
 pub struct PeerMessage {
     pub message_id: String,
     pub pool: String,
@@ -64,7 +92,7 @@ pub struct PeerMessage {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
+#[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
 pub struct PoolMembersResult {
     pub pool: String,
     pub agents: Vec<String>,
@@ -74,11 +102,13 @@ pub struct PoolMembersResult {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
+#[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
 pub struct PoolSendResult {
     /// Effective sender identity inferred for this session.
     pub sender: String,
-    /// Message id when at least one delivery was queued; null otherwise.
+    /// Message id when at least one delivery was queued; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", default)]
     pub message_id: Option<String>,
     /// Number of active members that received this message.
     pub delivery_count: usize,
@@ -88,6 +118,20 @@ pub struct PoolSendResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<PeerMessage>", default)]
     pub peer_messages: Option<Vec<PeerMessage>>,
+}
+
+fn deserialize_optional_non_null_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?.map_or_else(
+        || {
+            Err(serde::de::Error::custom(
+                "null is not allowed; omit the field instead",
+            ))
+        },
+        |value| Ok(Some(value)),
+    )
 }
 
 #[derive(Default)]
@@ -447,7 +491,7 @@ impl AgentPoolStore {
         validate_name(principal, "principal")?;
         validate_name(&args.pool, "pool")?;
         validate_name(&args.target, "target")?;
-        if args.message.is_empty() || args.message.len() > 65_536 {
+        if args.message.is_empty() || args.message.len() > MAX_MESSAGE_BYTES {
             return Err(invalid("message must contain 1 to 65536 bytes"));
         }
         if let Some(reply) = &args.in_reply_to {
@@ -647,7 +691,7 @@ fn prune_messages(connection: &Connection) -> Result<(), McpError> {
 
 fn validate_name(value: &str, field: &str) -> Result<(), McpError> {
     if value.is_empty()
-        || value.chars().count() > 128
+        || value.chars().count() > MAX_NAME_CHARS
         || value.trim() != value
         || value.chars().any(char::is_control)
     {

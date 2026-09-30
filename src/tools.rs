@@ -19,17 +19,26 @@ pub const MIN_YIELD_MS: u64 = 10;
 pub const MAX_YIELD_MS: u64 = 120_000;
 pub const MIN_WAIT_SECONDS: u64 = 15;
 pub const MAX_WAIT_SECONDS: u64 = 100;
+const NON_WHITESPACE_SCHEMA_PATTERN: &str =
+    r"[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]";
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ExecCommandArgs {
     /// Shell command passed to the server-configured shell with -c.
-    #[schemars(length(min = 1))]
+    #[schemars(
+        length(min = 1),
+        regex(pattern = NON_WHITESPACE_SCHEMA_PATTERN)
+    )]
     pub cmd: String,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     /// Absolute path, or relative to the workspace base directory. The workspace is not a sandbox boundary.
-    #[schemars(with = "String", skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        with = "String",
+        length(min = 1),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub workdir: Option<String>,
     #[serde(default)]
     /// Allocate a PTY.
@@ -63,12 +72,17 @@ pub struct StartSessionArgs {
     #[schemars(
         with = "String",
         length(min = 1),
+        regex(pattern = NON_WHITESPACE_SCHEMA_PATTERN),
         skip_serializing_if = "Option::is_none"
     )]
     pub cmd: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     /// Absolute path, or relative to the workspace base directory. The workspace is not a sandbox boundary.
-    #[schemars(with = "String", skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        with = "String",
+        length(min = 1),
+        skip_serializing_if = "Option::is_none"
+    )]
     pub workdir: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     /// Allocate a PTY (default true).
@@ -224,7 +238,7 @@ pub struct ExecResponse {
     #[schemars(with = "i32", default)]
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "String", default)]
+    #[schemars(with = "String", regex(pattern = "^[a-z]+-[a-z]+$"), default)]
     pub session_id: Option<String>,
     pub output: String,
     pub output_truncated: bool,
