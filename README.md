@@ -1,84 +1,19 @@
 # chatgpt-exec-mcp
 
-An MCP server for running shell commands and exchanging durable messages between
-account-scoped cooperative agents. It supports stdio and Unix-socket Streamable HTTP.
+An MCP server for shell commands, stateful terminals, and messages between
+cooperating agents. It supports stdio and Unix-socket Streamable HTTP.
 
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the vendored PTY utility.
+## Run
 
-## Tools
-
-The MCP server exposes four execution tools:
-
-| Tool | Purpose |
-| --- | --- |
-| `exec_command` | Run a shell command and return its exit code. If it is still running after the initial yield, return a session ID instead. |
-| `start_session` | Start an explicitly stateful shell, REPL, or long-running process. Uses a PTY by default. |
-| `write_stdin` | Send input, send Ctrl-C, or immediately poll output from a running session. |
-| `wait_for_exit` | Wait for a running session to finish without waking on ordinary stdout/stderr activity. |
-
-Session IDs are short memorable handles such as `amber-river`. The server enforces separate quotas and idle timeouts for explicit sessions and `exec_command` continuations.
-
-With agent_pool configured, pool_members(pool) lists active members and
-pool_send(pool, target, message) sends to one active member or to global for all
-other active members. On a session's first send to a pool, register_as claims
-the agent name and binds it to _meta["openai/session"]. Later sends infer the
-sender, so register_as is omitted or null. Supplying it again is rejected. A
-global send can succeed with zero recipients and still create membership; the
-result reports sender, membership_created, delivery_count, recipients, and a
-message_id only when at least one delivery was queued.
-
-Membership is an inactivity lease refreshed by ordinary tool activity; the deployment default is one day and is configurable in agent_pool.
-Messages are stored in a durable SQLite inbox. exec_command, start_session,
-write_stdin, wait_for_exit, and pool calls piggyback unread peer_messages in
-their normal results. Messages offered on one call are acknowledged by the
-same session's next tool call, giving at-least-once delivery without join,
-leave, poll, or ack tools. global never self-delivers. Pool state and pending
-inbox rows survive core restarts; expired memberships and their inbox rows are
-cleaned up automatically. Each instance is for one authenticated account;
-deploy separate core, tunnel, socket, and database for different accounts. See
-[agent-pool configuration](docs/configuration.md#agent-pool-and-account-scope).
-
-## Build
-
-Rust 1.88 or newer is required (edition 2024).
+Linux x86_64 binaries are available from [Releases](https://github.com/CeraCharlesCC/chatgpt-exec-mcp/releases).
+Start with [examples/minimal.json](examples/minimal.json) and edit the workspace,
+shell, output directory, and child environment for your deployment.
 
 ```bash
-cargo build --release --locked
-cargo test --all-targets --locked
+chatgpt-exec-mcp --config /absolute/path/to/config.json
 ```
 
-For a distributable standalone binary, use the fixed offline build recipe after
-fetching the locked dependencies. It builds in an isolated target directory and
-remaps builder paths out of runtime diagnostics:
-
-```bash
-python3 scripts/build-standalone.py --output /tmp/chatgpt-exec-mcp
-```
-
-Linux x86_64 binaries are available from [Releases](https://github.com/CeraCharlesCC/chatgpt-exec-mcp/releases). Optional provenance verification: `gh attestation verify <binary> --repo CeraCharlesCC/chatgpt-exec-mcp`.
-
-Run the server over stdio:
-
-```bash
-./target/release/chatgpt-exec-mcp --config examples/minimal.json
-```
-
-Or run HTTP with an existing socket parent directory:
-
-```bash
-./target/release/chatgpt-exec-mcp --config examples/minimal.json --listen-unix /absolute/path/mcp.sock
-```
-
-The HTTP endpoint `/mcp` advertises only MCP `2026-07-28`, requires modern
-per-request metadata, and uses JSON responses without `Mcp-Session-Id`.
-`/readyz` probes local readiness. Run the forwarding tunnel as the same Unix user
-as core to access the `0600` socket. Separate core and tunnel services preserve
-core-owned PTYs across tunnel restarts; restarting core ends PTYs. See
-[HTTP configuration](docs/configuration.md#unix-streamable-http).
-
-Versioned JSON configuration is required. Workspace, shell, output directory and child environment policy are explicit; see [configuration version 1](docs/configuration.md) for defaults, validation and the breaking changes from the old CLI.
-
-A typical stdio MCP client configuration has this shape (the exact configuration format depends on the client):
+A typical stdio MCP client configuration is:
 
 ```json
 {
@@ -91,31 +26,73 @@ A typical stdio MCP client configuration has this shape (the exact configuration
 }
 ```
 
-## Execution behavior
+For HTTP, add `--listen-unix /absolute/path/mcp.sock`. The socket parent must
+exist, and the forwarding tunnel must run as the same Unix user. HTTP clients
+must support MCP `2026-07-28`. `/readyz` reports
+local readiness. See [configuration](docs/configuration.md#unix-streamable-http).
 
-`exec_command` invokes the configured shell with `-c` (without login profiles). It waits up to 10 seconds by default; if the command is still running, the response includes a `session_id` that can be passed to `wait_for_exit` or `write_stdin`.
+## Execution tools
 
-Use `start_session` when state must persist between calls, such as an interactive shell or REPL. Use `wait_for_exit` when a process only needs more time. Use `write_stdin` for input, Ctrl-C, or output polling.
+| Tool | Purpose |
+| --- | --- |
+| `exec_command` | Run a shell command. Return its exit code when finished, or a session ID when it needs more time. |
+| `start_session` | Start a stateful shell, REPL, or long-running process. Uses a PTY by default. |
+| `write_stdin` | Send input or Ctrl-C, or immediately poll pending output with empty input. |
+| `wait_for_exit` | Wait for completion without waking on ordinary stdout/stderr activity. |
 
-Child processes receive only the configured `child_env` allowlist and matching conditional rules, plus `CHATGPT_EXEC_SESSION`. Both pipe and PTY clear inherited environment. Credential values and host-specific runtime defaults belong in the deployment layer.
+`exec_command` runs the configured shell without login profiles and waits up to
+10 seconds by default. Use `start_session` when variables or working-directory
+changes must persist between calls. Configure the child environment through
+[`child_env`](docs/configuration.md#child-environment).
 
-## Output behavior
+Large outputs return a bounded excerpt and an `output_ref` for recovering the
+full log from the same filesystem. The default display budget is approximately
+8,000 tokens, or 2,000 for recognized Rust/Cargo/Gradle builds; set
+`max_output_tokens` to override it. Build excerpts may preserve buried summary
+lines. Referenced logs have configurable retention and capacity limits; see
+[configuration](docs/configuration.md#optional-limits).
 
-Command output is captured to a managed raw-output store. If the output fits the response budget, it is returned in full. Oversized output returns a bounded head/tail projection and an `output_ref` describing the raw log so a client running in the same filesystem namespace can recover the omitted bytes.
+## Agent pools
 
-The ordinary implicit display budget is approximately 8,000 tokens; recognized `rustc`, Gradle, and `cargo build/check/test` invocations use approximately 2,000 tokens. Token budgets are estimated at four bytes per token and are not tokenizer-accurate. An explicit `max_output_tokens` overrides the implicit budget.
+With `agent_pool` configured, `pool_members` lists active agents and `pool_send`
+sends to an agent or to `global` (all other members). On your first send to a
+pool, supply `register_as`; later sends infer your name, so omit it.
 
-For recognized builds, the projection can additionally preserve a few buried summary lines such as Cargo completion/test summaries or Gradle build status. Unknown or ambiguous shell commands use the generic output policy.
+```text
+pool_send(pool="project", register_as="alice", target="global", message="Joining the project")
+pool_send(pool="project", target="bob", message="Tests passed")
+```
 
-Raw output is captured in `raw.log` under `output_store_dir`. Only logs exposed through
-`output_ref` are retained after a session ends. Inactive logs expire by mtime; all logs
-share one byte capacity limit. See [configuration](docs/configuration.md#optional-limits).
+Requests must supply `_meta["openai/session"]` to identify the chat. Messages
+arrive as `peer_messages` on the recipient's next tool call; they do not wake an
+idle chat. The following call acknowledges the messages. Membership expires
+after inactivity (one day by default).
 
-Tool argument validation uses rmcp’s standard `isError: true` tool results; unknown
-tool names return a JSON-RPC invalid-params error.
+Run each instance behind a private, authenticated tunnel for one account.
+Restarting only the tunnel preserves PTYs; restarting core ends PTYs but
+preserves memberships and pending messages. See
+[agent-pool configuration](docs/configuration.md#agent-pool-and-account-scope).
 
-In stdio mode, the server writes MCP JSON-RPC to stdout and diagnostics to stderr.
+## Build and test
+
+Rust 1.88 or newer is required.
+
+```bash
+cargo build --release --locked
+cargo test --workspace --all-targets --locked
+```
+
+To build a standalone release binary:
+
+```bash
+cargo fetch --locked
+python3 scripts/build-standalone.py --output /tmp/chatgpt-exec-mcp
+```
+
+Optional provenance verification:
+`gh attestation verify <binary> --repo CeraCharlesCC/chatgpt-exec-mcp`.
 
 ## License
 
-The original code in this repository is offered under the Apache License 2.0. Vendored OpenAI Codex code is also Apache-2.0 licensed and is documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Apache License 2.0. See [LICENSE](LICENSE), [NOTICE](NOTICE), and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for vendored OpenAI Codex code.

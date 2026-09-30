@@ -8,6 +8,11 @@ description = "An MCP server for shell commands, stateful PTYs, and multi-agent 
 readme = "README.md"
 publish = false
 
+[workspace]
+members = ["vendor/codex-utils-pty"]
+default-members = ["."]
+resolver = "3"
+
 [dependencies]
 anyhow = "1"
 codex-utils-pty = { path = "vendor/codex-utils-pty" }

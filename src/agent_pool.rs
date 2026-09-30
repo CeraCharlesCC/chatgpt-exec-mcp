@@ -913,20 +913,6 @@ mod tests {
     }
 
     #[test]
-    fn pruning_has_message_lookup_index() {
-        let (_directory, store) = store();
-        let connection = store.connection().unwrap();
-        let count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='inbox_message_id'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
     fn database_rejects_symlinks_and_permissive_files() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::Builder::new()

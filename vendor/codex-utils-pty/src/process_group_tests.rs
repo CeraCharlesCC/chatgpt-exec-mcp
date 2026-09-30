@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
-use pretty_assertions::assert_eq;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;

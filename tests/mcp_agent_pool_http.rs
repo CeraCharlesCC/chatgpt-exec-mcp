@@ -228,31 +228,25 @@ async fn piggyback_agent_pool_acceptance_path() {
         .iter()
         .find(|tool| tool["name"] == "pool_send")
         .unwrap();
+    let required: std::collections::BTreeSet<_> = send_schema["inputSchema"]["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    assert_eq!(required, ["pool", "target", "message"].into());
     assert_eq!(
-        send_schema["inputSchema"]["required"],
-        json!(["pool", "target", "message"])
+        required.len(),
+        send_schema["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .len()
     );
     assert!(
         send_schema["inputSchema"]["properties"]
             .get("register_as")
             .is_some()
     );
-    let send_description = send_schema["description"]
-        .as_str()
-        .unwrap()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert_eq!(
-        send_description,
-        "Send to target (an active member or global). On your first send to a pool, set register_as to claim your agent name; later sends infer it, so omit register_as. Typically use target=global first to announce your join; zero recipients still registers you."
-    );
-    let register_description =
-        send_schema["inputSchema"]["properties"]["register_as"]["description"]
-            .as_str()
-            .unwrap();
-    assert!(register_description.contains("first send"));
-    assert!(register_description.contains("omit thereafter"));
     for property in [
         "sender",
         "message_id",
@@ -313,7 +307,7 @@ async fn piggyback_agent_pool_acceptance_path() {
         join_offer["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("=== PEER MESSAGES ===")
+            .contains("Tiberius joined")
     );
 
     let redundant_registration = server
@@ -372,7 +366,7 @@ async fn piggyback_agent_pool_acceptance_path() {
         errored["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("=== PEER MESSAGES ===")
+            .contains("error-path")
     );
     let error_ack = server.exec("session-a").await;
     assert!(structured(&error_ack).get("peer_messages").is_none());

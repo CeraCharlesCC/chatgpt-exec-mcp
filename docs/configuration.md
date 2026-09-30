@@ -1,37 +1,31 @@
 # Configuration version 1
 
-Run `chatgpt-exec-mcp --config config.json`; start from the
-[minimal example](../examples/minimal.json). `--help` and `--version` also work
-without a config. Legacy flags and `CHATGPT_EXEC_*` configuration variables are
-rejected. `CHATGPT_EXEC_SESSION` is reserved runtime metadata.
+Start from the [minimal example](../examples/minimal.json) and run
+`chatgpt-exec-mcp --config config.json`. Configuration and environment changes
+require a restart.
 
 ## Required fields and paths
 
-The JSON object requires `version: 1`, `workspace`, `shell`, `output_store_dir`,
-and `child_env` (with explicit `inherit` and `rules` arrays, which may be empty).
-Unknown fields, duplicate keys at any depth, null values, incorrect types,
-unsupported versions and unreadable inputs are rejected before MCP starts.
+| Field | Value |
+| --- | --- |
+| `version` | `1` |
+| `workspace` | Existing directory used as the default working directory. |
+| `shell` | Executable shell file. Commands run without login profiles. |
+| `output_store_dir` | Writable directory for command logs; created if missing. |
+| `child_env` | Object containing `inherit` and `rules` arrays; both may be empty. |
 
-`--config` is relative to the initial cwd. Paths **inside** the file are relative
-to the parent of that supplied config path (including when the file is a symlink).
-Workspace and shell must exist and be usable. Their canonical paths are resolved
-at startup. Shell must be an executable regular file. Only the specified output
-directory is created unless `agent_pool` is configured, which also creates its private
-database directory; creation, locking or write failure aborts startup.
+Paths in the configuration are relative to the config file's directory.
+`workspace` sets the default working directory; it does not restrict filesystem
+access. Use an external sandbox when access restrictions are needed.
 
-`instructions_file` is optional. When present, its nonempty path must refer to a
-readable UTF-8 file. Its contents are appended to the core instructions. An empty
-file is allowed; null and an empty path are errors. Content is frozen at startup.
-
-MCP `workdir` is relative to the configured workspace. Only omission uses workspace;
-an explicit empty string is rejected. Cwd must resolve to an existing directory.
-Every spawn revalidates and canonicalizes it, then uses that same canonical cwd for
-both rule matching and process creation. Absolute paths and `..` are accepted.
+Optional `instructions_file` points to a UTF-8 file whose contents are appended
+to the server's instructions. Use only the documented fields, and omit unused
+optional fields rather than setting them to null.
 
 ## Optional limits
 
-Durations are integer seconds. Omitted fields use these defaults; invalid values
-are rejected. Session and continuation quotas apply separately.
+Durations are integer seconds. Omitted fields use these defaults.
+Session and command-continuation quotas apply separately.
 
 | Field | Default | Allowed inclusive range |
 | --- | ---: | ---: |
@@ -44,18 +38,16 @@ are rejected. Session and continuation quotas apply separately.
 | `output_store_retention` | 604800 | 1–31536000 |
 | `output_store_max_bytes` | 4294967296 | 1–1125899906842624 |
 
-Raw output is captured in `raw.log`. After a session ends, only logs whose
-`output_ref` was returned are retained. GC deletes inactive logs when their mtime
-is older than `output_store_retention`; live sessions are protected. Finishing a
-capture refreshes its mtime. After a crash, leftover logs expire by the same rule.
-`output_store_max_bytes` is the single capacity limit for all raw logs, including
-active captures. If it is exhausted, capture stops and reports an incomplete
-output reference to the stored prefix. There is no early eviction of unexpired logs.
+`output_cap_bytes` limits each displayed response. Logs exposed through
+`output_ref` are retained for `output_store_retention` seconds while inactive;
+unreferenced logs are removed when their session ends.
+`output_store_max_bytes` limits total stored output, including active captures.
+When full, capture stops and reports incomplete output; unexpired logs are kept.
 
 ## Child environment
 
-The process starts with an empty environment. `inherit` copies only named parent
-values, and matching rules copy a source value to a destination name:
+Use `inherit` to pass parent variables to children and `rules` to supply values
+conditionally. Include `HOME`, `PATH`, or other variables your commands need.
 
 ```json
 {
@@ -68,100 +60,51 @@ values, and matching rules copy a source value to a destination name:
 }
 ```
 
-Every inherited value and rule source must be present, nonempty UTF-8 without
-NUL at startup, including rules that have not matched any calls yet. Values are
-snapshotted; changes require restart.
+A rule supports `exec_command` or `start_session` and applies when the command
+starts in `workdir_under` or a subdirectory. The directory must exist. Symlinks
+are resolved before matching; a later `cd` does not change which values apply.
+`set_from_env` maps child variable names to parent variable names.
 
-Names follow `[A-Za-z_][A-Za-z0-9_]*`. Inherited, source and destination name sets
-must be disjoint. Duplicate inherit names, duplicate destinations across rules,
-reserved names, unknown tool names and empty rule mappings are errors. A source
-can feed distinct destinations, but it is never exported under its source name.
-
-Rules support `exec_command` and `start_session`, matched by the actual tool origin,
-independently of PTY selection. Roots must exist and are canonicalized at startup.
-A rule matches when the canonical spawn cwd is the root or a component-wise child
-of it. Symlink escapes and paths sharing only a string prefix do not match.
-Matching uses the initial cwd; a `cd` within the command does not change it.
-
-Core adds `CHATGPT_EXEC_SESSION` to each child. Both pipe and PTY use this policy.
-Commands run as `shell -c`. Set HOME/PATH/XDG in the launcher and list the values
-you need in `inherit`; login profiles are not loaded.
+All inherited and rule-source values must be present and nonempty at startup,
+even for rules that have not matched a command. Variable names must follow
+`[A-Za-z_][A-Za-z0-9_]*`. Inherited, source, and destination names must not overlap;
+inherited and destination names must be unique. Names starting with
+`CHATGPT_EXEC_` are reserved. Rule mappings must not be empty.
 
 ## Agent pool and account scope
 
-The optional agent_pool object enables pool_members and pool_send. database_path and principal
-are required and unknown fields are rejected. Example:
+The optional `agent_pool` object enables [agent messaging](../README.md#agent-pools).
+It requires `database_path` and `principal`.
 
-    {
-      "agent_pool": {
-        "database_path": "/private/state/chatgpt-exec-mcp/agent-pool.sqlite3",
-        "principal": "chatgpt-owner",
-        "membership_ttl_seconds": 86400
-      }
-    }
+```json
+{
+  "agent_pool": {
+    "database_path": "/private/state/chatgpt-exec-mcp/agent-pool.sqlite3",
+    "principal": "chatgpt-owner",
+    "membership_ttl_seconds": 86400
+  }
+}
+```
 
-database_path is resolved relative to the config directory like other paths.
-The database and its parent directory must be owner-only (0600 and 0700);
-missing directories are created with private permissions. Symlink database
-files and permissive database files/directories are rejected. Keep the SQLite
-database and its WAL/SHM files outside release directories so memberships and
-pending inbox rows survive core restart and deployment rollback.
+Keep the database outside release directories so updates and rollbacks preserve
+memberships and pending messages. Its parent directory and database must be
+owner-only (`0700` and `0600`); missing directories are created automatically.
+The database file must not be a symlink.
 
-membership_ttl_seconds is optional and defaults to 86400 (one day). It accepts
-180 through 604800 seconds and is a deployment setting, not a model-facing control.
-The three-minute minimum is longer than any single blocking execution-tool wait,
-so active tool calls cannot outlive a freshly renewed lease.
+`principal` identifies the owning account: use 1–128 bytes without control
+characters or surrounding whitespace. It does not provide authentication.
+Run each instance behind a private, authenticated tunnel for one account;
+use a separate instance for each account and do not share its connector.
 
-principal is a fixed account scope (nonempty, at most 128 bytes, no control
-characters or surrounding whitespace). The server trusts its deployment behind
-an authenticated, private, single-account-only tunnel; request headers and
-request metadata do not authenticate or select a principal. Do not share a
-connector backed by this instance with other accounts. Deploy a separate core,
-tunnel, socket, and database for every account.
-
-Without agent_pool, pool tools are unavailable. A session joins a pool on its
-first pool_send, which requires register_as and _meta["openai/session"]. The
-server atomically claims that agent name and binds it to the session. Later sends
-infer the sender, so register_as is omitted or null; supplying it again is
-rejected. target names one active member or global, which broadcasts to all
-other active members. Agent names are unique within a pool. A global send may
-have zero recipients and still create membership. PoolSendResult reports the
-effective sender, whether membership was created, delivery_count, recipients,
-and message_id (null when nothing was queued).
-
-Membership is a configurable inactivity lease (one day by default). Any ordinary tool call from
-the bound session refreshes all of that session's memberships. Expired members
-and their undelivered inbox rows are deleted automatically. Pool and agent names
-contain 1-128 characters with no control characters or surrounding whitespace.
-Message text is 1-65536 bytes. The instance-wide inbox is bounded to 10,000
-pending member deliveries.
-
-Messages are durable SQLite rows, not webhooks. Every model-callable execution
-tool piggybacks a bounded batch of unread messages in peer_messages when the
-current openai/session has memberships. The response text also contains a
-conspicuous peer-message block. The highest offered inbox cursor is retained;
-the same session's next tool call acknowledges that offer before collecting the
-next batch. If no later tool call happens, the offered rows remain recoverable
-until membership expiry. Cursor transitions are serialized per session so
-parallel calls cannot acknowledge offers out of order. Correlation is not MCP
-transport session management or account authentication.
+`membership_ttl_seconds` defaults to 86400 (one day) and accepts 180–604800.
+Tool activity renews membership. Inactive memberships and their pending messages
+are removed after this interval.
 
 ## Unix Streamable HTTP
 
-Use `--listen-unix /absolute/path/mcp.sock` with `--config` to serve `/mcp` over
-Streamable HTTP instead of stdio. The parent must already exist. The socket is
-`0600`, so run the forwarding tunnel as the same Unix user. Active sockets and
-non-socket paths are refused; stale sockets are removed and a graceful shutdown
-removes only the socket created by this process. `/readyz` is a local readiness
-probe.
+Add `--listen-unix /absolute/path/mcp.sock` to serve HTTP. The socket's parent
+directory must already exist; run the forwarding tunnel as the same Unix user
+as core to access the socket.
 
-Production HTTP advertises only MCP `2026-07-28`. Every request needs
-`MCP-Protocol-Version: 2026-07-28`, `Mcp-Method` matching its JSON-RPC method,
-`Mcp-Name` matching the tool name for `tools/call`, and the protocol's per-request
-`_meta` (protocolVersion, clientInfo and
-clientCapabilities under the `io.modelcontextprotocol/` namespace). Ordinary
-responses are JSON. The endpoint has no `Mcp-Session-Id` dependency.
-
-Run core and tunnel as separate processes/services. The shared process manager
-keeps PTYs alive across tunnel reconnects and restarts. Restarting core ends PTYs;
-durable agent-pool memberships and pending inbox rows are recovered from SQLite.
+Connect an MCP `2026-07-28` compatible client or tunnel to `/mcp`.
+Use `/readyz` to check local readiness.
