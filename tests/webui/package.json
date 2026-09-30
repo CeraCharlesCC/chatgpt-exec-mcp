@@ -1,0 +1,10 @@
+{
+  "name": "exec-mcp-webui-tests",
+  "private": true,
+  "scripts": {
+    "test": "node --test ui.test.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  }
+}

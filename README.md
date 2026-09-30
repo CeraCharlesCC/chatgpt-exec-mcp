@@ -34,6 +34,13 @@ local readiness. See [configuration](docs/configuration.md#unix-streamable-http)
 For local debugging, `--webui-listen 127.0.0.1:19162` adds a loopback-only
 WebUI with agent-pool administration and recent in-memory MCP/tool activity.
 It requires `--listen-unix`; the MCP endpoint is not exposed on the WebUI port.
+Activity supports a messages-only view and filters by pool, agent, and chat
+session (`_meta["openai/session"]`). Click a pool name in the sidebar to filter
+its activity; changing pools clears the agent and session filters. Agent filters
+include message senders and recipients. Session filters match the session that
+made the tool call (the sender for sends, the recipient for received messages).
+Recent events and the admin inbox provide filter choices for inactive pools too.
+Polling preserves scroll positions and defers changes while text is selected.
 
 ## Execution tools
 
@@ -95,6 +102,18 @@ Rust 1.88 or newer is required.
 cargo build --release --locked
 cargo test --workspace --all-targets --locked
 ```
+
+Browser regression tests require Node.js 20+ and Playwright:
+
+```bash
+cd tests/webui
+npm ci
+npx playwright install chromium
+npm test
+```
+
+To use an existing Chrome installation instead of downloading Chromium, set
+`WEBUI_BROWSER=/absolute/path/to/chrome` when running `npm test`.
 
 To build a standalone release binary:
 

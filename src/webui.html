@@ -6,7 +6,7 @@
 <title>Exec MCP Debug</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--panel:#161b22;--panel2:#0f141b;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#2f81f7;--good:#3fb950;--warn:#d29922;--bad:#f85149;--shadow:0 10px 30px rgba(0,0,0,.22)}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select,textarea{font:inherit;color:inherit}.shell{min-height:100vh;display:grid;grid-template-rows:52px 1fr}.top{display:flex;align-items:center;justify-content:space-between;padding:0 18px;border-bottom:1px solid var(--border);background:rgba(13,17,23,.92);backdrop-filter:blur(8px);position:sticky;top:0;z-index:10}.brand{display:flex;gap:10px;align-items:center;font-weight:650}.badge{font-size:11px;color:var(--muted);border:1px solid var(--border);padding:2px 7px;border-radius:999px}.status{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px}.dot{width:8px;height:8px;border-radius:50%;background:var(--good);box-shadow:0 0 0 3px rgba(63,185,80,.12)}.grid{display:grid;grid-template-columns:290px minmax(0,1fr) 340px;gap:12px;padding:12px;min-height:0}.panel{border:1px solid var(--border);background:var(--panel);border-radius:10px;box-shadow:var(--shadow);min-width:0;overflow:hidden}.panel h2{font-size:13px;margin:0;padding:12px 14px;border-bottom:1px solid var(--border);font-weight:650}.section{padding:12px}.pool{border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:10px}.pool-title{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background:var(--panel2);font-weight:600}.agent{padding:9px 10px;border-top:1px solid var(--border);display:grid;grid-template-columns:1fr auto;gap:8px}.agent-name{display:flex;align-items:center;gap:7px}.agent-meta{color:var(--muted);font-size:11px;margin-top:2px}.tiny-dot{width:7px;height:7px;border-radius:50%;background:var(--good)}button{border:1px solid var(--border);background:#21262d;border-radius:6px;padding:6px 9px;cursor:pointer}button:hover{border-color:#57606a;background:#292e36}.danger{color:#ffb4b4}.danger:hover{border-color:var(--bad);background:rgba(248,81,73,.08)}.tabs{display:flex;gap:4px;padding:8px;border-bottom:1px solid var(--border);background:var(--panel2)}.tab{border-color:transparent;background:transparent;color:var(--muted)}.tab.active{color:var(--text);background:#21262d;border-color:var(--border)}.events{height:calc(100vh - 126px);overflow:auto;padding:10px}.event{border:1px solid var(--border);border-radius:8px;margin-bottom:8px;background:#10151c}.event-head{display:flex;justify-content:space-between;gap:12px;padding:8px 10px;border-bottom:1px solid rgba(48,54,61,.7)}.event-kind{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.event-time,.muted{color:var(--muted)}.chips{display:flex;flex-wrap:wrap;gap:5px;padding:0 10px 8px}.chip{font-size:11px;color:#c9d1d9;background:#21262d;border:1px solid var(--border);padding:2px 6px;border-radius:999px}.event pre,.logline pre{white-space:pre-wrap;word-break:break-word;margin:0;padding:9px 10px;color:#c9d1d9;font:11.5px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;max-height:260px;overflow:auto}.lvl-error{border-left:3px solid var(--bad)}.lvl-warn{border-left:3px solid var(--warn)}.form-row{display:grid;gap:6px;margin-bottom:9px}label{font-size:11px;color:var(--muted)}input,select,textarea{width:100%;background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:7px 8px;outline:none}textarea{min-height:82px;resize:vertical}input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(47,129,247,.12)}.send-btn{background:#238636;border-color:#2ea043;width:100%;font-weight:600}.send-btn:hover{background:#2ea043;border-color:#3fb950}.inbox{max-height:40vh;overflow:auto}.message{border:1px solid var(--border);border-radius:8px;padding:9px;margin-bottom:8px}.message-head{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:var(--muted);margin-bottom:5px}.empty{color:var(--muted);padding:14px;text-align:center}.toast{position:fixed;right:18px;bottom:18px;padding:9px 12px;border:1px solid var(--border);background:#21262d;border-radius:8px;box-shadow:var(--shadow);opacity:0;transform:translateY(5px);transition:.15s;pointer-events:none}.toast.show{opacity:1;transform:none}.toast.bad{border-color:var(--bad)}.logline{border-bottom:1px solid rgba(48,54,61,.5);padding:7px 9px}.logmeta{font:11px ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--muted)}@media(max-width:1100px){.grid{grid-template-columns:260px 1fr}.right{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr}.events{height:65vh}}@media(max-width:760px){.grid{grid-template-columns:1fr}.right{display:block}.events{height:auto;max-height:70vh}.top{padding:0 10px}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select,textarea{font:inherit;color:inherit}.shell{min-height:100vh;display:grid;grid-template-rows:52px 1fr}.top{display:flex;align-items:center;justify-content:space-between;padding:0 18px;border-bottom:1px solid var(--border);background:rgba(13,17,23,.92);backdrop-filter:blur(8px);position:sticky;top:0;z-index:10}.brand{display:flex;gap:10px;align-items:center;font-weight:650}.badge{font-size:11px;color:var(--muted);border:1px solid var(--border);padding:2px 7px;border-radius:999px}.status{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px}.dot{width:8px;height:8px;border-radius:50%;background:var(--good);box-shadow:0 0 0 3px rgba(63,185,80,.12)}.grid{display:grid;grid-template-columns:290px minmax(0,1fr) 340px;gap:12px;padding:12px;min-height:0}.panel{border:1px solid var(--border);background:var(--panel);border-radius:10px;box-shadow:var(--shadow);min-width:0;overflow:hidden}.panel h2{font-size:13px;margin:0;padding:12px 14px;border-bottom:1px solid var(--border);font-weight:650}.section{padding:12px}.pool{border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:10px}.pool-title{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background:var(--panel2);font-weight:600}.agent{padding:9px 10px;border-top:1px solid var(--border);display:grid;grid-template-columns:1fr auto;gap:8px}.agent-name{display:flex;align-items:center;gap:7px}.agent-meta{color:var(--muted);font-size:11px;margin-top:2px}.tiny-dot{width:7px;height:7px;border-radius:50%;background:var(--good)}button{border:1px solid var(--border);background:#21262d;border-radius:6px;padding:6px 9px;cursor:pointer}button:hover{border-color:#57606a;background:#292e36}.danger{color:#ffb4b4}.danger:hover{border-color:var(--bad);background:rgba(248,81,73,.08)}.tabs{display:flex;gap:4px;padding:8px;border-bottom:1px solid var(--border);background:var(--panel2)}.tab{border-color:transparent;background:transparent;color:var(--muted)}.tab.active{color:var(--text);background:#21262d;border-color:var(--border)}.activity-panel{display:flex;flex-direction:column;height:calc(100vh - 76px)}.filters{display:flex;align-items:end;flex-wrap:wrap;gap:8px;padding:10px;border-bottom:1px solid var(--border);background:var(--panel2)}.filter-field{display:grid;gap:4px;flex:1;min-width:120px}.filter-count{font-size:11px;color:var(--muted);padding:7px 0}.events{flex:1;min-height:0;overflow:auto;overflow-anchor:none;padding:10px}.pool-filter{border:0;background:transparent;padding:0;text-align:left;color:inherit;font-weight:600;overflow-wrap:anywhere}.pool-filter[aria-pressed="true"]{color:#79b8ff}.message-body{white-space:pre-wrap;overflow-wrap:anywhere;padding:9px 10px;max-height:260px;overflow:auto}.message-status{padding:0 10px 8px;color:var(--muted);font-size:11px}.event{border:1px solid var(--border);border-radius:8px;margin-bottom:8px;background:#10151c}.event-head{display:flex;justify-content:space-between;gap:12px;padding:8px 10px;border-bottom:1px solid rgba(48,54,61,.7)}.event-kind{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.event-time,.muted{color:var(--muted)}.chips{display:flex;flex-wrap:wrap;gap:5px;padding:0 10px 8px}.chip{font-size:11px;color:#c9d1d9;background:#21262d;border:1px solid var(--border);padding:2px 6px;border-radius:999px}.event pre,.logline pre{white-space:pre-wrap;word-break:break-word;margin:0;padding:9px 10px;color:#c9d1d9;font:11.5px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;max-height:260px;overflow:auto}.lvl-error{border-left:3px solid var(--bad)}.lvl-warn{border-left:3px solid var(--warn)}.form-row{display:grid;gap:6px;margin-bottom:9px}label{font-size:11px;color:var(--muted)}input,select,textarea{width:100%;background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:7px 8px;outline:none}textarea{min-height:82px;resize:vertical}input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(47,129,247,.12)}.send-btn{background:#238636;border-color:#2ea043;width:100%;font-weight:600}.send-btn:hover{background:#2ea043;border-color:#3fb950}.inbox{max-height:40vh;overflow:auto}.message{border:1px solid var(--border);border-radius:8px;padding:9px;margin-bottom:8px}.message-head{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:var(--muted);margin-bottom:5px}.empty{color:var(--muted);padding:14px;text-align:center}.toast{position:fixed;right:18px;bottom:18px;padding:9px 12px;border:1px solid var(--border);background:#21262d;border-radius:8px;box-shadow:var(--shadow);opacity:0;transform:translateY(5px);transition:.15s;pointer-events:none}.toast.show{opacity:1;transform:none}.toast.bad{border-color:var(--bad)}.logline{border-bottom:1px solid rgba(48,54,61,.5);padding:7px 9px}.logmeta{font:11px ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--muted)}@media(max-width:1100px){.grid{grid-template-columns:260px 1fr}.right{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr}.activity-panel{height:70vh}}@media(max-width:760px){.grid{grid-template-columns:1fr}.right{display:block}.activity-panel{height:70vh}.top{padding:0 10px}}
 </style>
 </head>
 <body>
@@ -14,23 +14,352 @@
   <header class="top"><div class="brand">Exec MCP <span class="badge">debug console</span></div><div class="status"><span class="dot"></span><span id="status">connecting</span></div></header>
   <main class="grid">
     <aside class="panel"><h2>Agent pools</h2><div class="section" id="pools"><div class="empty">No active agents</div></div></aside>
-    <section class="panel"><div class="tabs"><button class="tab active" data-view="activity">Activity</button><button class="tab" data-view="logs">MCP log</button></div><div class="events" id="events"></div></section>
+    <section class="panel activity-panel"><div class="tabs"><button class="tab active" data-view="activity">Activity</button><button class="tab" data-view="logs">MCP log</button></div><div class="filters"><div class="filter-field"><label for="activityFilter">Show</label><select id="activityFilter"><option value="all">All activity</option><option value="messages">Messages only</option></select></div><div class="filter-field"><label for="activityPool">Agent pool</label><select id="activityPool"><option value="">All pools</option></select></div><div class="filter-field"><label for="activityAgent">Agent</label><select id="activityAgent"><option value="">All agents</option></select></div><div class="filter-field"><label for="activitySession">Chat session (openai/session)</label><select id="activitySession"><option value="">All sessions</option></select></div><span class="filter-count" id="filterCount" aria-live="polite"></span></div><div class="events" id="events"></div></section>
     <aside class="panel right"><div><h2>Send as admin</h2><div class="section"><div class="form-row"><label>Pool</label><select id="poolSelect"></select></div><div class="form-row"><label>Target</label><select id="targetSelect"></select></div><div class="form-row"><label>Message</label><textarea id="message" placeholder="Message delivered on the agent's next tool call"></textarea></div><button id="send" class="send-btn">Send message</button></div></div><div><h2>Admin inbox</h2><div class="section inbox" id="inbox"><div class="empty">No messages</div></div></div></aside>
   </main>
 </div><div id="toast" class="toast"></div>
 <script>
-const state={data:null,view:'activity'};const $=s=>document.querySelector(s);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function ago(ms){const d=Math.max(0,Date.now()-ms),s=Math.floor(d/1000);if(s<60)return s+'s ago';const m=Math.floor(s/60);if(m<60)return m+'m ago';const h=Math.floor(m/60);return h+'h ago'}function left(ms){const s=Math.max(0,Math.floor((ms-Date.now())/1000));if(s<60)return s+'s remaining';const m=Math.floor(s/60);if(m<60)return m+'m remaining';return Math.floor(m/60)+'h remaining'}
-function toast(msg,bad=false){const t=$('#toast');t.textContent=msg;t.className='toast show'+(bad?' bad':'');clearTimeout(t._x);t._x=setTimeout(()=>t.className='toast',2200)}
-function renderPools(){const root=$('#pools'),pools=state.data?.pools||[];root.innerHTML=pools.length?'':'<div class="empty">No active agents</div>';for(const p of pools){const box=document.createElement('div');box.className='pool';box.innerHTML=`<div class="pool-title"><span>${esc(p.name)}</span><span class="muted">${p.agents.length}</span></div>`;for(const a of p.agents){const row=document.createElement('div');row.className='agent';row.innerHTML=`<div><div class="agent-name"><span class="tiny-dot"></span><strong>${esc(a.agent)}</strong></div><div class="agent-meta">seen ${ago(a.last_seen_ms)} · lease ${left(a.expires_ms)}</div></div><button class="danger">Terminate</button>`;row.querySelector('button').onclick=()=>terminate(p.name,a.agent);box.appendChild(row)}root.appendChild(box)}renderTargets()}
-function renderTargets(){const pools=state.data?.pools||[],ps=$('#poolSelect'),ts=$('#targetSelect'),oldp=ps.value,oldt=ts.value;ps.innerHTML=pools.map(p=>`<option>${esc(p.name)}</option>`).join('');if([...ps.options].some(o=>o.value===oldp))ps.value=oldp;const p=pools.find(x=>x.name===ps.value);const targets=['global',...(p?.agents||[]).map(a=>a.agent)];ts.innerHTML=targets.map(x=>`<option>${esc(x)}</option>`).join('');if([...ts.options].some(o=>o.value===oldt))ts.value=oldt}
-function renderInbox(){const root=$('#inbox'),msgs=state.data?.admin_messages||[];root.innerHTML=msgs.length?'':'<div class="empty">No messages</div>';for(const m of msgs){const d=document.createElement('div');d.className='message';d.innerHTML=`<div class="message-head"><span>${esc(m.from)} · ${esc(m.pool)}</span><span>${ago(m.created_ms)}</span></div><div>${esc(m.message)}</div>`;root.appendChild(d)}}
-function eventAgents(e){return (e.agents||[]).map(a=>`<span class="chip">${esc(a.pool)}/${esc(a.agent)}</span>`).join('')}
-function renderEvents(){const root=$('#events'),events=[...(state.data?.events||[])].reverse();if(state.view==='logs'){root.innerHTML=events.map(e=>`<div class="logline"><div class="logmeta">${new Date(e.timestamp_ms).toLocaleTimeString()} [${esc(e.level)}] ${esc(e.kind)}${e.session?' session='+esc(e.session):''}</div><pre>${esc(JSON.stringify(e.detail,null,2))}</pre></div>`).join('')||'<div class="empty">No log entries</div>';return}root.innerHTML=events.map(e=>`<article class="event lvl-${esc(e.level)}"><div class="event-head"><span class="event-kind">${esc(e.kind)}</span><span class="event-time">${ago(e.timestamp_ms)}</span></div>${e.agents?.length?`<div class="chips">${eventAgents(e)}</div>`:''}<pre>${esc(JSON.stringify(e.detail,null,2))}</pre></article>`).join('')||'<div class="empty">No activity yet</div>'}
-async function terminate(pool,agent){if(!confirm(`Terminate ${agent} from ${pool}?`))return;try{const r=await fetch('/_admin/api/terminate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({pool,agent})});if(!r.ok)throw new Error(await r.text());toast('Membership terminated');await refresh()}catch(e){toast(e.message,true)}}
-async function send(){const pool=$('#poolSelect').value,target=$('#targetSelect').value,message=$('#message').value;if(!pool||!target||!message.trim())return toast('Pool, target and message are required',true);try{const r=await fetch('/_admin/api/send',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({pool,target,message})});if(!r.ok)throw new Error(await r.text());const x=await r.json();$('#message').value='';toast(`Delivered to ${(x.recipients||[]).length} recipient(s)`);await refresh()}catch(e){toast(e.message,true)}}
-async function refresh(){try{const r=await fetch('/_admin/api/snapshot',{cache:'no-store'});if(!r.ok)throw new Error(await r.text());state.data=await r.json();$('#status').textContent=`v${state.data.version} · up ${Math.floor(state.data.uptime_seconds/60)}m`;renderPools();renderInbox();renderEvents()}catch(e){$('#status').textContent='disconnected';toast(e.message,true)}}
-$('#poolSelect').onchange=renderTargets;$('#send').onclick=send;document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');state.view=b.dataset.view;renderEvents()});refresh();setInterval(refresh,1500);
+const state = {data: null, view: 'activity', filter: 'all', pool: '', agent: '', session: '', refreshing: false};
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+function ago(ms) {
+  const s = Math.floor(Math.max(0, Date.now() - ms) / 1000);
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  return Math.floor(s / 3600) + 'h ago';
+}
+function left(ms) {
+  const s = Math.max(0, Math.floor((ms - Date.now()) / 1000));
+  if (s < 60) return s + 's remaining';
+  if (s < 3600) return Math.floor(s / 60) + 'm remaining';
+  return Math.floor(s / 3600) + 'h remaining';
+}
+function toast(msg, bad = false) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (bad ? ' bad' : '');
+  clearTimeout(t._x);
+  t._x = setTimeout(() => t.className = 'toast', 2200);
+}
+
+// Keep immutable rows in the DOM. Replacing the list on every poll destroys
+// nested scroll positions, focus and the browser's text-selection anchors.
+let pointerTarget = null;
+function interacting(root) {
+  const selection = window.getSelection();
+  return (pointerTarget && root.contains(pointerTarget)) ||
+    (selection && !selection.isCollapsed &&
+      (root.contains(selection.anchorNode) || root.contains(selection.focusNode)));
+}
+function syncList(root, items, key, markup, emptyText, className = '') {
+  if (interacting(root)) return;
+  const bounds = root.getBoundingClientRect();
+  const anchor = root.scrollTop > 0 && [...root.children].find(node =>
+    node.dataset.key && node.getBoundingClientRect().bottom > bounds.top);
+  const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
+  const nodes = new Map([...root.children].map(node => [node.dataset.key, node]));
+  const keep = new Set();
+  let cursor = root.firstElementChild;
+  for (const item of items) {
+    const id = String(key(item));
+    keep.add(id);
+    let node = nodes.get(id);
+    if (!node) {
+      node = document.createElement('div');
+      node.dataset.key = id;
+    }
+    const html = markup(item);
+    if (node._markup !== html) {
+      node.className = className;
+      node.innerHTML = html;
+      node._markup = html;
+    }
+    if (node !== cursor) root.insertBefore(node, cursor);
+    cursor = node.nextElementSibling;
+  }
+  for (const node of [...root.children]) {
+    if (!keep.has(node.dataset.key)) node.remove();
+  }
+  if (!items.length && !root.firstElementChild) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = emptyText;
+    root.appendChild(empty);
+  }
+  updateTimes(root);
+  if (anchor && root.contains(anchor)) {
+    root.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
+  }
+}
+function updateTimes(root) {
+  if (interacting(root)) return;
+  root.querySelectorAll('[data-time]').forEach(node => {
+    const value = (node.dataset.clock === 'left' ? left : ago)(Number(node.dataset.time));
+    if (node.textContent !== value) node.textContent = value;
+  });
+}
+function time(ms, className = 'event-time', clock = 'ago') {
+  return `<span class="${className}" data-time="${Number(ms)}" data-clock="${clock}"></span>`;
+}
+function renderPools() {
+  const root = $('#pools'), pools = state.data?.pools || [];
+  if (!interacting(root)) {
+    // Pool wrappers and agent rows are keyed separately, so changing a lease
+    // does not replace the pool title or a focused Terminate button.
+    syncList(root, pools, p => p.name, p => `<div class="pool-title"><button class="pool-filter" data-pool="${esc(p.name)}" aria-pressed="false" title="Show activity from ${esc(p.name)}">${esc(p.name)}</button><span class="muted pool-count"></span></div><div class="pool-agents"></div>`, 'No active agents', 'pool');
+    for (const box of root.children) {
+      const p = pools.find(p => p.name === box.dataset.key);
+      if (!p) continue;
+      const button = box.querySelector('.pool-filter');
+      button.setAttribute('aria-pressed', String(state.pool === p.name));
+      box.querySelector('.pool-count').textContent = p.agents.length;
+      syncList(box.querySelector('.pool-agents'), p.agents, a => a.agent, a => `<div><div class="agent-name"><span class="tiny-dot"></span><strong>${esc(a.agent)}</strong></div><div class="agent-meta">seen <span data-clock="ago"></span> · lease <span data-clock="left"></span></div></div><button class="danger" data-pool="${esc(p.name)}" data-agent="${esc(a.agent)}">Terminate</button>`, '', 'agent');
+      for (const row of box.querySelector('.pool-agents').children) {
+        const agent = p.agents.find(a => a.agent === row.dataset.key);
+        if (!agent) continue;
+        row.querySelector('[data-clock=ago]').dataset.time = agent.last_seen_ms;
+        row.querySelector('[data-clock=left]').dataset.time = agent.expires_ms;
+      }
+    }
+    updateTimes(root);
+  }
+  renderTargets();
+}
+function syncOptions(select, values, selected) {
+  // Native selects must also survive polling while their menu is open.
+  const signature = JSON.stringify(values);
+  if (select._options !== signature) {
+    select.replaceChildren(...values.map(({value, label}) => new Option(label, value)));
+    select._options = signature;
+  }
+  if (values.some(x => x.value === selected)) select.value = selected;
+}
+function renderTargets() {
+  const pools = state.data?.pools || [], ps = $('#poolSelect'), ts = $('#targetSelect');
+  syncOptions(ps, pools.map(p => ({value: p.name, label: p.name})), ps.value);
+  const p = pools.find(x => x.name === ps.value);
+  syncOptions(ts, ['global', ...(p?.agents || []).map(a => a.agent)].map(value => ({value, label: value})), ts.value);
+}
+function renderInbox() {
+  const root = $('#inbox');
+  syncList(root, state.data?.admin_messages || [], m => m.message_id, m => `<div class="message-head"><span>${esc(m.from)} · ${esc(m.pool)}</span>${time(m.created_ms, '')}</div><div style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.message)}</div>`, 'No messages', 'message');
+}
+function eventPools(e, starts) {
+  const pools = new Set((e.agents || []).map(a => a.pool));
+  for (const name of [e.detail?.pool, e.detail?.arguments?.pool,
+    starts.get(e.detail?.start_event_id)?.detail?.arguments?.pool]) {
+    if (name) pools.add(name);
+  }
+  for (const m of e.detail?.result?.peer_messages || []) pools.add(m.pool);
+  return pools;
+}
+function isMessageEvent(e, starts) {
+  const start = e.kind === 'tool.start' ? e : starts.get(e.detail?.start_event_id);
+  return e.kind === 'admin.message.send' ||
+    (start?.detail?.tool === 'pool_send' && typeof start.detail.arguments?.message === 'string' && !start.detail.arguments.operation) ||
+    (e.detail?.result?.peer_messages || []).length > 0;
+}
+function eventIdentities(e, starts, finishes) {
+  const start = e.kind === 'tool.start' ? e : starts.get(e.detail?.start_event_id);
+  const finish = e.kind === 'tool.start' ? finishes.get(e.id) : e;
+  const agents = [...(e.agents || []), ...(start?.agents || []), ...(finish?.agents || [])];
+  const a = start?.detail?.arguments, value = finish?.detail?.result?.value;
+  if (a?.pool && value?.assigned_agent) agents.push({pool: a.pool, agent: value.assigned_agent});
+  if (a?.pool && a.target && a.target !== 'global') agents.push({pool: a.pool, agent: a.target});
+  if (a?.pool) for (const agent of value?.recipients || []) agents.push({pool: a.pool, agent});
+  if (e.kind === 'admin.message.send') {
+    agents.push({pool: e.detail.pool, agent: 'admin'});
+    if (e.detail.target !== 'global') agents.push({pool: e.detail.pool, agent: e.detail.target});
+  }
+  for (const m of e.detail?.result?.peer_messages || []) {
+    agents.push({pool: m.pool, agent: m.from}, {pool: m.pool, agent: m.to});
+  }
+  return agents;
+}
+function messages(events, finishes) {
+  const rows = [], received = new Set();
+  const identities = (state.data?.pools || []).flatMap(p => p.agents);
+  function receive(m, timestamp_ms, session) {
+    const key = JSON.stringify([m.pool, m.message_id, m.to]);
+    if (received.has(key)) return;
+    received.add(key);
+    rows.push({...m, key: 'receive:' + key, timestamp_ms, kind: 'message.receive', status: 'Received',
+      agents: [m.from, m.to], sessions: session ? [session] : []});
+  }
+  for (const e of events) {
+    const d = e.detail || {};
+    if (e.kind === 'tool.start' && d.tool === 'pool_send' && typeof d.arguments?.message === 'string' && !d.arguments.operation) {
+      const a = d.arguments, finish = finishes.get(e.id), result = finish?.detail?.result;
+      const from = result?.value?.assigned_agent ||
+        [...(finish?.agents || []), ...(e.agents || [])].find(x => x.pool === a.pool)?.agent ||
+        identities.find(x => x.pool === a.pool && x.session === e.session)?.agent || 'Agent';
+      const failed = finish?.kind === 'tool.error';
+      const agents = [from, a.target, ...(result?.value?.recipients || [])];
+      rows.push({...a, key: 'send:' + e.id, from, to: a.target, timestamp_ms: e.timestamp_ms,
+        kind: 'message.send', level: failed ? 'error' : 'info', message_id: result?.value?.message_id,
+        agents, sessions: e.session ? [e.session] : [],
+        status: !finish ? 'Sending…' : failed ? `Failed: ${result?.error || 'Send failed'}` :
+          `Queued for ${(result?.value?.recipients || []).length} recipient(s)`});
+    }
+    if (e.kind === 'admin.message.send') {
+      const agents = ['admin', d.target, ...(e.agents || []).filter(a => a.pool === d.pool).map(a => a.agent)];
+      rows.push({...d, key: 'admin:' + e.id, from: 'admin', to: d.target,
+        timestamp_ms: e.timestamp_ms, kind: 'message.send', agents, sessions: [],
+        status: `Queued for ${d.delivery_count} recipient(s)`});
+    }
+    for (const m of d.result?.peer_messages || []) receive(m, e.timestamp_ms, e.session);
+  }
+  for (const m of state.data?.admin_messages || []) receive({...m, to: 'admin'}, m.created_ms);
+  return rows.sort((a, b) => b.timestamp_ms - a.timestamp_ms);
+}
+function renderFilters(events, starts, finishes, conversation) {
+  const names = new Set((state.data?.pools || []).map(p => p.name));
+  const agents = new Set(), sessions = new Set();
+  for (const p of state.data?.pools || []) {
+    if (!state.pool || p.name === state.pool) for (const a of p.agents) {
+      agents.add(a.agent);
+      sessions.add(a.session);
+    }
+  }
+  for (const e of events) {
+    const pools = eventPools(e, starts);
+    for (const pool of pools) names.add(pool);
+    if (!state.pool || pools.has(state.pool)) {
+      if (e.session) sessions.add(e.session);
+      for (const a of eventIdentities(e, starts, finishes)) {
+        if (!state.pool || a.pool === state.pool) agents.add(a.agent);
+      }
+    }
+  }
+  for (const m of state.data?.admin_messages || []) names.add(m.pool);
+  for (const m of conversation) if (!state.pool || m.pool === state.pool) {
+    for (const agent of m.agents) agents.add(agent);
+    for (const session of m.sessions) sessions.add(session);
+  }
+  if (state.pool) names.add(state.pool);
+  if (state.agent) agents.add(state.agent);
+  if (state.session) sessions.add(state.session);
+  const options = (values, label) => [{value: '', label}, ...[...values].filter(Boolean).sort().map(value => ({value, label: value}))];
+  syncOptions($('#activityPool'), options(names, 'All pools'), state.pool);
+  syncOptions($('#activityAgent'), options(agents, 'All agents'), state.agent);
+  syncOptions($('#activitySession'), options(sessions, 'All sessions'), state.session);
+}
+function eventMarkup(e) {
+  if (state.view === 'logs') {
+    return `<div class="logmeta">${new Date(e.timestamp_ms).toLocaleTimeString()} [${esc(e.level)}] ${esc(e.kind)}${e.session ? ' session=' + esc(e.session) : ''}</div><pre>${esc(JSON.stringify(e.detail, null, 2))}</pre>`;
+  }
+  return `<article class="event lvl-${esc(e.level)}"><div class="event-head"><span class="event-kind">${esc(e.kind)}</span>${time(e.timestamp_ms)}</div>${e.agents?.length ? `<div class="chips">${e.agents.map(a => `<span class="chip">${esc(a.pool)}/${esc(a.agent)}</span>`).join('')}</div>` : ''}<pre>${esc(JSON.stringify(e.detail, null, 2))}</pre></article>`;
+}
+function messageMarkup(m) {
+  return `<article class="event lvl-${esc(m.level || 'info')}"><div class="event-head"><span class="event-kind">${esc(m.from)} → ${esc(m.to)}</span>${time(m.timestamp_ms)}</div><div class="chips"><span class="chip">${esc(m.pool)}</span><span class="chip">${esc(m.kind)}</span>${m.message_id ? `<span class="chip">${esc(m.message_id)}</span>` : ''}${m.in_reply_to ? `<span class="chip">reply to ${esc(m.in_reply_to)}</span>` : ''}</div><div class="message-body">${esc(m.message)}</div><div class="message-status">${esc(m.status)}</div></article>`;
+}
+function renderEvents() {
+  const root = $('#events'), events = state.data?.events || [];
+  const starts = new Map(events.filter(e => e.kind === 'tool.start').map(e => [e.id, e]));
+  const finishes = new Map(events.filter(e => e.detail?.start_event_id).map(e => [e.detail.start_event_id, e]));
+  const conversationRows = messages(events, finishes);
+  renderFilters(events, starts, finishes, conversationRows);
+  if (interacting(root)) return;
+  const viewKey = JSON.stringify([state.view, state.filter, state.pool, state.agent, state.session]);
+  if (root._viewKey !== viewKey) root.scrollTop = 0;
+  root._viewKey = viewKey;
+  const conversation = state.view === 'activity' && state.filter === 'messages';
+  const all = conversation ? conversationRows : [...events].reverse();
+  const shown = all.filter(item => {
+    if (conversation) return (!state.pool || item.pool === state.pool) &&
+      (!state.agent || item.agents.includes(state.agent)) &&
+      (!state.session || item.sessions.includes(state.session));
+    return (!state.pool || eventPools(item, starts).has(state.pool)) &&
+      (!state.agent || eventIdentities(item, starts, finishes).some(a =>
+        a.agent === state.agent && (!state.pool || a.pool === state.pool))) &&
+      (!state.session || item.session === state.session) &&
+      (state.filter !== 'messages' || isMessageEvent(item, starts));
+  });
+  syncList(root, shown, item => `${state.view}:${conversation ? 'message:' : 'event:'}${item.key || item.id}`,
+    conversation ? messageMarkup : eventMarkup,
+    state.pool || state.agent || state.session || state.filter !== 'all' ? 'No entries match these filters' : 'No activity yet',
+    state.view === 'logs' ? 'logline' : '');
+  $('#filterCount').textContent = `${shown.length} / ${all.length} ${conversation ? 'messages' : 'events'}`;
+}
+function render() {
+  renderPools();
+  renderInbox();
+  renderEvents();
+}
+async function terminate(pool, agent) {
+  if (!confirm(`Terminate ${agent} from ${pool}?`)) return;
+  try {
+    const r = await fetch('/_admin/api/terminate', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({pool, agent})});
+    if (!r.ok) throw new Error(await r.text());
+    toast('Membership terminated');
+    await refresh();
+  } catch (e) { toast(e.message, true); }
+}
+async function send() {
+  const pool = $('#poolSelect').value, target = $('#targetSelect').value, message = $('#message').value;
+  if (!pool || !target || !message.trim()) return toast('Pool, target and message are required', true);
+  try {
+    const r = await fetch('/_admin/api/send', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({pool, target, message})});
+    if (!r.ok) throw new Error(await r.text());
+    const x = await r.json();
+    $('#message').value = '';
+    toast(`Queued for ${(x.recipients || []).length} recipient(s)`);
+    await refresh();
+  } catch (e) { toast(e.message, true); }
+}
+async function refresh() {
+  // Never let a slow poll overlap another request and overwrite newer data.
+  if (state.refreshing) return;
+  state.refreshing = true;
+  try {
+    const r = await fetch('/_admin/api/snapshot', {cache: 'no-store'});
+    if (!r.ok) throw new Error(await r.text());
+    state.data = await r.json();
+    $('#status').textContent = `v${state.data.version} · up ${Math.floor(state.data.uptime_seconds / 60)}m`;
+    render();
+  } catch (e) {
+    $('#status').textContent = 'disconnected';
+    toast(e.message, true);
+  } finally { state.refreshing = false; }
+}
+$('#poolSelect').onchange = renderTargets;
+$('#send').onclick = send;
+$('#pools').onclick = event => {
+  const button = event.target.closest('button');
+  if (button?.classList.contains('danger')) terminate(button.dataset.pool, button.dataset.agent);
+  if (button?.classList.contains('pool-filter')) {
+    selectPool(state.pool === button.dataset.pool ? '' : button.dataset.pool);
+  }
+};
+$('#activityFilter').onchange = event => { state.filter = event.target.value; clearSelection(); renderEvents(); };
+function clearSelection() { window.getSelection()?.removeAllRanges(); }
+function selectPool(pool) {
+  clearSelection();
+  state.pool = pool;
+  state.agent = '';
+  state.session = '';
+  render();
+}
+$('#activityPool').onchange = event => selectPool(event.target.value);
+$('#activityAgent').onchange = event => { state.agent = event.target.value; clearSelection(); renderEvents(); };
+$('#activitySession').onchange = event => { state.session = event.target.value; clearSelection(); renderEvents(); };
+document.querySelectorAll('.tab').forEach(button => button.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x === button));
+  state.view = button.dataset.view;
+  clearSelection();
+  renderEvents();
+});
+document.addEventListener('pointerdown', event => { pointerTarget = event.target; });
+function endPointer() { pointerTarget = null; render(); }
+document.addEventListener('pointerup', endPointer);
+document.addEventListener('pointercancel', endPointer);
+window.addEventListener('blur', () => { pointerTarget = null; });
+// Apply deferred rows as soon as a selection is cleared, without waiting for a poll.
+document.addEventListener('selectionchange', () => {
+  if (window.getSelection()?.isCollapsed && !pointerTarget) render();
+});
+refresh();
+setInterval(refresh, 1500);
 </script>
 </body>
 </html>
