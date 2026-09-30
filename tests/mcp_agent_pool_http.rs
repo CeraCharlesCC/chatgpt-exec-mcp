@@ -247,6 +247,105 @@ async fn piggyback_agent_pool_acceptance_path() {
             .get("register_as")
             .is_some()
     );
+    assert_eq!(send_schema["inputSchema"]["additionalProperties"], false);
+    for property in ["pool", "target", "register_as", "in_reply_to"] {
+        assert_eq!(
+            send_schema["inputSchema"]["properties"][property]["minLength"],
+            1
+        );
+        assert_eq!(
+            send_schema["inputSchema"]["properties"][property]["maxLength"],
+            128
+        );
+        assert_eq!(
+            send_schema["inputSchema"]["properties"][property]["type"],
+            "string"
+        );
+        assert!(
+            send_schema["inputSchema"]["properties"][property]["pattern"]
+                .as_str()
+                .unwrap()
+                .contains("\\u0000")
+        );
+        assert!(
+            send_schema["inputSchema"]["properties"][property]
+                .get("default")
+                .is_none()
+        );
+    }
+    assert_eq!(
+        send_schema["inputSchema"]["properties"]["message"]["minLength"],
+        1
+    );
+    assert_eq!(
+        send_schema["inputSchema"]["properties"]["message"]["maxLength"],
+        65_536
+    );
+    assert_eq!(send_schema["outputSchema"]["additionalProperties"], false);
+    assert_eq!(
+        send_schema["outputSchema"]["properties"]["message_id"]["type"],
+        "string"
+    );
+    assert!(
+        !send_schema["outputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "message_id")
+    );
+    assert_eq!(
+        send_schema["outputSchema"]["$defs"]["PeerMessage"]["additionalProperties"],
+        false
+    );
+    let members_schema = tools
+        .iter()
+        .find(|tool| tool["name"] == "pool_members")
+        .unwrap();
+    assert_eq!(members_schema["annotations"]["readOnlyHint"], true);
+    assert_eq!(
+        members_schema["inputSchema"]["properties"]["pool"]["minLength"],
+        1
+    );
+    assert_eq!(
+        members_schema["inputSchema"]["properties"]["pool"]["maxLength"],
+        128
+    );
+    assert!(
+        members_schema["inputSchema"]["properties"]["pool"]["pattern"]
+            .as_str()
+            .unwrap()
+            .contains("\\u0000")
+    );
+    assert_eq!(
+        members_schema["outputSchema"]["additionalProperties"],
+        false
+    );
+    for arguments in [
+        json!({
+            "pool": "Imperator",
+            "target": "global",
+            "message": "join",
+            "register_as": null
+        }),
+        json!({
+            "pool": "Imperator",
+            "target": "global",
+            "message": "join",
+            "register_as": "NullCheck",
+            "in_reply_to": null
+        }),
+    ] {
+        let invalid = server
+            .tool("pool_send", arguments, Some("null-check"))
+            .await;
+        assert_eq!(invalid["result"]["isError"], true, "{invalid}");
+        assert!(
+            invalid["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("null is not allowed")
+        );
+    }
     for property in [
         "sender",
         "message_id",
@@ -277,7 +376,7 @@ async fn piggyback_agent_pool_acceptance_path() {
     assert_eq!(structured(&augustus)["recipients"], json!([]));
     assert_eq!(structured(&augustus)["delivery_count"], 0);
     assert_eq!(structured(&augustus)["membership_created"], true);
-    assert_eq!(structured(&augustus)["message_id"], Value::Null);
+    assert!(structured(&augustus).get("message_id").is_none());
 
     let empty_again = server
         .send("session-a", None, "global", "still alone")
@@ -286,7 +385,7 @@ async fn piggyback_agent_pool_acceptance_path() {
     assert_eq!(structured(&empty_again)["recipients"], json!([]));
     assert_eq!(structured(&empty_again)["delivery_count"], 0);
     assert_eq!(structured(&empty_again)["membership_created"], false);
-    assert_eq!(structured(&empty_again)["message_id"], Value::Null);
+    assert!(structured(&empty_again).get("message_id").is_none());
 
     let tiberius = server
         .send("session-b", Some("Tiberius"), "global", "Tiberius joined")

@@ -217,9 +217,14 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         1
     );
     assert!(
-        start_tool["inputSchema"]["properties"]["cmd"]
-            .get("pattern")
-            .is_none()
+        start_tool["inputSchema"]["properties"]["cmd"]["pattern"]
+            .as_str()
+            .unwrap()
+            .contains("\\u3000")
+    );
+    assert_eq!(
+        start_tool["inputSchema"]["properties"]["workdir"]["minLength"],
+        1
     );
     assert!(
         start_tool["inputSchema"]["properties"]
@@ -248,9 +253,18 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         1
     );
     assert!(
-        exec_tool["inputSchema"]["properties"]["cmd"]
-            .get("pattern")
-            .is_none()
+        exec_tool["inputSchema"]["properties"]["cmd"]["pattern"]
+            .as_str()
+            .unwrap()
+            .contains("\\u3000")
+    );
+    assert_eq!(
+        exec_tool["inputSchema"]["properties"]["workdir"]["minLength"],
+        1
+    );
+    assert_eq!(
+        exec_tool["outputSchema"]["properties"]["session_id"]["pattern"],
+        "^[a-z]+-[a-z]+$"
     );
     assert_eq!(
         exec_tool["inputSchema"]["properties"]["yield_time_ms"]["minimum"],
