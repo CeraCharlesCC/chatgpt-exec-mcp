@@ -1,3 +1,4 @@
+pub mod agent_pool;
 pub mod config;
 pub mod output_store;
 mod output_summary;
@@ -6,6 +7,8 @@ pub mod server;
 pub mod session;
 pub mod session_id;
 pub mod tools;
+#[cfg(unix)]
+pub mod transport;
 
 pub use config::Config;
 pub use process_manager::ProcessManager;

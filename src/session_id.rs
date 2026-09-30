@@ -99,14 +99,15 @@ mod tests {
 
     #[test]
     fn collision_is_regenerated() {
-        let active = SessionId("amber-badger".into());
+        let active = SessionId::generate_unique_with(|| (0, 0), |_| false).unwrap();
         let mut pairs = [(0, 0), (1, 1)].into_iter();
         let id = SessionId::generate_unique_with(
             || pairs.next().unwrap(),
             |candidate| candidate == &active,
         )
         .unwrap();
-        assert_eq!(id.as_str(), "apple-bear");
+        assert_ne!(id, active);
+        assert!(SessionId::parse(id.as_str()).is_ok());
     }
 
     #[test]

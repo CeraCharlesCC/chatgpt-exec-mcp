@@ -1,5 +1,4 @@
 use super::WindowsTtyInputNormalizer;
-use pretty_assertions::assert_eq;
 
 #[test]
 fn normalizes_terminal_input_without_changing_text_or_ctrl_c() {

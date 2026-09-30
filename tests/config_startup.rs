@@ -123,6 +123,62 @@ fn rejects_schema_errors_and_invalid_paths_and_limits() {
 }
 
 #[test]
+fn agent_pool_requires_an_explicit_principal_and_database_path() {
+    for agent_pool in [
+        Value::Null,
+        json!({}),
+        json!({"database_path":"agent_pool.sqlite3"}),
+        json!({"principal":"owner"}),
+        json!({"principal":"", "database_path":"agent_pool.sqlite3"}),
+        json!({"principal":" owner", "database_path":"agent_pool.sqlite3"}),
+        json!({"principal":"owner\n", "database_path":"agent_pool.sqlite3"}),
+        json!({"principal":"owner", "database_path":""}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":179}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":604801}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":null}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "unknown":"SECRET_SENTINEL"}),
+    ] {
+        let mut value = config();
+        value["agent_pool"] = agent_pool;
+        rejected(&value.to_string(), &[]);
+    }
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("config.json");
+    let mut value = config();
+    value["agent_pool"] =
+        json!({"principal":"dedicated-owner", "database_path":"agent_pool.sqlite3"});
+    std::fs::write(&path, value.to_string()).unwrap();
+    let settings = chatgpt_exec_mcp::Config::load(&path).unwrap();
+    let agent_pool = settings.agent_pool.unwrap();
+    assert_eq!(agent_pool.principal, "dedicated-owner");
+    assert_eq!(
+        agent_pool.membership_ttl,
+        std::time::Duration::from_secs(86_400)
+    );
+    assert_eq!(
+        agent_pool.database_path,
+        dir.path().join("agent_pool.sqlite3")
+    );
+    assert!(
+        !agent_pool.database_path.exists(),
+        "validation must not create the database"
+    );
+
+    let mut minimum = config();
+    minimum["agent_pool"] = json!({
+        "principal":"dedicated-owner",
+        "database_path":"agent_pool.sqlite3",
+        "membership_ttl_seconds":180
+    });
+    std::fs::write(&path, minimum.to_string()).unwrap();
+    let settings = chatgpt_exec_mcp::Config::load(&path).unwrap();
+    assert_eq!(
+        settings.agent_pool.unwrap().membership_ttl,
+        std::time::Duration::from_secs(180)
+    );
+}
+
+#[test]
 fn rejects_legacy_environment_and_invalid_policy() {
     for name in [
         "CHATGPT_EXEC_WORKSPACE",

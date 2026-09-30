@@ -21,8 +21,33 @@ pub struct Config {
     pub output_store_dir: PathBuf,
     pub output_store_retention: Duration,
     pub output_store_max_bytes: u64,
+    pub agent_pool: Option<AgentPoolConfig>,
     pub(crate) additional_instructions: Option<String>,
     pub(crate) child_env: ChildEnv,
+}
+
+/// One authenticated account per core/tunnel instance. Inbound request headers
+/// and metadata never supply or override this deployment identity.
+#[derive(Clone, Debug)]
+pub struct AgentPoolConfig {
+    pub database_path: PathBuf,
+    pub principal: String,
+    pub membership_ttl: Duration,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileAgentPoolConfig {
+    database_path: PathBuf,
+    principal: String,
+    #[serde(default = "day")]
+    membership_ttl_seconds: u64,
+}
+
+fn present_agent_pool<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<FileAgentPoolConfig>, D::Error> {
+    FileAgentPoolConfig::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -33,6 +58,8 @@ struct FileConfig {
     shell: PathBuf,
     output_store_dir: PathBuf,
     child_env: EnvConfig,
+    #[serde(default, deserialize_with = "present_agent_pool")]
+    agent_pool: Option<FileAgentPoolConfig>,
     #[serde(default, deserialize_with = "present_path")]
     instructions_file: Option<PathBuf>,
     #[serde(default = "three")]
@@ -66,6 +93,15 @@ fn quarter_hour() -> u64 {
 }
 fn thirty() -> u64 {
     30
+}
+// The longest model-callable execution wait is 120 seconds. Keep the
+// minimum lease comfortably above that so a freshly refreshed membership
+// cannot expire while its tool call is still active.
+const MIN_AGENT_POOL_TTL_SECONDS: u64 = 180;
+const MAX_AGENT_POOL_TTL_SECONDS: u64 = 604_800;
+
+fn day() -> u64 {
+    86_400
 }
 fn megabyte() -> usize {
     1_048_576
@@ -196,6 +232,27 @@ impl Config {
             .transpose()?;
         let output_store_dir = resolve(base, &raw.output_store_dir, "output_store_dir")?;
         let child_env = resolve_env(raw.child_env, base, env)?;
+        let agent_pool = raw.agent_pool.map(|agent_pool| {
+            if agent_pool.principal.is_empty()
+                || agent_pool.principal.len() > 128
+                || agent_pool.principal.chars().any(char::is_control)
+                || agent_pool.principal.trim() != agent_pool.principal
+            {
+                bail!("agent_pool.principal must be a non-empty account identifier of at most 128 bytes");
+            }
+            if !(MIN_AGENT_POOL_TTL_SECONDS..=MAX_AGENT_POOL_TTL_SECONDS)
+                .contains(&agent_pool.membership_ttl_seconds)
+            {
+                bail!(
+                    "agent_pool.membership_ttl_seconds must be between {MIN_AGENT_POOL_TTL_SECONDS} and {MAX_AGENT_POOL_TTL_SECONDS}"
+                );
+            }
+            Ok(AgentPoolConfig {
+                database_path: resolve(base, &agent_pool.database_path, "agent_pool.database_path")?,
+                principal: agent_pool.principal,
+                membership_ttl: Duration::from_secs(agent_pool.membership_ttl_seconds),
+            })
+        }).transpose()?;
         let config = Self {
             workspace,
             shell,
@@ -210,6 +267,7 @@ impl Config {
             output_cap_bytes: raw.output_cap_bytes,
             output_store_retention: Duration::from_secs(raw.output_store_retention),
             output_store_max_bytes: raw.output_store_max_bytes,
+            agent_pool,
         };
         config.validate_limits()?;
         Ok(config)

@@ -1,36 +1,31 @@
 # Configuration version 1
 
-Run `chatgpt-exec-mcp --config config.json`; start from the
-[minimal example](../examples/minimal.json). `--help` and `--version` also work
-without a config. Legacy flags and `CHATGPT_EXEC_*` configuration variables are
-rejected. `CHATGPT_EXEC_SESSION` is reserved runtime metadata.
+Start from the [minimal example](../examples/minimal.json) and run
+`chatgpt-exec-mcp --config config.json`. Configuration and environment changes
+require a restart.
 
 ## Required fields and paths
 
-The JSON object requires `version: 1`, `workspace`, `shell`, `output_store_dir`,
-and `child_env` (with explicit `inherit` and `rules` arrays, which may be empty).
-Unknown fields, duplicate keys at any depth, null values, incorrect types,
-unsupported versions and unreadable inputs are rejected before MCP starts.
+| Field | Value |
+| --- | --- |
+| `version` | `1` |
+| `workspace` | Existing directory used as the default working directory. |
+| `shell` | Executable shell file. Commands run without login profiles. |
+| `output_store_dir` | Writable directory for command logs; created if missing. |
+| `child_env` | Object containing `inherit` and `rules` arrays; both may be empty. |
 
-`--config` is relative to the initial cwd. Paths **inside** the file are relative
-to the parent of that supplied config path (including when the file is a symlink).
-Workspace and shell must exist and be usable. Their canonical paths are resolved
-at startup. Shell must be an executable regular file. Only the specified output
-directory is created; creation, locking or write failure aborts startup.
+Paths in the configuration are relative to the config file's directory.
+`workspace` sets the default working directory; it does not restrict filesystem
+access. Use an external sandbox when access restrictions are needed.
 
-`instructions_file` is optional. When present, its nonempty path must refer to a
-readable UTF-8 file. Its contents are appended to the core instructions. An empty
-file is allowed; null and an empty path are errors. Content is frozen at startup.
-
-MCP `workdir` is relative to the configured workspace. Only omission uses workspace;
-an explicit empty string is rejected. Cwd must resolve to an existing directory.
-Every spawn revalidates and canonicalizes it, then uses that same canonical cwd for
-both rule matching and process creation. Absolute paths and `..` are accepted.
+Optional `instructions_file` points to a UTF-8 file whose contents are appended
+to the server's instructions. Use only the documented fields, and omit unused
+optional fields rather than setting them to null.
 
 ## Optional limits
 
-Durations are integer seconds. Omitted fields use these defaults; invalid values
-are rejected. Session and continuation quotas apply separately.
+Durations are integer seconds. Omitted fields use these defaults.
+Session and command-continuation quotas apply separately.
 
 | Field | Default | Allowed inclusive range |
 | --- | ---: | ---: |
@@ -43,18 +38,16 @@ are rejected. Session and continuation quotas apply separately.
 | `output_store_retention` | 604800 | 1–31536000 |
 | `output_store_max_bytes` | 4294967296 | 1–1125899906842624 |
 
-Raw output is captured in `raw.log`. After a session ends, only logs whose
-`output_ref` was returned are retained. GC deletes inactive logs when their mtime
-is older than `output_store_retention`; live sessions are protected. Finishing a
-capture refreshes its mtime. After a crash, leftover logs expire by the same rule.
-`output_store_max_bytes` is the single capacity limit for all raw logs, including
-active captures. If it is exhausted, capture stops and reports an incomplete
-output reference to the stored prefix. There is no early eviction of unexpired logs.
+`output_cap_bytes` limits each displayed response. Logs exposed through
+`output_ref` are retained for `output_store_retention` seconds while inactive;
+unreferenced logs are removed when their session ends.
+`output_store_max_bytes` limits total stored output, including active captures.
+When full, capture stops and reports incomplete output; unexpired logs are kept.
 
 ## Child environment
 
-The process starts with an empty environment. `inherit` copies only named parent
-values, and matching rules copy a source value to a destination name:
+Use `inherit` to pass parent variables to children and `rules` to supply values
+conditionally. Include `HOME`, `PATH`, or other variables your commands need.
 
 ```json
 {
@@ -67,21 +60,51 @@ values, and matching rules copy a source value to a destination name:
 }
 ```
 
-Every inherited value and rule source must be present, nonempty UTF-8 without
-NUL at startup, including rules that have not matched any calls yet. Values are
-snapshotted; changes require restart.
+A rule supports `exec_command` or `start_session` and applies when the command
+starts in `workdir_under` or a subdirectory. The directory must exist. Symlinks
+are resolved before matching; a later `cd` does not change which values apply.
+`set_from_env` maps child variable names to parent variable names.
 
-Names follow `[A-Za-z_][A-Za-z0-9_]*`. Inherited, source and destination name sets
-must be disjoint. Duplicate inherit names, duplicate destinations across rules,
-reserved names, unknown tool names and empty rule mappings are errors. A source
-can feed distinct destinations, but it is never exported under its source name.
+All inherited and rule-source values must be present and nonempty at startup,
+even for rules that have not matched a command. Variable names must follow
+`[A-Za-z_][A-Za-z0-9_]*`. Inherited, source, and destination names must not overlap;
+inherited and destination names must be unique. Names starting with
+`CHATGPT_EXEC_` are reserved. Rule mappings must not be empty.
 
-Rules support `exec_command` and `start_session`, matched by the actual tool origin,
-independently of PTY selection. Roots must exist and are canonicalized at startup.
-A rule matches when the canonical spawn cwd is the root or a component-wise child
-of it. Symlink escapes and paths sharing only a string prefix do not match.
-Matching uses the initial cwd; a `cd` within the command does not change it.
+## Agent pool and account scope
 
-Core adds `CHATGPT_EXEC_SESSION` to each child. Both pipe and PTY use this policy.
-Commands run as `shell -c`. Set HOME/PATH/XDG in the launcher and list the values
-you need in `inherit`; login profiles are not loaded.
+The optional `agent_pool` object enables [agent messaging](../README.md#agent-pools).
+It requires `database_path` and `principal`.
+
+```json
+{
+  "agent_pool": {
+    "database_path": "/private/state/chatgpt-exec-mcp/agent-pool.sqlite3",
+    "principal": "chatgpt-owner",
+    "membership_ttl_seconds": 86400
+  }
+}
+```
+
+Keep the database outside release directories so updates and rollbacks preserve
+memberships and pending messages. Its parent directory and database must be
+owner-only (`0700` and `0600`); missing directories are created automatically.
+The database file must not be a symlink.
+
+`principal` identifies the owning account: use 1–128 bytes without control
+characters or surrounding whitespace. It does not provide authentication.
+Run each instance behind a private, authenticated tunnel for one account;
+use a separate instance for each account and do not share its connector.
+
+`membership_ttl_seconds` defaults to 86400 (one day) and accepts 180–604800.
+Tool activity renews membership. Inactive memberships and their pending messages
+are removed after this interval.
+
+## Unix Streamable HTTP
+
+Add `--listen-unix /absolute/path/mcp.sock` to serve HTTP. The socket's parent
+directory must already exist; run the forwarding tunnel as the same Unix user
+as core to access the socket.
+
+Connect an MCP `2026-07-28` compatible client or tunnel to `/mcp`.
+Use `/readyz` to check local readiness.

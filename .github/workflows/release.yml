@@ -30,10 +30,12 @@ jobs:
         run: cargo fetch --locked
       - name: Test and lint
         run: |
-          cargo test --all-targets --locked --offline
-          cargo clippy --all-targets --locked --offline -- -D warnings
-      - name: Build standalone binary
-        run: python3 scripts/build-standalone.py --output dist/chatgpt-exec-mcp-linux-x86_64
+          cargo test --workspace --all-targets --locked --offline
+          cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+      - name: Prepare release files
+        run: |
+          python3 scripts/build-standalone.py --output dist/chatgpt-exec-mcp-linux-x86_64
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md dist/
       - name: Attest binary
         if: github.event_name != 'pull_request' && github.repository == 'CeraCharlesCC/chatgpt-exec-mcp'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -42,11 +44,13 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: chatgpt-exec-mcp-linux-x86_64
-          path: dist/chatgpt-exec-mcp-linux-x86_64
+          path: dist/
           if-no-files-found: error
       - name: Publish tagged release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'CeraCharlesCC/chatgpt-exec-mcp'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" dist/chatgpt-exec-mcp-linux-x86_64 --verify-tag --generate-notes
+        run: |
+          gh release create "$RELEASE_TAG" dist/chatgpt-exec-mcp-linux-x86_64 \
+            dist/LICENSE dist/NOTICE dist/THIRD_PARTY_NOTICES.md --verify-tag --generate-notes

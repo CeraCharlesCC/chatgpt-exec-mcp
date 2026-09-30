@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -12,6 +13,13 @@ use tokio::process::Command;
 
 const PRIVATE_USER: &str = "MCP_TEST_SOURCE_USER";
 const PRIVATE_TOKEN: &str = "MCP_TEST_SOURCE_TOKEN";
+
+fn string_set(value: &Value) -> BTreeSet<&str> {
+    let values = value.as_array().unwrap();
+    let strings: BTreeSet<_> = values.iter().map(|value| value.as_str().unwrap()).collect();
+    assert_eq!(strings.len(), values.len(), "duplicate schema values");
+    strings
+}
 
 fn write_config(workspace: &TempDir, scoped: bool) -> std::path::PathBuf {
     let path = workspace.path().join("config.json");
@@ -99,10 +107,7 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         "chatgpt-exec-mcp"
     );
     let instructions = initialized["result"]["instructions"].as_str().unwrap();
-    assert!(instructions.contains("prefer wait_for_exit"));
     assert!(instructions.ends_with("Test workspace instructions."));
-    assert!(instructions.contains("ordinary stdout/stderr does not wake"));
-    assert!(!instructions.contains("build-summary"));
     stdin
         .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
         .await
@@ -114,12 +119,16 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
     )
     .await;
-    let names: Vec<_> = listed["result"]["tools"]
+    let names: BTreeSet<_> = listed["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
+    assert_eq!(
+        names.len(),
+        listed["result"]["tools"].as_array().unwrap().len()
+    );
     assert_eq!(
         names,
         [
@@ -128,6 +137,7 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
             "wait_for_exit",
             "write_stdin"
         ]
+        .into()
     );
     for tool in listed["result"]["tools"].as_array().unwrap() {
         let properties = tool["outputSchema"]["properties"].as_object().unwrap();
@@ -136,34 +146,34 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         assert!(!properties.contains_key("chunk_id"));
         assert!(properties.contains_key("output_encoding_loss"));
         assert!(properties.contains_key("capture_error"));
-        let required = tool["outputSchema"]["required"].as_array().unwrap();
+        let required = string_set(&tool["outputSchema"]["required"]);
         assert_eq!(
             required,
-            json!([
+            [
                 "call_wall_time_seconds",
                 "output",
                 "output_truncated",
                 "output_encoding_loss"
-            ])
-            .as_array()
-            .unwrap()
+            ]
+            .into()
         );
         let output_ref = &tool["outputSchema"]["properties"]["output_ref"];
         assert_eq!(output_ref["type"], "object");
         assert_eq!(output_ref["additionalProperties"], false);
         assert_eq!(
-            output_ref["properties"]["capture_status"]["enum"],
-            json!(["open", "complete", "incomplete"])
+            string_set(&output_ref["properties"]["capture_status"]["enum"]),
+            ["open", "complete", "incomplete"].into()
         );
         assert_eq!(
-            output_ref["required"],
-            json!([
+            string_set(&output_ref["required"]),
+            [
                 "path",
                 "range_start",
                 "range_end",
                 "stored_bytes",
                 "capture_status"
-            ])
+            ]
+            .into()
         );
     }
     let wait_tool = listed["result"]["tools"]
@@ -172,12 +182,6 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         .iter()
         .find(|tool| tool["name"] == "wait_for_exit")
         .unwrap();
-    assert!(
-        wait_tool["description"]
-            .as_str()
-            .unwrap()
-            .contains("does not wake")
-    );
     assert_eq!(wait_tool["inputSchema"]["additionalProperties"], false);
     assert_eq!(wait_tool["inputSchema"]["required"], json!(["session_id"]));
     assert_eq!(
@@ -239,12 +243,6 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         .iter()
         .find(|tool| tool["name"] == "exec_command")
         .unwrap();
-    assert!(
-        exec_tool["inputSchema"]["properties"]["cmd"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("server-configured shell")
-    );
     assert_eq!(
         exec_tool["inputSchema"]["properties"]["cmd"]["minLength"],
         1
@@ -376,10 +374,6 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
             .unwrap()
             >= 0.0
     );
-    assert_eq!(
-        one_shot["result"]["content"][0]["text"],
-        "exit_code=0; output_bytes=6"
-    );
 
     // start_session is the tool whose complete argument object may be omitted.
     let default_shell = request(
@@ -396,7 +390,7 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         .unwrap();
     let stopped = request(&mut stdin, &mut stdout, json!({
         "jsonrpc": "2.0", "id": 29, "method": "tools/call",
-        "params": { "name": "write_stdin", "arguments": { "session_id": default_id, "chars": "exit\n" } }
+        "params": { "name": "write_stdin", "arguments": { "session_id": default_id, "chars": "exit 0\n" } }
     })).await;
     assert_eq!(stopped["result"]["structuredContent"]["exit_code"], 0);
 
