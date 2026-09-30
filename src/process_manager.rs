@@ -443,6 +443,7 @@ impl ProcessManager {
                 output_encoding_loss: prepared.encoding_loss,
                 capture_error,
                 output_ref,
+                peer_messages: None,
             },
             commit_end: prepared
                 .read_error
@@ -490,6 +491,7 @@ impl ProcessManager {
             output_encoding_loss: false,
             capture_error: delivery.capture_error,
             output_ref: delivery.output_ref,
+            peer_messages: None,
         }
     }
 

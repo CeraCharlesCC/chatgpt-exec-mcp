@@ -1,6 +1,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 
+use crate::agent_pool::PeerMessage;
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
@@ -234,6 +235,9 @@ pub struct ExecResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "OutputRef", default)]
     pub output_ref: Option<OutputRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<PeerMessage>", default)]
+    pub peer_messages: Option<Vec<PeerMessage>>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]

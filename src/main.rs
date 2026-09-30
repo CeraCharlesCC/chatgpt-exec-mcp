@@ -91,22 +91,23 @@ fn parse_args(args: Vec<OsString>) -> anyhow::Result<StartupAction> {
 
 async fn run(args: RunArgs) -> anyhow::Result<()> {
     let config = Config::load(&args.config_path)?;
-    let events = config
-        .events
+    let agent_pool = config
+        .agent_pool
         .clone()
         .map(|settings| {
-            chatgpt_exec_mcp::events::EventStore::open(&settings.database_path)
-                .map(|store| (std::sync::Arc::new(store), settings.principal))
+            chatgpt_exec_mcp::agent_pool::AgentPoolStore::open_with_ttl(
+                &settings.database_path,
+                settings.membership_ttl,
+            )
+            .map(|store| (std::sync::Arc::new(store), settings.principal))
         })
         .transpose()?;
     let manager = ProcessManager::new(config)?;
     let reaper = manager.spawn_reaper();
     let mut server = ExecMcpServer::new(manager.clone());
-    let worker = events.map(|(store, principal)| {
-        let worker = store.spawn_worker();
-        server = server.clone().with_events(store, principal);
-        worker
-    });
+    if let Some((store, principal)) = agent_pool {
+        server = server.with_agent_pool(store, principal);
+    }
 
     let result = if let Some(path) = args.listen_unix.as_deref() {
         run_http(server, path).await
@@ -117,10 +118,6 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     manager.shutdown_all().await;
     reaper.abort();
     let _ = reaper.await;
-    if let Some(worker) = worker {
-        worker.abort();
-        let _ = worker.await;
-    }
     result
 }
 

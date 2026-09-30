@@ -22,13 +22,6 @@ rmcp = { version = "=3.5.0", default-features = false, features = [
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-hmac = "0.12"
-sha2 = "0.10"
-base64 = "0.22"
-url = "2"
-subtle = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = [
@@ -44,6 +37,7 @@ tokio = { version = "1", features = [
 ] }
 
 [dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 

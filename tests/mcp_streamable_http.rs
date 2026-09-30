@@ -26,7 +26,7 @@ fn write_config(workspace: &TempDir) -> std::path::PathBuf {
             "shell": "/bin/bash",
             "output_store_dir": "outputs",
             "child_env": { "inherit": [], "rules": [] },
-            "events": {"database_path":"events.sqlite3", "principal":"http-test-account"}
+            "agent_pool": {"database_path":"agent-pool.sqlite3", "principal":"http-test-account"}
         })
         .to_string(),
     )
@@ -250,7 +250,7 @@ fn strict_stateless_http_discovery_and_shared_pty_survive_reconnection() {
         discovery["result"]["supportedVersions"],
         json!(["2026-07-28"])
     );
-    assert!(discovery["result"]["capabilities"]["events"].is_object());
+    assert!(discovery["result"]["capabilities"].get("events").is_none());
     let list = server.call(2, "tools/list", json!({}));
     assert_eq!(list.status, 200);
     assert!(!list.headers.contains_key("mcp-session-id"));

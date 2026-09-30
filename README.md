@@ -1,7 +1,7 @@
 # chatgpt-exec-mcp
 
-An MCP server for running shell commands and exchanging messages between agents
-through MCP Events. It supports stdio and Unix-socket Streamable HTTP.
+An MCP server for running shell commands and exchanging durable messages between
+account-scoped cooperative agents. It supports stdio and Unix-socket Streamable HTTP.
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the vendored PTY utility.
 
@@ -18,21 +18,22 @@ The MCP server exposes four execution tools:
 
 Session IDs are short memorable handles such as `amber-river`. The server enforces separate quotas and idle timeouts for explicit sessions and `exec_command` continuations.
 
-With `events` configured, `pool_members(pool)` lists active members and
-`pool_send(pool, agent, message)` queues a `multiagent.message` webhook. Subscribe
-through `events/subscribe` with `pool` and a unique `agent` to join; refresh the
-subscription before expiry and use `events/unsubscribe` to leave. `events/list`
-describes the event. The reserved send target `global` reaches other active members
-of the pool and cannot be subscribed as an agent name.
+With agent_pool configured, pool_members(pool) lists active members and
+pool_send(pool, agent, message) sends to a named member or to global for all
+other active members. A session joins a pool on its first pool_send; that call
+supplies from_agent, which is bound to _meta["openai/session"]. Later sends
+infer the sender and reject attempts to override it.
 
-The sender is resolved from matching `_meta["openai/session"]` on subscription
-and tool calls. When a subscription lacks that correlation value, `pool_send`
-accepts `from_agent`. Successful sends confirm queueing, not ChatGPT activation.
-Delivery uses Standard Webhooks signatures, HTTPS public callbacks, and up to six
-attempts with bounded backoff; there is no replay cursor. Memberships and pending
-deliveries persist in SQLite. Each instance is for one authenticated account;
-deploy separate core, tunnel, socket and database for different accounts. See
-[Events configuration](docs/configuration.md#events-and-account-scope).
+Membership is an inactivity lease refreshed by ordinary tool activity; the deployment default is one day and is configurable in agent_pool.
+Messages are stored in a durable SQLite inbox. exec_command, start_session,
+write_stdin, wait_for_exit, and pool calls piggyback unread peer_messages in
+their normal results. Messages offered on one call are acknowledged by the
+same session's next tool call, giving at-least-once delivery without join,
+leave, poll, or ack tools. global never self-delivers. Pool state and pending
+inbox rows survive core restarts; expired memberships and their inbox rows are
+cleaned up automatically. Each instance is for one authenticated account;
+deploy separate core, tunnel, socket, and database for different accounts. See
+[agent-pool configuration](docs/configuration.md#agent-pool-and-account-scope).
 
 ## Build
 
