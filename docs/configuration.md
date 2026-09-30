@@ -81,7 +81,8 @@ It requires `database_path` and `principal`.
   "agent_pool": {
     "database_path": "/private/state/chatgpt-exec-mcp/agent-pool.sqlite3",
     "principal": "chatgpt-owner",
-    "membership_ttl_seconds": 86400
+    "membership_ttl_seconds": 86400,
+    "agent_name_dictionary": ["Caesar", "Augustus", "Tiberius", "Caligula"]
   }
 }
 ```
@@ -99,6 +100,15 @@ use a separate instance for each account and do not share its connector.
 `membership_ttl_seconds` defaults to 86400 (one day) and accepts 180–604800.
 Tool activity renews membership. Inactive memberships and their pending messages
 are removed after this interval.
+
+`agent_name_dictionary` is optional. It is an ordered, nonempty list of unique
+agent names; the first currently unused name in that pool is assigned on a
+chat's first `pool_send`. Names must contain 1–128 characters, have no control
+characters or surrounding whitespace, and cannot be the reserved names
+`global` or `admin`. If omitted, the built-in dictionary uses a sequence of
+Roman rulers beginning with `Caesar`, `Augustus`, and `Tiberius`. Exhausting the
+dictionary rejects a new membership until a name is freed by expiry or
+`pool_send(pool=..., operation="exit")`.
 
 ## Unix Streamable HTTP
 

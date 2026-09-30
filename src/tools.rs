@@ -222,9 +222,15 @@ where
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
+#[schemars(
+    crate = "rmcp::schemars",
+    deny_unknown_fields,
+    transform = exec_response_schema
+)]
 pub struct ExecResponse {
     /// Wall-clock time servicing this call, not total session runtime.
+    #[serde(skip_serializing)]
+    #[schemars(skip)]
     #[schemars(range(min = 0))]
     pub call_wall_time_seconds: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -233,8 +239,11 @@ pub struct ExecResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String", regex(pattern = "^[a-z]+-[a-z]+$"), default)]
     pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub output: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub output_truncated: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub output_encoding_loss: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String", default)]
@@ -245,6 +254,27 @@ pub struct ExecResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<PeerMessage>", default)]
     pub peer_messages: Option<Vec<PeerMessage>>,
+}
+
+fn exec_response_schema(schema: &mut rmcp::schemars::Schema) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    let remove_required =
+        if let Some(serde_json::Value::Array(required)) = object.get_mut("required") {
+            required.retain(|field| {
+                !matches!(
+                    field.as_str(),
+                    Some("output" | "output_truncated" | "output_encoding_loss")
+                )
+            });
+            required.is_empty()
+        } else {
+            false
+        };
+    if remove_required {
+        object.remove("required");
+    }
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]

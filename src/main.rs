@@ -121,9 +121,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .agent_pool
         .clone()
         .map(|settings| {
-            chatgpt_exec_mcp::agent_pool::AgentPoolStore::open_with_ttl(
+            chatgpt_exec_mcp::agent_pool::AgentPoolStore::open_with_names(
                 &settings.database_path,
                 settings.membership_ttl,
+                settings.agent_name_dictionary,
             )
             .map(|store| (std::sync::Arc::new(store), settings.principal))
         })

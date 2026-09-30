@@ -136,6 +136,14 @@ fn agent_pool_requires_an_explicit_principal_and_database_path() {
         json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":179}),
         json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":604801}),
         json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":null}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":null}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":[]}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["Caesar", "Caesar"]}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["global"]}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["admin"]}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":[" Caesar"]}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["Caesar\n"]}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["x".repeat(129)]}),
         json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "unknown":"SECRET_SENTINEL"}),
     ] {
         let mut value = config();
@@ -159,6 +167,7 @@ fn agent_pool_requires_an_explicit_principal_and_database_path() {
         agent_pool.database_path,
         dir.path().join("agent_pool.sqlite3")
     );
+    assert_eq!(agent_pool.agent_name_dictionary.first().unwrap(), "Caesar");
     assert!(
         !agent_pool.database_path.exists(),
         "validation must not create the database"
@@ -175,6 +184,19 @@ fn agent_pool_requires_an_explicit_principal_and_database_path() {
     assert_eq!(
         settings.agent_pool.unwrap().membership_ttl,
         std::time::Duration::from_secs(180)
+    );
+
+    let mut custom_names = config();
+    custom_names["agent_pool"] = json!({
+        "principal":"dedicated-owner",
+        "database_path":"agent_pool.sqlite3",
+        "agent_name_dictionary":["Ada", "Grace", "Linus"]
+    });
+    std::fs::write(&path, custom_names.to_string()).unwrap();
+    let settings = chatgpt_exec_mcp::Config::load(&path).unwrap();
+    assert_eq!(
+        settings.agent_pool.unwrap().agent_name_dictionary,
+        ["Ada", "Grace", "Linus"]
     );
 }
 

@@ -246,7 +246,7 @@ impl ExecMcpServer {
         );
         let turn = self.begin_tool(session.as_deref()).await?;
         let (pool, principal) = self.agent_pool_context()?;
-        let result = pool.members(principal, args);
+        let result = pool.members(principal, args, session.as_deref());
         let peers = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
@@ -255,10 +255,9 @@ impl ExecMcpServer {
         Self::pool_result(result, peers)
     }
 
-    /// Send to target (an active member or global). On your first send to a pool,
-    /// set register_as to claim your agent name; later sends infer it, so omit
-    /// register_as. Typically use target=global first to announce your join; zero
-    /// recipients still registers you.
+    /// Send to target (an active member or global). The first send automatically
+    /// allocates this session an agent name from the configured dictionary. To
+    /// leave the pool explicitly, call with operation=exit and the pool only.
     #[tool(output_schema = schema_for_output::<PoolSendResult>(), annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true, idempotent_hint = false))]
     async fn pool_send(
         &self,

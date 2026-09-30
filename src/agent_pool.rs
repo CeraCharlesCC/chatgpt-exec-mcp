@@ -1,6 +1,7 @@
 //! Durable account-scoped cooperative agent pools.
 //!
 //! Membership is bound to `_meta["openai/session"]` on the first `pool_send`.
+//! Agent names are allocated automatically from the configured dictionary.
 //! Ordinary tool activity refreshes the membership lease and piggybacks queued
 //! peer messages. A message offered on one tool call is acknowledged by the
 //! same session's next tool call, giving at-least-once delivery without poll or
@@ -29,55 +30,90 @@ const MAX_NAME_CHARS: usize = 128;
 const MAX_MESSAGE_BYTES: usize = 65_536;
 const ADMIN_AGENT: &str = "admin";
 const MAX_ADMIN_MESSAGES: i64 = 1_000;
-const NAME_SCHEMA_PATTERN: &str = r"^[^\u0000-\u0020\u007F-\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000](?:[^\u0000-\u001F\u007F-\u009F]*[^\u0000-\u0020\u007F-\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000])?$";
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct PoolMembersArgs {
-    #[schemars(
-        length(min = 1, max = MAX_NAME_CHARS),
-        regex(pattern = NAME_SCHEMA_PATTERN)
-    )]
+    #[schemars(length(min = 1, max = MAX_NAME_CHARS))]
     pub pool: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(crate = "rmcp::schemars")]
+#[schemars(crate = "rmcp::schemars", transform = pool_send_schema)]
 pub struct PoolSendArgs {
     /// Pool name within this account.
-    #[schemars(
-        length(min = 1, max = MAX_NAME_CHARS),
-        regex(pattern = NAME_SCHEMA_PATTERN)
-    )]
+    #[schemars(length(min = 1, max = MAX_NAME_CHARS))]
     pub pool: String,
     /// Active member name, or global for all other active members.
-    #[schemars(
-        length(min = 1, max = MAX_NAME_CHARS),
-        regex(pattern = NAME_SCHEMA_PATTERN)
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null_string",
+        skip_serializing_if = "Option::is_none"
     )]
-    pub target: String,
+    #[schemars(with = "String", length(min = 1, max = MAX_NAME_CHARS), skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     /// Message text, 1 to 65,536 UTF-8 bytes.
-    #[schemars(length(min = 1, max = MAX_MESSAGE_BYTES))]
-    pub message: String,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null_string")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(
+        with = "String",
+        length(min = 1),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub message: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schemars(
         with = "String",
         length(min = 1, max = MAX_NAME_CHARS),
-        regex(pattern = NAME_SCHEMA_PATTERN),
         skip_serializing_if = "Option::is_none"
     )]
     pub in_reply_to: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null_string")]
-    /// Agent name to claim on your first send to this pool; omit thereafter.
-    #[schemars(
-        with = "String",
-        length(min = 1, max = MAX_NAME_CHARS),
-        regex(pattern = NAME_SCHEMA_PATTERN),
+    /// Omit for a normal send. Set to exit to remove this session from the pool.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null_operation",
         skip_serializing_if = "Option::is_none"
     )]
-    pub register_as: Option<String>,
+    #[schemars(with = "PoolExitOperation", skip_serializing_if = "Option::is_none")]
+    pub operation: Option<PoolExitOperation>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+pub enum PoolExitOperation {
+    Exit,
+}
+
+fn pool_send_schema(schema: &mut rmcp::schemars::Schema) {
+    schema.insert(
+        "oneOf".to_owned(),
+        json!([
+            {
+                "required": ["target", "message"],
+                "not": {"required": ["operation"]}
+            },
+            {
+                "required": ["operation"],
+                "not": {
+                    "anyOf": [
+                        {"required": ["target"]},
+                        {"required": ["message"]},
+                        {"required": ["in_reply_to"]}
+                    ]
+                }
+            }
+        ]),
+    );
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
@@ -122,26 +158,28 @@ pub struct AdminMessage {
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
 pub struct PoolMembersResult {
-    pub pool: String,
     pub agents: Vec<String>,
+    /// This session's allocated name in the pool, when joined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", default)]
+    pub self_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<PeerMessage>", default)]
     pub peer_messages: Option<Vec<PeerMessage>>,
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Default, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
 pub struct PoolSendResult {
-    /// Effective sender identity inferred for this session.
-    pub sender: String,
+    /// Name allocated on this session's first send to the pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", default)]
+    pub assigned_agent: Option<String>,
     /// Message id when at least one delivery was queued; omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String", default)]
     pub message_id: Option<String>,
-    /// Number of active members that received this message.
-    pub delivery_count: usize,
-    /// True when this call created the sender's pool membership.
-    pub membership_created: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recipients: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<PeerMessage>", default)]
@@ -153,6 +191,22 @@ where
     D: serde::Deserializer<'de>,
 {
     Option::<String>::deserialize(deserializer)?.map_or_else(
+        || {
+            Err(serde::de::Error::custom(
+                "null is not allowed; omit the field instead",
+            ))
+        },
+        |value| Ok(Some(value)),
+    )
+}
+
+fn deserialize_optional_non_null_operation<'de, D>(
+    deserializer: D,
+) -> Result<Option<PoolExitOperation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<PoolExitOperation>::deserialize(deserializer)?.map_or_else(
         || {
             Err(serde::de::Error::custom(
                 "null is not allowed; omit the field instead",
@@ -181,6 +235,7 @@ pub struct AgentPoolStore {
     connection: Mutex<Connection>,
     session_orders: Mutex<HashMap<SessionKey, SessionOrderWeak>>,
     lease_ttl_ms: i64,
+    agent_names: Arc<[String]>,
 }
 
 impl AgentPoolStore {
@@ -189,6 +244,37 @@ impl AgentPoolStore {
     }
 
     pub fn open_with_ttl(path: &Path, lease_ttl: Duration) -> anyhow::Result<Self> {
+        Self::open_with_names(
+            path,
+            lease_ttl,
+            crate::config::default_agent_name_dictionary(),
+        )
+    }
+
+    pub fn open_with_names(
+        path: &Path,
+        lease_ttl: Duration,
+        agent_names: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !agent_names.is_empty(),
+            "agent name dictionary must not be empty"
+        );
+        let mut unique_names = std::collections::HashSet::new();
+        for name in &agent_names {
+            anyhow::ensure!(
+                !name.is_empty()
+                    && name.chars().count() <= MAX_NAME_CHARS
+                    && name.trim() == name
+                    && !name.chars().any(char::is_control)
+                    && !matches!(name.as_str(), "global" | ADMIN_AGENT),
+                "agent name dictionary contains an invalid or reserved name"
+            );
+            anyhow::ensure!(
+                unique_names.insert(name.clone()),
+                "agent name dictionary contains duplicates"
+            );
+        }
         let lease_ttl_ms = i64::try_from(lease_ttl.as_millis())
             .map_err(|_| anyhow::anyhow!("agent pool membership TTL is too large"))?;
         anyhow::ensure!(
@@ -284,6 +370,7 @@ impl AgentPoolStore {
             connection: Mutex::new(connection),
             session_orders: Mutex::new(HashMap::new()),
             lease_ttl_ms,
+            agent_names: agent_names.into(),
         })
     }
 
@@ -689,10 +776,8 @@ impl AgentPoolStore {
         };
         transaction.commit().map_err(|_| storage_error())?;
         Ok(PoolSendResult {
-            sender: ADMIN_AGENT.to_owned(),
+            assigned_agent: None,
             message_id,
-            delivery_count: recipients.len(),
-            membership_created: false,
             recipients,
             peer_messages: None,
         })
@@ -729,9 +814,13 @@ impl AgentPoolStore {
         &self,
         principal: &str,
         args: PoolMembersArgs,
+        session: Option<&str>,
     ) -> Result<PoolMembersResult, McpError> {
         validate_name(principal, "principal")?;
         validate_name(&args.pool, "pool")?;
+        if let Some(session) = session {
+            validate_session(session)?;
+        }
         let now = now_ms();
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|_| storage_error())?;
@@ -749,10 +838,22 @@ impl AgentPoolStore {
                 .collect::<rusqlite::Result<Vec<String>>>()
                 .map_err(|_| storage_error())?
         };
+        let self_agent = match session {
+            Some(session) => transaction
+                .query_row(
+                    "SELECT agent FROM members
+                     WHERE principal=?1 AND pool=?2 AND session=?3 AND expires>?4",
+                    params![principal, args.pool, session, now],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| storage_error())?,
+            None => None,
+        };
         transaction.commit().map_err(|_| storage_error())?;
         Ok(PoolMembersResult {
-            pool: args.pool,
             agents,
+            self_agent,
             peer_messages: None,
         })
     }
@@ -763,23 +864,75 @@ impl AgentPoolStore {
         args: PoolSendArgs,
         session: Option<&str>,
     ) -> Result<PoolSendResult, McpError> {
-        validate_name(principal, "principal")?;
         validate_name(&args.pool, "pool")?;
-        validate_name(&args.target, "target")?;
-        if args.message.is_empty() || args.message.len() > MAX_MESSAGE_BYTES {
+        match args.operation {
+            Some(PoolExitOperation::Exit) => {
+                if args.target.is_some() || args.message.is_some() || args.in_reply_to.is_some() {
+                    return Err(invalid("operation=exit accepts only pool and operation"));
+                }
+                self.exit_pool(principal, &args.pool, session)
+            }
+            None => {
+                let target = args
+                    .target
+                    .ok_or_else(|| invalid("pool_send requires target for send"))?;
+                let message = args
+                    .message
+                    .ok_or_else(|| invalid("pool_send requires message for send"))?;
+                self.send_message(
+                    principal,
+                    &args.pool,
+                    target,
+                    message,
+                    args.in_reply_to,
+                    session,
+                )
+            }
+        }
+    }
+
+    fn exit_pool(
+        &self,
+        principal: &str,
+        pool: &str,
+        session: Option<&str>,
+    ) -> Result<PoolSendResult, McpError> {
+        validate_name(principal, "principal")?;
+        let session = session.ok_or_else(|| {
+            invalid("pool_send requires openai/session metadata to identify the sender")
+        })?;
+        validate_session(session)?;
+        let now = now_ms();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(|_| storage_error())?;
+        cleanup(&transaction, now)?;
+        transaction
+            .execute(
+                "DELETE FROM members WHERE principal=?1 AND pool=?2 AND session=?3",
+                params![principal, pool, session],
+            )
+            .map_err(|_| storage_error())?;
+        prune_messages(&transaction)?;
+        transaction.commit().map_err(|_| storage_error())?;
+        Ok(PoolSendResult::default())
+    }
+
+    fn send_message(
+        &self,
+        principal: &str,
+        pool: &str,
+        target: String,
+        message: String,
+        in_reply_to: Option<String>,
+        session: Option<&str>,
+    ) -> Result<PoolSendResult, McpError> {
+        validate_name(principal, "principal")?;
+        validate_name(&target, "target")?;
+        if message.is_empty() || message.len() > MAX_MESSAGE_BYTES {
             return Err(invalid("message must contain 1 to 65536 bytes"));
         }
-        if let Some(reply) = &args.in_reply_to {
+        if let Some(reply) = &in_reply_to {
             validate_name(reply, "in_reply_to")?;
-        }
-        if let Some(register_as) = &args.register_as {
-            validate_name(register_as, "register_as")?;
-            if register_as == "global" {
-                return Err(invalid("global is reserved as the broadcast target"));
-            }
-            if register_as == ADMIN_AGENT {
-                return Err(invalid("agent name is reserved"));
-            }
         }
         let session = session.ok_or_else(|| {
             invalid("pool_send requires openai/session metadata to bind the sender")
@@ -795,47 +948,24 @@ impl AgentPoolStore {
             .query_row(
                 "SELECT id,agent FROM members
                  WHERE principal=?1 AND pool=?2 AND session=?3",
-                params![principal, args.pool, session],
+                params![principal, pool, session],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|_| storage_error())?;
 
-        let (sender_id, sender, membership_created) = match bound {
-            Some((member_id, agent)) => {
-                if args.register_as.is_some() {
-                    return Err(invalid(
-                        "register_as is only valid on this session's first send to a pool",
-                    ));
-                }
-                (member_id, agent, false)
-            }
+        let (sender_id, sender, assigned_agent) = match bound {
+            Some((member_id, agent)) => (member_id, agent, None),
             None => {
-                let agent = args
-                    .register_as
-                    .as_deref()
-                    .ok_or_else(|| invalid("first pool_send in a pool requires register_as"))?;
-                if transaction
-                    .query_row(
-                        "SELECT 1 FROM members
-                         WHERE principal=?1 AND pool=?2 AND agent=?3",
-                        params![principal, args.pool, agent],
-                        |_| Ok(()),
-                    )
-                    .optional()
-                    .map_err(|_| storage_error())?
-                    .is_some()
-                {
-                    return Err(agent_conflict());
-                }
+                let agent = self.allocate_agent_name(&transaction, principal, pool)?;
                 transaction
                     .execute(
                         "INSERT INTO members(principal,pool,agent,session,expires,last_seen,generation)
                          VALUES(?1,?2,?3,?4,?5,?6,?7)",
                         params![
                             principal,
-                            args.pool,
-                            agent,
+                            pool,
+                            &agent,
                             session,
                             now + self.lease_ttl_ms,
                             now,
@@ -843,7 +973,7 @@ impl AgentPoolStore {
                         ],
                     )
                     .map_err(|_| agent_conflict())?;
-                (transaction.last_insert_rowid(), agent.to_owned(), true)
+                (transaction.last_insert_rowid(), agent.clone(), Some(agent))
             }
         };
 
@@ -854,7 +984,7 @@ impl AgentPoolStore {
             )
             .map_err(|_| storage_error())?;
 
-        if args.target == ADMIN_AGENT {
+        if target == ADMIN_AGENT {
             let message_id = format!("msg_{}", Uuid::new_v4());
             transaction
                 .execute(
@@ -863,10 +993,10 @@ impl AgentPoolStore {
                     params![
                         message_id,
                         principal,
-                        args.pool,
+                        pool,
                         sender,
-                        args.message,
-                        args.in_reply_to,
+                        message,
+                        in_reply_to,
                         now
                     ],
                 )
@@ -882,17 +1012,15 @@ impl AgentPoolStore {
                 .map_err(|_| storage_error())?;
             transaction.commit().map_err(|_| storage_error())?;
             return Ok(PoolSendResult {
-                sender,
+                assigned_agent,
                 message_id: Some(message_id),
-                delivery_count: 1,
-                membership_created,
                 recipients: vec![ADMIN_AGENT.to_owned()],
                 peer_messages: None,
             });
         }
 
         let targets: Vec<(i64, String)> = {
-            let mut statement = if args.target == "global" {
+            let mut statement = if target == "global" {
                 transaction
                     .prepare(
                         "SELECT id,agent FROM members
@@ -909,9 +1037,9 @@ impl AgentPoolStore {
                     )
                     .map_err(|_| storage_error())?
             };
-            if args.target == "global" {
+            if target == "global" {
                 statement
-                    .query_map(params![principal, args.pool, sender_id, now], |row| {
+                    .query_map(params![principal, pool, sender_id, now], |row| {
                         Ok((row.get(0)?, row.get(1)?))
                     })
                     .map_err(|_| storage_error())?
@@ -919,7 +1047,7 @@ impl AgentPoolStore {
                     .map_err(|_| storage_error())?
             } else {
                 statement
-                    .query_map(params![principal, args.pool, args.target, now], |row| {
+                    .query_map(params![principal, pool, target, now], |row| {
                         Ok((row.get(0)?, row.get(1)?))
                     })
                     .map_err(|_| storage_error())?
@@ -927,7 +1055,7 @@ impl AgentPoolStore {
                     .map_err(|_| storage_error())?
             }
         };
-        if args.target != "global" && targets.is_empty() {
+        if target != "global" && targets.is_empty() {
             return Err(invalid("target agent is not an active pool member"));
         }
 
@@ -953,11 +1081,11 @@ impl AgentPoolStore {
                     params![
                         message_id,
                         principal,
-                        args.pool,
+                        pool,
                         sender,
-                        args.target,
-                        args.message,
-                        args.in_reply_to,
+                        target,
+                        message,
+                        in_reply_to,
                         now
                     ],
                 )
@@ -973,15 +1101,35 @@ impl AgentPoolStore {
             Some(message_id)
         };
         transaction.commit().map_err(|_| storage_error())?;
-        let delivery_count = recipients.len();
         Ok(PoolSendResult {
-            sender,
+            assigned_agent,
             message_id,
-            delivery_count,
-            membership_created,
             recipients,
             peer_messages: None,
         })
+    }
+
+    fn allocate_agent_name(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        principal: &str,
+        pool: &str,
+    ) -> Result<String, McpError> {
+        for candidate in self.agent_names.iter() {
+            let occupied = transaction
+                .query_row(
+                    "SELECT 1 FROM members WHERE principal=?1 AND pool=?2 AND agent=?3",
+                    params![principal, pool, candidate],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|_| storage_error())?
+                .is_some();
+            if !occupied {
+                return Ok(candidate.clone());
+            }
+        }
+        Err(invalid("agent name dictionary is exhausted for this pool"))
     }
 }
 
@@ -1060,17 +1208,35 @@ mod tests {
             .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir()
             .unwrap();
-        let store = AgentPoolStore::open(&directory.path().join("agent-pool.sqlite3")).unwrap();
+        let store = AgentPoolStore::open_with_names(
+            &directory.path().join("agent-pool.sqlite3"),
+            Duration::from_millis(DEFAULT_TTL_MS as u64),
+            ["alice", "bob", "carol", "dave"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+        .unwrap();
         (directory, store)
     }
 
-    fn send(pool: &str, target: &str, register_as: Option<&str>, body: &str) -> PoolSendArgs {
+    fn send(pool: &str, target: &str, body: &str) -> PoolSendArgs {
         PoolSendArgs {
             pool: pool.into(),
-            target: target.into(),
-            message: body.into(),
+            target: Some(target.into()),
+            message: Some(body.into()),
             in_reply_to: None,
-            register_as: register_as.map(str::to_owned),
+            operation: None,
+        }
+    }
+
+    fn exit(pool: &str) -> PoolSendArgs {
+        PoolSendArgs {
+            pool: pool.into(),
+            target: None,
+            message: None,
+            in_reply_to: None,
+            operation: Some(PoolExitOperation::Exit),
         }
     }
 
@@ -1079,59 +1245,30 @@ mod tests {
         let (_directory, store) = store();
         let owner = "account-a";
         let first = store
-            .send(
-                owner,
-                send("project", "global", Some("alice"), "hello"),
-                Some("a"),
-            )
+            .send(owner, send("project", "global", "hello"), Some("a"))
             .unwrap();
-        assert_eq!(first.sender, "alice");
+        assert_eq!(first.assigned_agent.as_deref(), Some("alice"));
         assert!(first.recipients.is_empty());
-        assert_eq!(first.delivery_count, 0);
-        assert!(first.membership_created);
         assert!(first.message_id.is_none());
 
         let empty_again = store
-            .send(
-                owner,
-                send("project", "global", None, "still alone"),
-                Some("a"),
-            )
+            .send(owner, send("project", "global", "still alone"), Some("a"))
             .unwrap();
-        assert_eq!(empty_again.sender, "alice");
+        assert!(empty_again.assigned_agent.is_none());
         assert!(empty_again.recipients.is_empty());
-        assert_eq!(empty_again.delivery_count, 0);
-        assert!(!empty_again.membership_created);
         assert!(empty_again.message_id.is_none());
 
         let bob_join = store
-            .send(
-                owner,
-                send("project", "global", Some("bob"), "joined"),
-                Some("b"),
-            )
+            .send(owner, send("project", "global", "joined"), Some("b"))
             .unwrap();
-        assert_eq!(bob_join.sender, "bob");
-        assert_eq!(bob_join.delivery_count, 1);
-        assert!(bob_join.membership_created);
+        assert_eq!(bob_join.assigned_agent.as_deref(), Some("bob"));
         assert!(bob_join.message_id.is_some());
         let broadcast = store
-            .send(owner, send("project", "global", None, "team"), Some("a"))
+            .send(owner, send("project", "global", "team"), Some("a"))
             .unwrap();
-        assert_eq!(broadcast.sender, "alice");
+        assert!(broadcast.assigned_agent.is_none());
         assert_eq!(broadcast.recipients, ["bob"]);
-        assert_eq!(broadcast.delivery_count, 1);
-        assert!(!broadcast.membership_created);
         assert!(broadcast.message_id.is_some());
-        assert!(
-            store
-                .send(
-                    owner,
-                    send("project", "alice", Some("alice"), "redundant"),
-                    Some("a")
-                )
-                .is_err()
-        );
 
         store.begin_tool_state(owner, Some("b")).unwrap();
         let offered = store.collect_tool_messages(owner, Some("b")).unwrap();
@@ -1147,23 +1284,118 @@ mod tests {
         );
     }
 
+    #[test]
+    fn automatic_names_exhaust_exit_reuse_and_failed_join_rolls_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let store = AgentPoolStore::open_with_names(
+            &directory.path().join("agent-pool.sqlite3"),
+            Duration::from_millis(DEFAULT_TTL_MS as u64),
+            ["one", "two"].into_iter().map(str::to_owned).collect(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .send("owner", send("p", "global", "join"), Some("a"))
+                .unwrap()
+                .assigned_agent
+                .as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            store
+                .send("owner", send("p", "global", "join"), Some("b"))
+                .unwrap()
+                .assigned_agent
+                .as_deref(),
+            Some("two")
+        );
+        assert!(
+            store
+                .send("owner", send("p", "global", "join"), Some("c"))
+                .unwrap_err()
+                .message
+                .contains("dictionary is exhausted")
+        );
+
+        store.send("owner", exit("p"), Some("a")).unwrap();
+        assert_eq!(
+            store
+                .send("owner", send("p", "global", "join"), Some("c"))
+                .unwrap()
+                .assigned_agent
+                .as_deref(),
+            Some("one")
+        );
+
+        // A failed first targeted send must not consume an allocated name.
+        assert!(
+            store
+                .send("owner", send("q", "nobody", "fail"), Some("x"))
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .send("owner", send("q", "global", "join"), Some("y"))
+                .unwrap()
+                .assigned_agent
+                .as_deref(),
+            Some("one")
+        );
+    }
+
+    #[test]
+    fn exit_is_pool_scoped_for_a_session() {
+        let (_directory, store) = store();
+        store
+            .send("owner", send("left", "global", "join"), Some("session"))
+            .unwrap();
+        store
+            .send("owner", send("right", "global", "join"), Some("session"))
+            .unwrap();
+
+        store.send("owner", exit("left"), Some("session")).unwrap();
+        let left = store
+            .members(
+                "owner",
+                PoolMembersArgs {
+                    pool: "left".into(),
+                },
+                Some("session"),
+            )
+            .unwrap();
+        assert!(left.agents.is_empty());
+        assert!(left.self_agent.is_none());
+
+        let right = store
+            .members(
+                "owner",
+                PoolMembersArgs {
+                    pool: "right".into(),
+                },
+                Some("session"),
+            )
+            .unwrap();
+        assert_eq!(right.agents, ["alice"]);
+        assert_eq!(right.self_agent.as_deref(), Some("alice"));
+
+        // Repeated exit is intentionally idempotent.
+        store.send("owner", exit("left"), Some("session")).unwrap();
+    }
+
     #[tokio::test]
     async fn concurrent_turns_do_not_block_tools_or_duplicate_offers() {
         let (_directory, store) = store();
         let owner = "account-a";
         store
-            .send(
-                owner,
-                send("project", "global", Some("alice"), "join"),
-                Some("a"),
-            )
+            .send(owner, send("project", "global", "join"), Some("a"))
             .unwrap();
         store
-            .send(
-                owner,
-                send("project", "global", Some("bob"), "join"),
-                Some("b"),
-            )
+            .send(owner, send("project", "global", "join"), Some("b"))
             .unwrap();
 
         // Consume and acknowledge Bob's join announcement first.
@@ -1175,7 +1407,7 @@ mod tests {
         store.begin_tool_state(owner, Some("a")).unwrap();
 
         store
-            .send(owner, send("project", "alice", None, "parallel"), Some("b"))
+            .send(owner, send("project", "alice", "parallel"), Some("b"))
             .unwrap();
 
         // Both turns can start before either finishes. Only the latest-started
@@ -1211,26 +1443,13 @@ mod tests {
         let (directory, store) = store();
         let path = directory.path().join("agent-pool.sqlite3");
         store
-            .send(
-                "owner",
-                send("p", "global", Some("alice"), "join"),
-                Some("a"),
-            )
-            .unwrap();
-        assert!(
-            store
-                .send(
-                    "owner",
-                    send("p", "global", Some("alice"), "join"),
-                    Some("other")
-                )
-                .is_err()
-        );
-        store
-            .send("owner", send("p", "global", Some("bob"), "join"), Some("b"))
+            .send("owner", send("p", "global", "join"), Some("a"))
             .unwrap();
         store
-            .send("owner", send("p", "bob", None, "durable"), Some("a"))
+            .send("owner", send("p", "global", "join"), Some("b"))
+            .unwrap();
+        store
+            .send("owner", send("p", "bob", "durable"), Some("a"))
             .unwrap();
         store.begin_tool_state("owner", Some("b")).unwrap();
         assert_eq!(
@@ -1240,7 +1459,15 @@ mod tests {
         // Restart before Bob's next tool call implicitly acknowledges the offer.
         drop(store);
 
-        let restarted = AgentPoolStore::open(&path).unwrap();
+        let restarted = AgentPoolStore::open_with_names(
+            &path,
+            Duration::from_millis(DEFAULT_TTL_MS as u64),
+            ["alice", "bob", "carol", "dave"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+        .unwrap();
         restarted.begin_tool_state("owner", Some("b")).unwrap();
         assert_eq!(
             restarted.collect_tool_messages("owner", Some("b")).unwrap()[0].message,
@@ -1264,7 +1491,7 @@ mod tests {
         }
         assert_eq!(
             restarted
-                .members("owner", PoolMembersArgs { pool: "p".into() })
+                .members("owner", PoolMembersArgs { pool: "p".into() }, Some("a"))
                 .unwrap()
                 .agents,
             ["alice"]
@@ -1276,26 +1503,15 @@ mod tests {
         let (_directory, store) = store();
         let owner = "account-a";
 
-        assert!(
-            store
-                .send(
-                    owner,
-                    send("project", "global", Some(ADMIN_AGENT), "reserved"),
-                    Some("admin-session"),
-                )
-                .is_err()
-        );
-
         let to_admin = store
             .send(
                 owner,
-                send("project", ADMIN_AGENT, Some("alice"), "need human input"),
+                send("project", ADMIN_AGENT, "need human input"),
                 Some("alice-session"),
             )
             .unwrap();
         assert_eq!(to_admin.recipients, [ADMIN_AGENT]);
-        assert_eq!(to_admin.delivery_count, 1);
-        assert!(to_admin.membership_created);
+        assert_eq!(to_admin.assigned_agent.as_deref(), Some("alice"));
 
         let inbox = store.admin_messages(owner, 10).unwrap();
         assert_eq!(inbox.len(), 1);
@@ -1305,7 +1521,6 @@ mod tests {
         let from_admin = store
             .admin_send(owner, "project", "alice", "continue", None)
             .unwrap();
-        assert_eq!(from_admin.sender, ADMIN_AGENT);
         assert_eq!(from_admin.recipients, ["alice"]);
 
         store
@@ -1333,6 +1548,7 @@ mod tests {
                     PoolMembersArgs {
                         pool: "project".into(),
                     },
+                    Some("alice-session"),
                 )
                 .unwrap()
                 .agents

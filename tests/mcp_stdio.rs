@@ -129,34 +129,38 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         names.len(),
         listed["result"]["tools"].as_array().unwrap().len()
     );
-    assert_eq!(
-        names,
-        [
-            "exec_command",
-            "start_session",
-            "wait_for_exit",
-            "write_stdin"
-        ]
-        .into()
-    );
+    for required in [
+        "exec_command",
+        "start_session",
+        "wait_for_exit",
+        "write_stdin",
+    ] {
+        assert!(
+            names.contains(required),
+            "missing execution tool {required}"
+        );
+    }
+    for agent_pool_tool in ["pool_members", "pool_send"] {
+        assert!(
+            !names.contains(agent_pool_tool),
+            "agent-pool tools must stay disabled without agent_pool configuration"
+        );
+    }
     for tool in listed["result"]["tools"].as_array().unwrap() {
         let properties = tool["outputSchema"]["properties"].as_object().unwrap();
-        assert!(properties.contains_key("call_wall_time_seconds"));
-        assert!(!properties.contains_key("wall_time_seconds"));
-        assert!(!properties.contains_key("chunk_id"));
+        assert!(!properties.contains_key("call_wall_time_seconds"));
         assert!(properties.contains_key("output_encoding_loss"));
         assert!(properties.contains_key("capture_error"));
-        let required = string_set(&tool["outputSchema"]["required"]);
-        assert_eq!(
-            required,
-            [
-                "call_wall_time_seconds",
-                "output",
-                "output_truncated",
-                "output_encoding_loss"
-            ]
-            .into()
-        );
+        let required: BTreeSet<_> = tool["outputSchema"]
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        for sparse in ["output", "output_truncated", "output_encoding_loss"] {
+            assert!(!required.contains(sparse));
+        }
         let output_ref = &tool["outputSchema"]["properties"]["output_ref"];
         assert_eq!(output_ref["type"], "object");
         assert_eq!(output_ref["additionalProperties"], false);
@@ -402,10 +406,9 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
     assert_eq!(one_shot["result"]["structuredContent"]["exit_code"], 0);
     assert_eq!(one_shot["result"]["structuredContent"]["output"], "mcp-ok");
     assert!(
-        one_shot["result"]["structuredContent"]["call_wall_time_seconds"]
-            .as_f64()
-            .unwrap()
-            >= 0.0
+        one_shot["result"]["structuredContent"]
+            .get("call_wall_time_seconds")
+            .is_none()
     );
 
     // start_session is the tool whose complete argument object may be omitted.
@@ -637,7 +640,11 @@ async fn cancelling_wait_for_exit_keeps_process_running_and_output_pending() {
     .await;
     assert_eq!(finished["id"], 5);
     assert_eq!(finished["result"]["structuredContent"]["exit_code"], 0);
-    assert_eq!(finished["result"]["structuredContent"]["output"], "");
+    assert!(
+        finished["result"]["structuredContent"]
+            .get("output")
+            .is_none()
+    );
 
     drop(stdin);
     let status = tokio::time::timeout(Duration::from_secs(5), child.wait())

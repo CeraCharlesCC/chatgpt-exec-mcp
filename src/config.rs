@@ -33,6 +33,7 @@ pub struct AgentPoolConfig {
     pub database_path: PathBuf,
     pub principal: String,
     pub membership_ttl: Duration,
+    pub agent_name_dictionary: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -42,6 +43,8 @@ struct FileAgentPoolConfig {
     principal: String,
     #[serde(default = "day")]
     membership_ttl_seconds: u64,
+    #[serde(default = "default_agent_name_dictionary")]
+    agent_name_dictionary: Vec<String>,
 }
 
 fn present_agent_pool<'de, D: serde::Deserializer<'de>>(
@@ -102,6 +105,63 @@ const MAX_AGENT_POOL_TTL_SECONDS: u64 = 604_800;
 
 fn day() -> u64 {
     86_400
+}
+
+pub(crate) fn default_agent_name_dictionary() -> Vec<String> {
+    [
+        "Caesar",
+        "Augustus",
+        "Tiberius",
+        "Caligula",
+        "Claudius",
+        "Nero",
+        "Galba",
+        "Otho",
+        "Vitellius",
+        "Vespasian",
+        "Titus",
+        "Domitian",
+        "Nerva",
+        "Trajan",
+        "Hadrian",
+        "Antoninus",
+        "Marcus",
+        "Lucius",
+        "Commodus",
+        "Pertinax",
+        "Didius",
+        "Septimius",
+        "Caracalla",
+        "Geta",
+        "Macrinus",
+        "Elagabalus",
+        "Severus",
+        "Maximinus",
+        "Gordian",
+        "Philip",
+        "Decius",
+        "Gallus",
+        "Aemilian",
+        "Valerian",
+        "Gallienus",
+        "Aurelian",
+        "Tacitus",
+        "Florian",
+        "Probus",
+        "Carus",
+        "Numerian",
+        "Carinus",
+        "Diocletian",
+        "Maximian",
+        "Constantius",
+        "Galerius",
+        "Constantine",
+        "Licinius",
+        "Julian",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 fn megabyte() -> usize {
     1_048_576
@@ -247,10 +307,30 @@ impl Config {
                     "agent_pool.membership_ttl_seconds must be between {MIN_AGENT_POOL_TTL_SECONDS} and {MAX_AGENT_POOL_TTL_SECONDS}"
                 );
             }
+            if agent_pool.agent_name_dictionary.is_empty() {
+                bail!("agent_pool.agent_name_dictionary must not be empty");
+            }
+            let mut names = HashSet::new();
+            for name in &agent_pool.agent_name_dictionary {
+                if name.is_empty()
+                    || name.chars().count() > 128
+                    || name.trim() != name
+                    || name.chars().any(char::is_control)
+                    || matches!(name.as_str(), "global" | "admin")
+                {
+                    bail!(
+                        "agent_pool.agent_name_dictionary entries must be unique usable agent names of 1 to 128 characters"
+                    );
+                }
+                if !names.insert(name.clone()) {
+                    bail!("agent_pool.agent_name_dictionary entries must be unique");
+                }
+            }
             Ok(AgentPoolConfig {
                 database_path: resolve(base, &agent_pool.database_path, "agent_pool.database_path")?,
                 principal: agent_pool.principal,
                 membership_ttl: Duration::from_secs(agent_pool.membership_ttl_seconds),
+                agent_name_dictionary: agent_pool.agent_name_dictionary,
             })
         }).transpose()?;
         let config = Self {

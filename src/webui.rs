@@ -181,7 +181,7 @@ async fn send(State(state): State<WebUiState>, body: Bytes) -> Result<Response, 
             "message": request.message,
             "in_reply_to": request.in_reply_to,
             "message_id": result.message_id.clone(),
-            "delivery_count": result.delivery_count,
+            "delivery_count": result.recipients.len(),
         }),
     );
     json_response(StatusCode::OK, &result)

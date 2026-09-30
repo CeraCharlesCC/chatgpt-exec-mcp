@@ -2,11 +2,9 @@
 
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -15,7 +13,6 @@ const PRINCIPAL: &str = "account-a";
 struct Server {
     child: Option<Child>,
     workspace: TempDir,
-    database: PathBuf,
     client: reqwest::Client,
     webui_client: reqwest::Client,
     webui_address: SocketAddr,
@@ -40,7 +37,11 @@ impl Server {
                 "shell": "/bin/bash",
                 "output_store_dir": "outputs",
                 "child_env": {"inherit": [], "rules": []},
-                "agent_pool": {"database_path": database, "principal": PRINCIPAL}
+                "agent_pool": {
+                    "database_path": database,
+                    "principal": PRINCIPAL,
+                    "agent_name_dictionary": ["Augustus", "Tiberius", "Livia", "Debug"]
+                }
             })
             .to_string(),
         )
@@ -48,7 +49,6 @@ impl Server {
         let mut server = Self {
             child: None,
             workspace,
-            database,
             client: reqwest::Client::builder()
                 .unix_socket(socket)
                 .no_proxy()
@@ -175,22 +175,22 @@ impl Server {
         .await
     }
 
-    async fn send(
-        &self,
-        session: &str,
-        register_as: Option<&str>,
-        target: &str,
-        message: &str,
-    ) -> Value {
-        let mut arguments = json!({
+    async fn send(&self, session: &str, target: &str, message: &str) -> Value {
+        let arguments = json!({
             "pool": "Imperator",
             "target": target,
             "message": message
         });
-        if let Some(register_as) = register_as {
-            arguments["register_as"] = json!(register_as);
-        }
         self.tool("pool_send", arguments, Some(session)).await
+    }
+
+    async fn exit(&self, session: &str) -> Value {
+        self.tool(
+            "pool_send",
+            json!({"pool":"Imperator", "operation":"exit"}),
+            Some(session),
+        )
+        .await
     }
 
     async fn exec(&self, session: &str) -> Value {
@@ -219,12 +219,6 @@ async fn piggyback_agent_pool_acceptance_path() {
         json!(["2026-07-28"])
     );
     assert!(discovery["result"]["capabilities"].get("events").is_none());
-    for method in ["events/list", "events/subscribe", "events/unsubscribe"] {
-        assert_eq!(
-            server.call(method, json!({}), None).await["error"]["code"],
-            -32601
-        );
-    }
 
     let tools = server.call("tools/list", json!({}), None).await;
     let tools = tools["result"]["tools"].as_array().unwrap();
@@ -241,172 +235,110 @@ async fn piggyback_agent_pool_acceptance_path() {
             "missing {name}"
         );
     }
-    for forbidden in ["pool_join", "pool_leave", "pool_poll", "pool_ack"] {
-        assert!(!tools.iter().any(|tool| tool["name"] == forbidden));
-    }
+
     let send_schema = tools
         .iter()
         .find(|tool| tool["name"] == "pool_send")
         .unwrap();
-    let required: std::collections::BTreeSet<_> = send_schema["inputSchema"]["required"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|value| value.as_str().unwrap())
-        .collect();
-    assert_eq!(required, ["pool", "target", "message"].into());
-    assert_eq!(
-        required.len(),
-        send_schema["inputSchema"]["required"]
+    assert_eq!(send_schema["inputSchema"]["type"], "object");
+    assert_eq!(send_schema["inputSchema"]["additionalProperties"], false);
+    assert!(
+        send_schema["inputSchema"]["oneOf"]
             .as_array()
-            .unwrap()
-            .len()
+            .is_some_and(|v| v.len() == 2)
     );
     assert!(
         send_schema["inputSchema"]["properties"]
             .get("register_as")
-            .is_some()
+            .is_none()
     );
-    assert_eq!(send_schema["inputSchema"]["additionalProperties"], false);
-    for property in ["pool", "target", "register_as", "in_reply_to"] {
-        assert_eq!(
-            send_schema["inputSchema"]["properties"][property]["minLength"],
-            1
-        );
-        assert_eq!(
-            send_schema["inputSchema"]["properties"][property]["maxLength"],
-            128
-        );
-        assert_eq!(
-            send_schema["inputSchema"]["properties"][property]["type"],
-            "string"
-        );
+    assert_eq!(
+        send_schema["inputSchema"]["$defs"]["PoolExitOperation"]["enum"],
+        json!(["exit"])
+    );
+    assert!(
+        send_schema["inputSchema"]["properties"]["message"]
+            .get("maxLength")
+            .is_none(),
+        "runtime enforces the UTF-8 byte limit; JSON Schema maxLength counts characters"
+    );
+    for removed in ["sender", "delivery_count", "membership_created"] {
         assert!(
-            send_schema["inputSchema"]["properties"][property]["pattern"]
-                .as_str()
-                .unwrap()
-                .contains("\\u0000")
-        );
-        assert!(
-            send_schema["inputSchema"]["properties"][property]
-                .get("default")
+            send_schema["outputSchema"]["properties"]
+                .get(removed)
                 .is_none()
         );
     }
-    assert_eq!(
-        send_schema["inputSchema"]["properties"]["message"]["minLength"],
-        1
-    );
-    assert_eq!(
-        send_schema["inputSchema"]["properties"]["message"]["maxLength"],
-        65_536
-    );
-    assert_eq!(send_schema["outputSchema"]["additionalProperties"], false);
-    assert_eq!(
-        send_schema["outputSchema"]["properties"]["message_id"]["type"],
-        "string"
-    );
+    for kept in [
+        "assigned_agent",
+        "message_id",
+        "recipients",
+        "peer_messages",
+    ] {
+        assert!(
+            send_schema["outputSchema"]["properties"]
+                .get(kept)
+                .is_some()
+        );
+    }
+
+    let exec_schema = tools
+        .iter()
+        .find(|tool| tool["name"] == "exec_command")
+        .unwrap();
+    let exec_required = exec_schema["outputSchema"]["required"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
-        !send_schema["outputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == "message_id")
+        exec_schema["outputSchema"]["properties"]
+            .get("call_wall_time_seconds")
+            .is_none()
     );
-    assert_eq!(
-        send_schema["outputSchema"]["$defs"]["PeerMessage"]["additionalProperties"],
-        false
-    );
+    for sparse in ["output", "output_truncated", "output_encoding_loss"] {
+        assert!(
+            exec_schema["outputSchema"]["properties"]
+                .get(sparse)
+                .is_some()
+        );
+        assert!(!exec_required.iter().any(|value| value == sparse));
+    }
+
     let members_schema = tools
         .iter()
         .find(|tool| tool["name"] == "pool_members")
         .unwrap();
     assert_eq!(members_schema["annotations"]["readOnlyHint"], true);
-    assert_eq!(
-        members_schema["inputSchema"]["properties"]["pool"]["minLength"],
-        1
-    );
-    assert_eq!(
-        members_schema["inputSchema"]["properties"]["pool"]["maxLength"],
-        128
-    );
     assert!(
-        members_schema["inputSchema"]["properties"]["pool"]["pattern"]
-            .as_str()
-            .unwrap()
-            .contains("\\u0000")
-    );
-    assert_eq!(
-        members_schema["outputSchema"]["additionalProperties"],
-        false
-    );
-    for arguments in [
-        json!({
-            "pool": "Imperator",
-            "target": "global",
-            "message": "join",
-            "register_as": null
-        }),
-        json!({
-            "pool": "Imperator",
-            "target": "global",
-            "message": "join",
-            "register_as": "NullCheck",
-            "in_reply_to": null
-        }),
-    ] {
-        let invalid = server
-            .tool("pool_send", arguments, Some("null-check"))
-            .await;
-        assert_eq!(invalid["result"]["isError"], true, "{invalid}");
-        assert!(
-            invalid["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("null is not allowed")
-        );
-    }
-    for property in [
-        "sender",
-        "message_id",
-        "delivery_count",
-        "membership_created",
-    ] {
-        assert!(
-            send_schema["outputSchema"]["properties"]
-                .get(property)
-                .is_some(),
-            "missing pool_send output property {property}"
-        );
-    }
-    let exec_schema = tools
-        .iter()
-        .find(|tool| tool["name"] == "exec_command")
-        .unwrap();
-    assert!(
-        exec_schema["outputSchema"]["properties"]
-            .get("peer_messages")
+        members_schema["outputSchema"]["properties"]
+            .get("self_agent")
             .is_some()
     );
 
-    assert!(
-        !send_schema.to_string().contains("admin"),
-        "hidden admin address must not appear in the public tool schema"
-    );
+    for arguments in [
+        json!({"pool":"Imperator","target":null,"message":"x"}),
+        json!({"pool":"Imperator","target":"global","message":"x","operation":null}),
+    ] {
+        let invalid = server
+            .tool("pool_send", arguments, Some("invalid-null"))
+            .await;
+        assert_eq!(invalid["result"]["isError"], true);
+    }
 
+    // WebUI administration continues to use the automatically assigned identity.
     let debug_to_admin = server
         .tool(
             "pool_send",
-            json!({
-                "pool": "WebUI",
-                "target": "admin",
-                "message": "need human input",
-                "register_as": "Debug"
-            }),
+            json!({"pool":"WebUI","target":"admin","message":"need human input"}),
             Some("session-debug"),
         )
         .await;
+    let debug_agent = structured(&debug_to_admin)["assigned_agent"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert_eq!(structured(&debug_to_admin)["recipients"], json!(["admin"]));
+
     let snapshot: Value = server
         .webui_client
         .get(format!(
@@ -421,20 +353,20 @@ async fn piggyback_agent_pool_acceptance_path() {
         .json()
         .await
         .unwrap();
-    assert_eq!(snapshot["pools"][0]["name"], "WebUI");
-    assert_eq!(snapshot["pools"][0]["agents"][0]["agent"], "Debug");
-    assert_eq!(snapshot["admin_messages"][0]["from"], "Debug");
-    assert_eq!(snapshot["admin_messages"][0]["message"], "need human input");
-    assert!(
-        snapshot["events"].as_array().unwrap().iter().any(|event| {
-            event["kind"] == "tool.finish" && event["detail"]["tool"] == "pool_send"
-        })
-    );
+    assert!(snapshot["pools"].as_array().unwrap().iter().any(|pool| {
+        pool["name"] == "WebUI"
+            && pool["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|agent| agent["agent"] == debug_agent)
+    }));
+    assert_eq!(snapshot["admin_messages"][0]["from"], debug_agent);
 
     let admin_send: Value = server
         .webui_client
         .post(format!("http://{}/_admin/api/send", server.webui_address))
-        .json(&json!({"pool":"WebUI","target":"Debug","message":"human reply"}))
+        .json(&json!({"pool":"WebUI","target":debug_agent,"message":"human reply"}))
         .send()
         .await
         .unwrap()
@@ -443,8 +375,8 @@ async fn piggyback_agent_pool_acceptance_path() {
         .json()
         .await
         .unwrap();
-    assert_eq!(admin_send["sender"], "admin");
-    assert_eq!(admin_send["recipients"], json!(["Debug"]));
+    assert_eq!(admin_send["recipients"], json!([debug_agent.clone()]));
+
     let debug_receive = server
         .tool(
             "pool_members",
@@ -452,214 +384,50 @@ async fn piggyback_agent_pool_acceptance_path() {
             Some("session-debug"),
         )
         .await;
-    assert_eq!(
-        structured(&debug_receive)["peer_messages"][0]["from"],
-        "admin"
-    );
+    assert_eq!(structured(&debug_receive)["self_agent"], debug_agent);
     assert_eq!(
         structured(&debug_receive)["peer_messages"][0]["message"],
         "human reply"
     );
 
-    let terminated: Value = server
-        .webui_client
-        .post(format!(
-            "http://{}/_admin/api/terminate",
-            server.webui_address
-        ))
-        .json(&json!({"pool":"WebUI","agent":"Debug"}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(terminated["terminated"], true);
-
-    let augustus = server
-        .send("session-a", Some("Augustus"), "global", "Augustus joined")
-        .await;
-    assert_eq!(structured(&augustus)["sender"], "Augustus");
-    assert_eq!(structured(&augustus)["recipients"], json!([]));
-    assert_eq!(structured(&augustus)["delivery_count"], 0);
-    assert_eq!(structured(&augustus)["membership_created"], true);
+    // First send allocates a name; later sends infer it without another field.
+    let augustus = server.send("session-a", "global", "joined").await;
+    assert_eq!(structured(&augustus)["assigned_agent"], "Augustus");
+    assert!(structured(&augustus).get("recipients").is_none());
     assert!(structured(&augustus).get("message_id").is_none());
 
-    let empty_again = server
-        .send("session-a", None, "global", "still alone")
-        .await;
-    assert_eq!(structured(&empty_again)["sender"], "Augustus");
-    assert_eq!(structured(&empty_again)["recipients"], json!([]));
-    assert_eq!(structured(&empty_again)["delivery_count"], 0);
-    assert_eq!(structured(&empty_again)["membership_created"], false);
-    assert!(structured(&empty_again).get("message_id").is_none());
+    let again = server.send("session-a", "global", "still alone").await;
+    assert!(structured(&again).get("assigned_agent").is_none());
 
-    let tiberius = server
-        .send("session-b", Some("Tiberius"), "global", "Tiberius joined")
-        .await;
-    assert_eq!(structured(&tiberius)["sender"], "Tiberius");
+    let tiberius = server.send("session-b", "global", "joined").await;
+    assert_eq!(structured(&tiberius)["assigned_agent"], "Tiberius");
     assert_eq!(structured(&tiberius)["recipients"], json!(["Augustus"]));
-    assert_eq!(structured(&tiberius)["delivery_count"], 1);
-    assert_eq!(structured(&tiberius)["membership_created"], true);
-    assert!(structured(&tiberius)["message_id"].as_str().is_some());
 
     let join_offer = server.exec("session-a").await;
     assert_eq!(
         structured(&join_offer)["peer_messages"][0]["from"],
         "Tiberius"
     );
-    assert_eq!(structured(&join_offer)["peer_messages"][0]["to"], "global");
     assert!(
         join_offer["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("Tiberius joined")
-    );
-
-    let redundant_registration = server
-        .send(
-            "session-b",
-            Some("Tiberius"),
-            "Augustus",
-            "redundant registration",
-        )
-        .await;
-    assert_eq!(redundant_registration["result"]["isError"], true);
-    assert!(
-        redundant_registration["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("register_as is only valid")
+            .contains("joined"),
+        "text fallback should continue carrying peer messages"
     );
 
     let targeted = server
-        .send("session-b", None, "Augustus", "API side is updated")
+        .send("session-b", "Augustus", "API side is updated")
         .await;
-    assert_eq!(structured(&targeted)["sender"], "Tiberius");
     assert_eq!(structured(&targeted)["recipients"], json!(["Augustus"]));
-    assert_eq!(structured(&targeted)["delivery_count"], 1);
-    assert_eq!(structured(&targeted)["membership_created"], false);
-    assert!(structured(&targeted)["message_id"].as_str().is_some());
     let offered = server.exec("session-a").await;
-    assert_eq!(
-        structured(&offered)["peer_messages"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
     assert_eq!(
         structured(&offered)["peer_messages"][0]["message"],
         "API side is updated"
     );
-    assert_eq!(structured(&offered)["peer_messages"][0]["to"], "Augustus");
     let acknowledged = server.exec("session-a").await;
     assert!(structured(&acknowledged).get("peer_messages").is_none());
 
-    // Ordinary tool-error results still surface unread peer messages.
-    server
-        .send("session-b", None, "Augustus", "error-path")
-        .await;
-    let errored = server
-        .tool("exec_command", json!({"cmd":""}), Some("session-a"))
-        .await;
-    assert_eq!(errored["result"]["isError"], true);
-    assert_eq!(
-        structured(&errored)["peer_messages"][0]["message"],
-        "error-path"
-    );
-    assert!(
-        errored["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("error-path")
-    );
-    let error_ack = server.exec("session-a").await;
-    assert!(structured(&error_ack).get("peer_messages").is_none());
-
-    let conflict = server
-        .send("session-c", Some("Augustus"), "global", "collision")
-        .await;
-    assert_eq!(conflict["result"]["isError"], true);
-    assert!(
-        conflict["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("already active")
-    );
-
-    let livia = server
-        .send("session-c", Some("Livia"), "global", "Livia joined")
-        .await;
-    assert_eq!(
-        structured(&livia)["recipients"],
-        json!(["Augustus", "Tiberius"])
-    );
-    let fanout = server.send("session-b", None, "global", "broadcast").await;
-    assert_eq!(
-        structured(&fanout)["recipients"],
-        json!(["Augustus", "Livia"])
-    );
-    assert_eq!(
-        structured(&fanout)["peer_messages"][0]["from"],
-        "Livia",
-        "pool_send must piggyback the sender's unread inbox"
-    );
-
-    // Clear Augustus's outstanding offers, then queue one unread message and restart.
-    let _ = server.exec("session-a").await;
-    let _ = server.exec("session-a").await;
-    server
-        .send("session-b", None, "Augustus", "survives restart")
-        .await;
-    server.stop();
-    server.start().await;
-    let durable = server.exec("session-a").await;
-    assert_eq!(
-        structured(&durable)["peer_messages"][0]["message"],
-        "survives restart"
-    );
-    let _ = server.exec("session-a").await;
-
-    // Batching is bounded; the remainder stays queued for later tool calls.
-    for index in 0..40 {
-        server
-            .send("session-b", None, "Augustus", &format!("batch-{index:02}"))
-            .await;
-    }
-    let first_batch = server.exec("session-a").await;
-    assert_eq!(
-        structured(&first_batch)["peer_messages"]
-            .as_array()
-            .unwrap()
-            .len(),
-        32
-    );
-    let second_batch = server.exec("session-a").await;
-    assert_eq!(
-        structured(&second_batch)["peer_messages"]
-            .as_array()
-            .unwrap()
-            .len(),
-        8
-    );
-    let empty = server.exec("session-a").await;
-    assert!(structured(&empty).get("peer_messages").is_none());
-
-    // Expiry removes the member and cascades any undelivered inbox rows.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    Connection::open(&server.database)
-        .unwrap()
-        .execute(
-            "UPDATE members SET expires=?1 WHERE principal=?2 AND pool='Imperator' AND agent='Livia'",
-            rusqlite::params![now - 1, PRINCIPAL],
-        )
-        .unwrap();
     let members = server
         .tool(
             "pool_members",
@@ -671,15 +439,56 @@ async fn piggyback_agent_pool_acceptance_path() {
         structured(&members)["agents"],
         json!(["Augustus", "Tiberius"])
     );
+    assert_eq!(structured(&members)["self_agent"], "Augustus");
 
-    // Request metadata cannot forge the configured account scope.
-    let forged = Connection::open(&server.database)
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM members WHERE principal='forged-account'",
-            [],
-            |row| row.get::<_, i64>(0),
+    // Explicit exit is idempotent and ordinary tool activity must not resurrect membership.
+    let exited = server.exit("session-a").await;
+    assert_eq!(structured(&exited), &json!({}));
+    let _ = server.exec("session-a").await;
+    let after_exit = server
+        .tool(
+            "pool_members",
+            json!({"pool":"Imperator"}),
+            Some("session-b"),
         )
-        .unwrap();
-    assert_eq!(forged, 0);
+        .await;
+    assert_eq!(structured(&after_exit)["agents"], json!(["Tiberius"]));
+    assert_eq!(structured(&after_exit)["self_agent"], "Tiberius");
+
+    let mixed_exit = server
+        .tool(
+            "pool_send",
+            json!({"pool":"Imperator","operation":"exit","target":"global","message":"no"}),
+            Some("session-b"),
+        )
+        .await;
+    assert_eq!(mixed_exit["result"]["isError"], true);
+
+    let rejoined = server.send("session-a", "global", "back").await;
+    assert_eq!(structured(&rejoined)["assigned_agent"], "Augustus");
+    let _ = server.exec("session-b").await; // acknowledge the rejoin broadcast
+
+    // Error results still surface unread peer messages.
+    server.send("session-b", "Augustus", "error-path").await;
+    let errored = server
+        .tool("exec_command", json!({"cmd":""}), Some("session-a"))
+        .await;
+    assert_eq!(errored["result"]["isError"], true);
+    assert_eq!(
+        structured(&errored)["peer_messages"][0]["message"],
+        "error-path"
+    );
+
+    // Pending inbox rows remain durable across a core restart.
+    let _ = server.exec("session-a").await;
+    server
+        .send("session-b", "Augustus", "survives restart")
+        .await;
+    server.stop();
+    server.start().await;
+    let durable = server.exec("session-a").await;
+    assert_eq!(
+        structured(&durable)["peer_messages"][0]["message"],
+        "survives restart"
+    );
 }

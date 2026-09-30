@@ -56,20 +56,30 @@ full log from the same filesystem. The default display budget is approximately
 lines. Referenced logs have configurable retention and capacity limits; see
 [configuration](docs/configuration.md#optional-limits).
 
+Structured execution results are sparse: empty `output`, false truncation or
+encoding-loss flags, and unavailable state fields are omitted. A completed
+command therefore usually needs only its `exit_code` (plus output when it has
+any); a running command returns its `session_id`.
+
 ## Agent pools
 
 With `agent_pool` configured, `pool_members` lists active agents and `pool_send`
-sends to an agent or to `global` (all other members). On your first send to a
-pool, supply `register_as`; later sends infer your name, so omit it.
+sends to an agent or to `global` (all other members). The first send from a chat
+to a pool automatically allocates an agent name from the configured dictionary;
+later sends infer that name from the chat session.
 
 ```text
-pool_send(pool="project", register_as="alice", target="global", message="Joining the project")
-pool_send(pool="project", target="bob", message="Tests passed")
+pool_send(pool="project", target="global", message="Joining the project")
+pool_send(pool="project", target="Augustus", message="Tests passed")
+pool_send(pool="project", operation="exit")
 ```
 
 Requests must supply `_meta["openai/session"]` to identify the chat. Messages
 arrive as `peer_messages` on the recipient's next tool call; they do not wake an
-idle chat. The following call acknowledges the messages. Membership expires
+idle chat. The following call acknowledges the messages. The first send returns
+`assigned_agent`; `pool_members` returns `self_agent` for a joined caller. Empty
+recipient lists and other unused result fields are omitted. `operation="exit"`
+removes only this chat's membership in that pool; otherwise membership expires
 after inactivity (one day by default).
 
 Run each instance behind a private, authenticated tunnel for one account.
