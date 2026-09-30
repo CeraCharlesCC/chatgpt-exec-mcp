@@ -27,9 +27,11 @@ const MAX_BATCH_COUNT: usize = 32;
 const MAX_BATCH_BYTES: usize = 128 * 1024;
 const MAX_NAME_CHARS: usize = 128;
 const MAX_MESSAGE_BYTES: usize = 65_536;
+const ADMIN_AGENT: &str = "admin";
+const MAX_ADMIN_MESSAGES: i64 = 1_000;
 const NAME_SCHEMA_PATTERN: &str = r"^[^\u0000-\u0020\u007F-\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000](?:[^\u0000-\u001F\u007F-\u009F]*[^\u0000-\u0020\u007F-\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000])?$";
 
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct PoolMembersArgs {
@@ -40,7 +42,7 @@ pub struct PoolMembersArgs {
     pub pool: String,
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct PoolSendArgs {
@@ -89,6 +91,32 @@ pub struct PeerMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String", default)]
     pub in_reply_to: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentIdentity {
+    pub pool: String,
+    pub agent: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminMember {
+    pub pool: String,
+    pub agent: String,
+    pub session: String,
+    pub last_seen_ms: i64,
+    pub expires_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminMessage {
+    pub message_id: String,
+    pub pool: String,
+    pub from: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    pub created_ms: i64,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -232,7 +260,18 @@ impl AgentPoolStore {
                UNIQUE(member_id,message_id)
              );
              CREATE INDEX IF NOT EXISTS inbox_member_cursor ON inbox(member_id,cursor);
-             CREATE INDEX IF NOT EXISTS inbox_message_id ON inbox(message_id);",
+             CREATE INDEX IF NOT EXISTS inbox_message_id ON inbox(message_id);
+             CREATE TABLE IF NOT EXISTS admin_messages (
+               id TEXT PRIMARY KEY,
+               principal TEXT NOT NULL,
+               pool TEXT NOT NULL,
+               sender TEXT NOT NULL,
+               body TEXT NOT NULL,
+               in_reply_to TEXT,
+               created INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS admin_messages_principal_created
+               ON admin_messages(principal,created);",
         )?;
         // A process restart cannot know whether an offered response reached its
         // caller. Keep the inbox rows and re-offer them rather than risking
@@ -450,6 +489,242 @@ impl AgentPoolStore {
         Ok(messages)
     }
 
+    pub fn identities_for_session(
+        &self,
+        principal: &str,
+        session: Option<&str>,
+    ) -> Result<Vec<AgentIdentity>, McpError> {
+        validate_name(principal, "principal")?;
+        let Some(session) = session else {
+            return Ok(Vec::new());
+        };
+        validate_session(session)?;
+        let now = now_ms();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(|_| storage_error())?;
+        cleanup(&transaction, now)?;
+        let identities = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT pool,agent FROM members
+                     WHERE principal=?1 AND session=?2 AND expires>?3
+                     ORDER BY pool,agent",
+                )
+                .map_err(|_| storage_error())?;
+            statement
+                .query_map(params![principal, session, now], |row| {
+                    Ok(AgentIdentity {
+                        pool: row.get(0)?,
+                        agent: row.get(1)?,
+                    })
+                })
+                .map_err(|_| storage_error())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|_| storage_error())?
+        };
+        transaction.commit().map_err(|_| storage_error())?;
+        Ok(identities)
+    }
+
+    pub fn admin_members(&self, principal: &str) -> Result<Vec<AdminMember>, McpError> {
+        validate_name(principal, "principal")?;
+        let now = now_ms();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(|_| storage_error())?;
+        cleanup(&transaction, now)?;
+        let members = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT pool,agent,session,last_seen,expires FROM members
+                     WHERE principal=?1 AND expires>?2 ORDER BY pool,agent",
+                )
+                .map_err(|_| storage_error())?;
+            statement
+                .query_map(params![principal, now], |row| {
+                    Ok(AdminMember {
+                        pool: row.get(0)?,
+                        agent: row.get(1)?,
+                        session: row.get(2)?,
+                        last_seen_ms: row.get(3)?,
+                        expires_ms: row.get(4)?,
+                    })
+                })
+                .map_err(|_| storage_error())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|_| storage_error())?
+        };
+        transaction.commit().map_err(|_| storage_error())?;
+        Ok(members)
+    }
+
+    pub fn admin_messages(
+        &self,
+        principal: &str,
+        limit: usize,
+    ) -> Result<Vec<AdminMessage>, McpError> {
+        validate_name(principal, "principal")?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id,pool,sender,body,in_reply_to,created FROM admin_messages
+                 WHERE principal=?1 ORDER BY created DESC,id DESC LIMIT ?2",
+            )
+            .map_err(|_| storage_error())?;
+        statement
+            .query_map(params![principal, limit.min(500) as i64], |row| {
+                Ok(AdminMessage {
+                    message_id: row.get(0)?,
+                    pool: row.get(1)?,
+                    from: row.get(2)?,
+                    message: row.get(3)?,
+                    in_reply_to: row.get(4)?,
+                    created_ms: row.get(5)?,
+                })
+            })
+            .map_err(|_| storage_error())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| storage_error())
+    }
+
+    pub fn admin_send(
+        &self,
+        principal: &str,
+        pool: &str,
+        target: &str,
+        message: &str,
+        in_reply_to: Option<&str>,
+    ) -> Result<PoolSendResult, McpError> {
+        validate_name(principal, "principal")?;
+        validate_name(pool, "pool")?;
+        validate_name(target, "target")?;
+        if target == ADMIN_AGENT {
+            return Err(invalid("admin cannot target itself"));
+        }
+        if message.is_empty() || message.len() > MAX_MESSAGE_BYTES {
+            return Err(invalid("message must contain 1 to 65536 bytes"));
+        }
+        if let Some(reply) = in_reply_to {
+            validate_name(reply, "in_reply_to")?;
+        }
+        let now = now_ms();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(|_| storage_error())?;
+        cleanup(&transaction, now)?;
+        let targets: Vec<(i64, String)> = {
+            let mut statement = if target == "global" {
+                transaction
+                    .prepare(
+                        "SELECT id,agent FROM members
+                         WHERE principal=?1 AND pool=?2 AND expires>?3 ORDER BY agent",
+                    )
+                    .map_err(|_| storage_error())?
+            } else {
+                transaction
+                    .prepare(
+                        "SELECT id,agent FROM members
+                         WHERE principal=?1 AND pool=?2 AND agent=?3 AND expires>?4 ORDER BY agent",
+                    )
+                    .map_err(|_| storage_error())?
+            };
+            if target == "global" {
+                statement
+                    .query_map(params![principal, pool, now], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .map_err(|_| storage_error())?
+                    .collect::<rusqlite::Result<_>>()
+                    .map_err(|_| storage_error())?
+            } else {
+                statement
+                    .query_map(params![principal, pool, target, now], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .map_err(|_| storage_error())?
+                    .collect::<rusqlite::Result<_>>()
+                    .map_err(|_| storage_error())?
+            }
+        };
+        if target != "global" && targets.is_empty() {
+            return Err(invalid("target agent is not an active pool member"));
+        }
+        let pending: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM inbox", [], |row| row.get(0))
+            .map_err(|_| storage_error())?;
+        if pending + targets.len() as i64 > MAX_PENDING {
+            return Err(invalid("agent pool inbox is full; retry later"));
+        }
+        let recipients = targets
+            .iter()
+            .map(|(_, agent)| agent.clone())
+            .collect::<Vec<_>>();
+        let message_id = if targets.is_empty() {
+            None
+        } else {
+            let message_id = format!("msg_{}", Uuid::new_v4());
+            transaction
+                .execute(
+                    "INSERT INTO messages(id,principal,pool,sender,target,body,in_reply_to,created)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        message_id,
+                        principal,
+                        pool,
+                        ADMIN_AGENT,
+                        target,
+                        message,
+                        in_reply_to,
+                        now
+                    ],
+                )
+                .map_err(|_| storage_error())?;
+            for (member_id, _) in &targets {
+                transaction
+                    .execute(
+                        "INSERT INTO inbox(member_id,message_id) VALUES(?1,?2)",
+                        params![member_id, message_id],
+                    )
+                    .map_err(|_| storage_error())?;
+            }
+            Some(message_id)
+        };
+        transaction.commit().map_err(|_| storage_error())?;
+        Ok(PoolSendResult {
+            sender: ADMIN_AGENT.to_owned(),
+            message_id,
+            delivery_count: recipients.len(),
+            membership_created: false,
+            recipients,
+            peer_messages: None,
+        })
+    }
+
+    pub fn admin_terminate(
+        &self,
+        principal: &str,
+        pool: &str,
+        agent: &str,
+    ) -> Result<bool, McpError> {
+        validate_name(principal, "principal")?;
+        validate_name(pool, "pool")?;
+        validate_name(agent, "agent")?;
+        if agent == ADMIN_AGENT {
+            return Err(invalid("agent name is reserved"));
+        }
+        let now = now_ms();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(|_| storage_error())?;
+        cleanup(&transaction, now)?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM members WHERE principal=?1 AND pool=?2 AND agent=?3",
+                params![principal, pool, agent],
+            )
+            .map_err(|_| storage_error())?;
+        prune_messages(&transaction)?;
+        transaction.commit().map_err(|_| storage_error())?;
+        Ok(deleted > 0)
+    }
+
     pub fn members(
         &self,
         principal: &str,
@@ -501,6 +776,9 @@ impl AgentPoolStore {
             validate_name(register_as, "register_as")?;
             if register_as == "global" {
                 return Err(invalid("global is reserved as the broadcast target"));
+            }
+            if register_as == ADMIN_AGENT {
+                return Err(invalid("agent name is reserved"));
             }
         }
         let session = session.ok_or_else(|| {
@@ -575,6 +853,43 @@ impl AgentPoolStore {
                 params![sender_id, now + self.lease_ttl_ms, now],
             )
             .map_err(|_| storage_error())?;
+
+        if args.target == ADMIN_AGENT {
+            let message_id = format!("msg_{}", Uuid::new_v4());
+            transaction
+                .execute(
+                    "INSERT INTO admin_messages(id,principal,pool,sender,body,in_reply_to,created)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        message_id,
+                        principal,
+                        args.pool,
+                        sender,
+                        args.message,
+                        args.in_reply_to,
+                        now
+                    ],
+                )
+                .map_err(|_| storage_error())?;
+            transaction
+                .execute(
+                    "DELETE FROM admin_messages WHERE principal=?1 AND rowid NOT IN (
+                       SELECT rowid FROM admin_messages WHERE principal=?1
+                       ORDER BY created DESC,rowid DESC LIMIT ?2
+                     )",
+                    params![principal, MAX_ADMIN_MESSAGES],
+                )
+                .map_err(|_| storage_error())?;
+            transaction.commit().map_err(|_| storage_error())?;
+            return Ok(PoolSendResult {
+                sender,
+                message_id: Some(message_id),
+                delivery_count: 1,
+                membership_created,
+                recipients: vec![ADMIN_AGENT.to_owned()],
+                peer_messages: None,
+            });
+        }
 
         let targets: Vec<(i64, String)> = {
             let mut statement = if args.target == "global" {
@@ -953,6 +1268,75 @@ mod tests {
                 .unwrap()
                 .agents,
             ["alice"]
+        );
+    }
+
+    #[test]
+    fn hidden_admin_address_supports_bidirectional_messages_and_termination() {
+        let (_directory, store) = store();
+        let owner = "account-a";
+
+        assert!(
+            store
+                .send(
+                    owner,
+                    send("project", "global", Some(ADMIN_AGENT), "reserved"),
+                    Some("admin-session"),
+                )
+                .is_err()
+        );
+
+        let to_admin = store
+            .send(
+                owner,
+                send("project", ADMIN_AGENT, Some("alice"), "need human input"),
+                Some("alice-session"),
+            )
+            .unwrap();
+        assert_eq!(to_admin.recipients, [ADMIN_AGENT]);
+        assert_eq!(to_admin.delivery_count, 1);
+        assert!(to_admin.membership_created);
+
+        let inbox = store.admin_messages(owner, 10).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].from, "alice");
+        assert_eq!(inbox[0].message, "need human input");
+
+        let from_admin = store
+            .admin_send(owner, "project", "alice", "continue", None)
+            .unwrap();
+        assert_eq!(from_admin.sender, ADMIN_AGENT);
+        assert_eq!(from_admin.recipients, ["alice"]);
+
+        store
+            .begin_tool_state(owner, Some("alice-session"))
+            .unwrap();
+        let offered = store
+            .collect_tool_messages(owner, Some("alice-session"))
+            .unwrap();
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].from, ADMIN_AGENT);
+        assert_eq!(offered[0].message, "continue");
+
+        let identities = store
+            .identities_for_session(owner, Some("alice-session"))
+            .unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].agent, "alice");
+
+        assert!(store.admin_terminate(owner, "project", "alice").unwrap());
+        assert!(store.admin_members(owner).unwrap().is_empty());
+        assert!(
+            store
+                .members(
+                    owner,
+                    PoolMembersArgs {
+                        pool: "project".into(),
+                    },
+                )
+                .unwrap()
+                .agents
+                .is_empty()
         );
     }
 

@@ -108,3 +108,10 @@ as core to access the socket.
 
 Connect an MCP `2026-07-28` compatible client or tunnel to `/mcp`.
 Use `/readyz` to check local readiness.
+
+## Debug WebUI
+
+With Unix Streamable HTTP enabled, `--webui-listen 127.0.0.1:19162` enables the
+optional debug WebUI. The address must be loopback. The WebUI port serves only
+the human administration surface; `/mcp` remains on the private Unix socket.
+Recent activity is kept in memory and is reset when core restarts.

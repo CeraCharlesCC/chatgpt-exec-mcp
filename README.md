@@ -31,6 +31,10 @@ exist, and the forwarding tunnel must run as the same Unix user. HTTP clients
 must support MCP `2026-07-28`. `/readyz` reports
 local readiness. See [configuration](docs/configuration.md#unix-streamable-http).
 
+For local debugging, `--webui-listen 127.0.0.1:19162` adds a loopback-only
+WebUI with agent-pool administration and recent in-memory MCP/tool activity.
+It requires `--listen-unix`; the MCP endpoint is not exposed on the WebUI port.
+
 ## Execution tools
 
 | Tool | Purpose |

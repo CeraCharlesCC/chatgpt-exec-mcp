@@ -217,10 +217,10 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         1
     );
     assert!(
-        start_tool["inputSchema"]["properties"]["cmd"]["pattern"]
-            .as_str()
-            .unwrap()
-            .contains("\\u3000")
+        start_tool["inputSchema"]["properties"]["cmd"]
+            .get("pattern")
+            .is_none(),
+        "cmd schema must not use a regex that connector validators may treat as full-match"
     );
     assert_eq!(
         start_tool["inputSchema"]["properties"]["workdir"]["minLength"],
@@ -253,10 +253,10 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         1
     );
     assert!(
-        exec_tool["inputSchema"]["properties"]["cmd"]["pattern"]
-            .as_str()
-            .unwrap()
-            .contains("\\u3000")
+        exec_tool["inputSchema"]["properties"]["cmd"]
+            .get("pattern")
+            .is_none(),
+        "cmd schema must not use a regex that connector validators may treat as full-match"
     );
     assert_eq!(
         exec_tool["inputSchema"]["properties"]["workdir"]["minLength"],
@@ -364,6 +364,25 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
     assert_eq!(whitespace_only["result"]["isError"], true);
     assert!(
         whitespace_only["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cmd must not be empty")
+    );
+
+    let whitespace_only_session = request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "tools/call",
+            "params": { "name": "start_session", "arguments": { "cmd": "   " } }
+        }),
+    )
+    .await;
+    assert_eq!(whitespace_only_session["result"]["isError"], true);
+    assert!(
+        whitespace_only_session["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("cmd must not be empty")

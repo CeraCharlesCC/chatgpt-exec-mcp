@@ -1,7 +1,9 @@
 //! Stateless MCP over a private Unix socket. rmcp owns protocol dispatch.
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use rmcp::transport::streamable_http_server::{
@@ -9,18 +11,35 @@ use rmcp::transport::streamable_http_server::{
 };
 
 use crate::ExecMcpServer;
+use crate::webui::{self, WebUiState};
 
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 pub async fn serve_unix(
     server: ExecMcpServer,
     path: &Path,
+    webui_listen: Option<SocketAddr>,
     shutdown: impl Future<Output = anyhow::Result<()>> + Send + 'static,
 ) -> anyhow::Result<()> {
     prepare_socket_path(path)?;
     let listener = tokio::net::UnixListener::bind(path).context("bind MCP Unix socket failed")?;
     let socket = SocketGuard::new(path)?;
     let server = server.with_http_protocol();
+    let activity = server.activity_hub();
+    activity.emit(
+        "mcp.listen",
+        "info",
+        None,
+        Vec::new(),
+        serde_json::json!({"unix_socket": path.display().to_string(), "mcp_path": "/mcp"}),
+    );
+    let webui_state = server
+        .admin_context()
+        .map(|(pool, principal)| {
+            WebUiState::new(Some(pool), Some(principal), Arc::clone(&activity))
+        })
+        .unwrap_or_else(|| WebUiState::new(None, None, Arc::clone(&activity)));
+
     let mut config = StreamableHttpServerConfig::default();
     config.legacy_session_mode = false;
     config.stateless_protocol_metadata_required = true;
@@ -29,16 +48,57 @@ pub async fn serve_unix(
     let cancellation = config.cancellation_token.clone();
     let service: StreamableHttpService<ExecMcpServer, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(server.clone()), Default::default(), config);
-    let router = axum::Router::new()
+
+    let mut router = axum::Router::new()
         .route("/readyz", axum::routing::get(|| async { "ready" }))
         .nest_service("/mcp", service);
-    let result = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            let _ = shutdown.await;
-            cancellation.cancel();
-        })
-        .await
-        .context("streamable HTTP server failed");
+    if webui_listen.is_some() {
+        router = router.merge(webui::router(webui_state.clone()));
+    }
+
+    let webui_listener = match webui_listen {
+        Some(address) => {
+            let listener = tokio::net::TcpListener::bind(address)
+                .await
+                .with_context(|| format!("bind WebUI listener {address} failed"))?;
+            activity.emit(
+                "mcp.webui.listen",
+                "info",
+                None,
+                Vec::new(),
+                serde_json::json!({"address": address.to_string()}),
+            );
+            Some(listener)
+        }
+        None => None,
+    };
+
+    let shutdown_cancellation = cancellation.clone();
+    let shutdown_task = tokio::spawn(async move {
+        let _ = shutdown.await;
+        shutdown_cancellation.cancel();
+    });
+
+    let unix_cancellation = cancellation.clone();
+    let unix_server = axum::serve(listener, router).with_graceful_shutdown(async move {
+        unix_cancellation.cancelled().await;
+    });
+
+    let result = if let Some(webui_listener) = webui_listener {
+        let webui_cancellation = cancellation.clone();
+        let webui_server = axum::serve(webui_listener, webui::router(webui_state))
+            .with_graceful_shutdown(async move {
+                webui_cancellation.cancelled().await;
+            });
+        let joined = tokio::try_join!(unix_server, webui_server);
+        joined.map(|_| ()).context("HTTP server failed")
+    } else {
+        unix_server.await.context("streamable HTTP server failed")
+    };
+
+    cancellation.cancel();
+    shutdown_task.abort();
+    let _ = shutdown_task.await;
     drop(socket);
     result
 }

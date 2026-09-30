@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -16,6 +17,8 @@ struct Server {
     workspace: TempDir,
     database: PathBuf,
     client: reqwest::Client,
+    webui_client: reqwest::Client,
+    webui_address: SocketAddr,
 }
 
 impl Server {
@@ -26,6 +29,9 @@ impl Server {
             .unwrap();
         let database = workspace.path().join("agent-pool.sqlite3");
         let socket = workspace.path().join("mcp.sock");
+        let webui_probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let webui_address = webui_probe.local_addr().unwrap();
+        drop(webui_probe);
         std::fs::write(
             workspace.path().join("config.json"),
             json!({
@@ -49,6 +55,12 @@ impl Server {
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
+            webui_client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            webui_address,
         };
         server.start().await;
         server
@@ -62,6 +74,8 @@ impl Server {
                 .arg(self.workspace.path().join("config.json"))
                 .arg("--listen-unix")
                 .arg(socket)
+                .arg("--webui-listen")
+                .arg(self.webui_address.to_string())
                 .current_dir(self.workspace.path())
                 .env_clear()
                 .stdin(Stdio::null())
@@ -76,13 +90,19 @@ impl Server {
                 self.child.as_mut().unwrap().try_wait().unwrap().is_none(),
                 "core exited during startup"
             );
-            if self
+            let core_ready = self
                 .client
                 .get("http://localhost/readyz")
                 .send()
                 .await
-                .is_ok_and(|response| response.status().is_success())
-            {
+                .is_ok_and(|response| response.status().is_success());
+            let webui_ready = self
+                .webui_client
+                .get(format!("http://{}/_admin/api/snapshot", self.webui_address))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success());
+            if core_ready && webui_ready {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -368,6 +388,95 @@ async fn piggyback_agent_pool_acceptance_path() {
             .get("peer_messages")
             .is_some()
     );
+
+    assert!(
+        !send_schema.to_string().contains("admin"),
+        "hidden admin address must not appear in the public tool schema"
+    );
+
+    let debug_to_admin = server
+        .tool(
+            "pool_send",
+            json!({
+                "pool": "WebUI",
+                "target": "admin",
+                "message": "need human input",
+                "register_as": "Debug"
+            }),
+            Some("session-debug"),
+        )
+        .await;
+    assert_eq!(structured(&debug_to_admin)["recipients"], json!(["admin"]));
+    let snapshot: Value = server
+        .webui_client
+        .get(format!(
+            "http://{}/_admin/api/snapshot",
+            server.webui_address
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(snapshot["pools"][0]["name"], "WebUI");
+    assert_eq!(snapshot["pools"][0]["agents"][0]["agent"], "Debug");
+    assert_eq!(snapshot["admin_messages"][0]["from"], "Debug");
+    assert_eq!(snapshot["admin_messages"][0]["message"], "need human input");
+    assert!(
+        snapshot["events"].as_array().unwrap().iter().any(|event| {
+            event["kind"] == "tool.finish" && event["detail"]["tool"] == "pool_send"
+        })
+    );
+
+    let admin_send: Value = server
+        .webui_client
+        .post(format!("http://{}/_admin/api/send", server.webui_address))
+        .json(&json!({"pool":"WebUI","target":"Debug","message":"human reply"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(admin_send["sender"], "admin");
+    assert_eq!(admin_send["recipients"], json!(["Debug"]));
+    let debug_receive = server
+        .tool(
+            "pool_members",
+            json!({"pool":"WebUI"}),
+            Some("session-debug"),
+        )
+        .await;
+    assert_eq!(
+        structured(&debug_receive)["peer_messages"][0]["from"],
+        "admin"
+    );
+    assert_eq!(
+        structured(&debug_receive)["peer_messages"][0]["message"],
+        "human reply"
+    );
+
+    let terminated: Value = server
+        .webui_client
+        .post(format!(
+            "http://{}/_admin/api/terminate",
+            server.webui_address
+        ))
+        .json(&json!({"pool":"WebUI","agent":"Debug"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(terminated["terminated"], true);
 
     let augustus = server
         .send("session-a", Some("Augustus"), "global", "Augustus joined")

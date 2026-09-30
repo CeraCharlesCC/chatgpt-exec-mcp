@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use rmcp::ServiceExt;
@@ -11,6 +12,7 @@ use chatgpt_exec_mcp::ProcessManager;
 struct RunArgs {
     config_path: PathBuf,
     listen_unix: Option<PathBuf>,
+    webui_listen: Option<SocketAddr>,
 }
 
 enum StartupAction {
@@ -24,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     match parse_args(std::env::args_os().skip(1).collect())? {
         StartupAction::Help => {
             println!(
-                "Usage: chatgpt-exec-mcp --config <PATH> [--listen-unix <PATH>]\n       chatgpt-exec-mcp --help | --version"
+                "Usage: chatgpt-exec-mcp --config <PATH> [--listen-unix <PATH>] [--webui-listen <LOOPBACK:PORT>]\n       chatgpt-exec-mcp --help | --version"
             );
             return Ok(());
         }
@@ -46,20 +48,11 @@ fn parse_args(args: Vec<OsString>) -> anyhow::Result<StartupAction> {
 
     let mut config_path = None;
     let mut listen_unix = None;
+    let mut webui_listen = None;
     let mut index = 0;
     while index < args.len() {
         let flag = &args[index];
         index += 1;
-        let destination = match flag.to_str() {
-            Some("--config") => &mut config_path,
-            Some("--listen-unix") => &mut listen_unix,
-            _ => anyhow::bail!("unexpected argument; use --config <PATH> [--listen-unix <PATH>]"),
-        };
-        anyhow::ensure!(
-            destination.is_none(),
-            "duplicate argument: {}",
-            flag.to_string_lossy()
-        );
         let value = args
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("{} requires a value", flag.to_string_lossy()))?;
@@ -68,12 +61,40 @@ fn parse_args(args: Vec<OsString>) -> anyhow::Result<StartupAction> {
             "{} requires a non-empty value",
             flag.to_string_lossy()
         );
-        *destination = Some(PathBuf::from(value));
+        match flag.to_str() {
+            Some("--config") => {
+                anyhow::ensure!(config_path.is_none(), "duplicate argument: --config");
+                config_path = Some(PathBuf::from(value));
+            }
+            Some("--listen-unix") => {
+                anyhow::ensure!(listen_unix.is_none(), "duplicate argument: --listen-unix");
+                listen_unix = Some(PathBuf::from(value));
+            }
+            Some("--webui-listen") => {
+                anyhow::ensure!(webui_listen.is_none(), "duplicate argument: --webui-listen");
+                let text = value
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("--webui-listen must be valid UTF-8"))?;
+                let address: SocketAddr = text
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--webui-listen requires LOOPBACK_IP:PORT"))?;
+                anyhow::ensure!(
+                    address.ip().is_loopback(),
+                    "--webui-listen only accepts loopback addresses"
+                );
+                webui_listen = Some(address);
+            }
+            _ => anyhow::bail!(
+                "unexpected argument; use --config <PATH> [--listen-unix <PATH>] [--webui-listen <LOOPBACK:PORT>]"
+            ),
+        }
         index += 1;
     }
 
     let config_path = config_path.ok_or_else(|| {
-        anyhow::anyhow!("usage: chatgpt-exec-mcp --config <PATH> [--listen-unix <PATH>]")
+        anyhow::anyhow!(
+            "usage: chatgpt-exec-mcp --config <PATH> [--listen-unix <PATH>] [--webui-listen <LOOPBACK:PORT>]"
+        )
     })?;
     if let Some(path) = listen_unix.as_ref() {
         anyhow::ensure!(
@@ -83,9 +104,14 @@ fn parse_args(args: Vec<OsString>) -> anyhow::Result<StartupAction> {
         #[cfg(not(unix))]
         anyhow::bail!("--listen-unix is only supported on Unix");
     }
+    anyhow::ensure!(
+        webui_listen.is_none() || listen_unix.is_some(),
+        "--webui-listen requires --listen-unix"
+    );
     Ok(StartupAction::Run(RunArgs {
         config_path,
         listen_unix,
+        webui_listen,
     }))
 }
 
@@ -110,7 +136,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let result = if let Some(path) = args.listen_unix.as_deref() {
-        run_http(server, path).await
+        run_http(server, path, args.webui_listen).await
     } else {
         run_stdio(server).await
     };
@@ -122,12 +148,20 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-async fn run_http(server: ExecMcpServer, path: &std::path::Path) -> anyhow::Result<()> {
-    chatgpt_exec_mcp::transport::serve_unix(server, path, shutdown_signal()).await
+async fn run_http(
+    server: ExecMcpServer,
+    path: &std::path::Path,
+    webui_listen: Option<SocketAddr>,
+) -> anyhow::Result<()> {
+    chatgpt_exec_mcp::transport::serve_unix(server, path, webui_listen, shutdown_signal()).await
 }
 
 #[cfg(not(unix))]
-async fn run_http(_server: ExecMcpServer, _path: &std::path::Path) -> anyhow::Result<()> {
+async fn run_http(
+    _server: ExecMcpServer,
+    _path: &std::path::Path,
+    _webui_listen: Option<SocketAddr>,
+) -> anyhow::Result<()> {
     anyhow::bail!("--listen-unix is only supported on Unix")
 }
 

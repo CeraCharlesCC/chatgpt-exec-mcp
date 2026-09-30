@@ -1,5 +1,7 @@
 use std::{borrow::Cow, sync::Arc};
 
+use serde_json::{Value, json};
+
 use rmcp::handler::server::{
     router::tool::ToolRouter, tool::schema_for_output, wrapper::Parameters,
 };
@@ -10,9 +12,10 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
+use crate::activity::ActivityHub;
 use crate::agent_pool::{
-    AgentPoolStore, PeerMessage, PoolMembersArgs, PoolMembersResult, PoolSendArgs, PoolSendResult,
-    SessionTurn,
+    AgentIdentity, AgentPoolStore, PeerMessage, PoolMembersArgs, PoolMembersResult, PoolSendArgs,
+    PoolSendResult, SessionTurn,
 };
 use crate::process_manager::ProcessManager;
 use crate::tools::{
@@ -25,6 +28,7 @@ pub struct ExecMcpServer {
     tool_router: ToolRouter<Self>,
     agent_pool: Option<Arc<AgentPoolStore>>,
     principal: Option<String>,
+    activity: Arc<ActivityHub>,
     strict_http: bool,
 }
 
@@ -39,6 +43,7 @@ impl ExecMcpServer {
             tool_router,
             agent_pool: None,
             principal: None,
+            activity: Arc::new(ActivityHub::new(500)),
             strict_http: false,
         }
     }
@@ -56,6 +61,110 @@ impl ExecMcpServer {
     pub fn with_http_protocol(mut self) -> Self {
         self.strict_http = true;
         self
+    }
+
+    pub(crate) fn activity_hub(&self) -> Arc<ActivityHub> {
+        Arc::clone(&self.activity)
+    }
+
+    pub(crate) fn admin_context(&self) -> Option<(Arc<AgentPoolStore>, String)> {
+        match (&self.agent_pool, &self.principal) {
+            (Some(pool), Some(principal)) => Some((Arc::clone(pool), principal.clone())),
+            _ => None,
+        }
+    }
+
+    fn activity_agents(&self, session: Option<&str>) -> Vec<AgentIdentity> {
+        match (&self.agent_pool, &self.principal) {
+            (Some(pool), Some(principal)) => pool
+                .identities_for_session(principal, session)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn tool_started(&self, tool: &str, session: Option<&str>, arguments: Value) -> u64 {
+        self.activity.emit(
+            "tool.start",
+            "info",
+            session,
+            self.activity_agents(session),
+            json!({"tool": tool, "arguments": arguments}),
+        )
+    }
+
+    fn tool_finished(
+        &self,
+        tool: &str,
+        session: Option<&str>,
+        start_event_id: u64,
+        success: bool,
+        detail: Value,
+    ) {
+        self.activity.emit(
+            if success { "tool.finish" } else { "tool.error" },
+            if success { "info" } else { "error" },
+            session,
+            self.activity_agents(session),
+            json!({
+                "tool": tool,
+                "start_event_id": start_event_id,
+                "result": detail,
+            }),
+        );
+    }
+
+    fn pool_activity_detail<T: serde::Serialize>(
+        result: &Result<T, McpError>,
+        peers: &[PeerMessage],
+    ) -> (bool, Value) {
+        match result {
+            Ok(value) => (true, json!({"value": value, "peer_messages": peers})),
+            Err(error) => (
+                false,
+                json!({"error": error.message.to_string(), "peer_messages": peers}),
+            ),
+        }
+    }
+
+    fn exec_activity_detail(
+        result: &anyhow::Result<ExecResponse>,
+        peers: &[PeerMessage],
+    ) -> (bool, Value) {
+        match result {
+            Ok(response) => (true, Self::exec_response_detail(response, peers)),
+            Err(error) => (
+                false,
+                json!({"error": error.to_string(), "peer_messages": peers}),
+            ),
+        }
+    }
+
+    fn exec_response_detail(response: &ExecResponse, peers: &[PeerMessage]) -> Value {
+        json!({
+            "exit_code": response.exit_code,
+            "session_id": response.session_id,
+            "output": Self::activity_preview(&response.output),
+            "output_bytes": response.output.len(),
+            "output_truncated": response.output_truncated,
+            "output_encoding_loss": response.output_encoding_loss,
+            "capture_error": response.capture_error,
+            "output_ref": response.output_ref,
+            "peer_messages": peers,
+            "call_wall_time_seconds": response.call_wall_time_seconds,
+        })
+    }
+
+    fn activity_preview(value: &str) -> String {
+        const MAX: usize = 8 * 1024;
+        if value.len() <= MAX {
+            return value.to_owned();
+        }
+        let mut end = MAX;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n… <{} bytes omitted>", &value[..end], value.len() - end)
     }
 
     fn agent_pool_context(&self) -> Result<(&AgentPoolStore, &str), McpError> {
@@ -105,8 +214,18 @@ impl ExecMcpServer {
     ) -> Vec<PeerMessage> {
         match self.finish_tool(session, turn).await {
             Ok(peers) => peers,
-            Err(_) => {
+            Err(error) => {
                 eprintln!("agent pool piggyback collection failed; preserving primary tool result");
+                self.activity.emit(
+                    "mcp.warning",
+                    "warn",
+                    session,
+                    self.activity_agents(session),
+                    json!({
+                        "message": "agent pool piggyback collection failed; preserving primary tool result",
+                        "error": error.message.to_string(),
+                    }),
+                );
                 Vec::new()
             }
         }
@@ -120,12 +239,19 @@ impl ExecMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session = Self::session(&context);
+        let started = self.tool_started(
+            "pool_members",
+            session.as_deref(),
+            serde_json::to_value(&args).unwrap_or(Value::Null),
+        );
         let turn = self.begin_tool(session.as_deref()).await?;
         let (pool, principal) = self.agent_pool_context()?;
         let result = pool.members(principal, args);
         let peers = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
+        let (success, detail) = Self::pool_activity_detail(&result, &peers);
+        self.tool_finished("pool_members", session.as_deref(), started, success, detail);
         Self::pool_result(result, peers)
     }
 
@@ -140,12 +266,19 @@ impl ExecMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session = Self::session(&context);
+        let started = self.tool_started(
+            "pool_send",
+            session.as_deref(),
+            serde_json::to_value(&args).unwrap_or(Value::Null),
+        );
         let turn = self.begin_tool(session.as_deref()).await?;
         let (pool, principal) = self.agent_pool_context()?;
         let result = pool.send(principal, args, session.as_deref());
         let peers = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
+        let (success, detail) = Self::pool_activity_detail(&result, &peers);
+        self.tool_finished("pool_send", session.as_deref(), started, success, detail);
         Self::pool_result(result, peers)
     }
 
@@ -194,11 +327,24 @@ impl ExecMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session = Self::session(&context);
+        let started = self.tool_started(
+            "exec_command",
+            session.as_deref(),
+            json!({
+                "cmd": &args.cmd,
+                "workdir": &args.workdir,
+                "tty": args.tty,
+                "yield_time_ms": args.yield_time_ms,
+                "max_output_tokens": args.max_output_tokens,
+            }),
+        );
         let turn = self.begin_tool(session.as_deref()).await?;
         let response = self.manager.exec_command(args).await;
         let peers = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
+        let (success, detail) = Self::exec_activity_detail(&response, &peers);
+        self.tool_finished("exec_command", session.as_deref(), started, success, detail);
         Self::respond(response, peers)
     }
 
@@ -210,11 +356,29 @@ impl ExecMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session = Self::session(&context);
+        let started = self.tool_started(
+            "start_session",
+            session.as_deref(),
+            json!({
+                "cmd": &args.cmd,
+                "workdir": &args.workdir,
+                "tty": args.tty,
+                "max_output_tokens": args.max_output_tokens,
+            }),
+        );
         let turn = self.begin_tool(session.as_deref()).await?;
         let response = self.manager.start_session(args).await;
         let peers = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
+        let (success, detail) = Self::exec_activity_detail(&response, &peers);
+        self.tool_finished(
+            "start_session",
+            session.as_deref(),
+            started,
+            success,
+            detail,
+        );
         Self::respond(response, peers)
     }
 
@@ -226,11 +390,22 @@ impl ExecMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session = Self::session(&context);
+        let started = self.tool_started(
+            "write_stdin",
+            session.as_deref(),
+            json!({
+                "session_id": &args.session_id,
+                "chars": &args.chars,
+                "max_output_tokens": args.max_output_tokens,
+            }),
+        );
         let turn = self.begin_tool(session.as_deref()).await?;
         let response = self.manager.write_stdin(args).await;
         let peers = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
+        let (success, detail) = Self::exec_activity_detail(&response, &peers);
+        self.tool_finished("write_stdin", session.as_deref(), started, success, detail);
         Self::respond(response, peers)
     }
 
@@ -242,6 +417,15 @@ impl ExecMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session = Self::session(&context);
+        let started = self.tool_started(
+            "wait_for_exit",
+            session.as_deref(),
+            json!({
+                "session_id": &args.session_id,
+                "wait_seconds": args.wait_seconds,
+                "max_output_tokens": args.max_output_tokens,
+            }),
+        );
         let turn = self.begin_tool(session.as_deref()).await?;
         let response = self
             .manager
@@ -252,13 +436,31 @@ impl ExecMcpServer {
                 let peers = self
                     .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
                     .await;
+                let detail = Self::exec_response_detail(&response, &peers);
+                self.tool_finished("wait_for_exit", session.as_deref(), started, true, detail);
                 Self::success(response, peers)
             }
-            Ok(None) => Err(McpError::internal_error("wait_for_exit cancelled", None)),
+            Ok(None) => {
+                self.tool_finished(
+                    "wait_for_exit",
+                    session.as_deref(),
+                    started,
+                    false,
+                    json!({"error": "wait_for_exit cancelled"}),
+                );
+                Err(McpError::internal_error("wait_for_exit cancelled", None))
+            }
             Err(error) => {
                 let peers = self
                     .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
                     .await;
+                self.tool_finished(
+                    "wait_for_exit",
+                    session.as_deref(),
+                    started,
+                    false,
+                    json!({"error": error.to_string(), "peer_messages": peers}),
+                );
                 Ok(Self::tool_error(error, peers))
             }
         }

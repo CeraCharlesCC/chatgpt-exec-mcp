@@ -19,18 +19,12 @@ pub const MIN_YIELD_MS: u64 = 10;
 pub const MAX_YIELD_MS: u64 = 120_000;
 pub const MIN_WAIT_SECONDS: u64 = 15;
 pub const MAX_WAIT_SECONDS: u64 = 100;
-const NON_WHITESPACE_SCHEMA_PATTERN: &str =
-    r"[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]";
-
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ExecCommandArgs {
     /// Shell command passed to the server-configured shell with -c.
-    #[schemars(
-        length(min = 1),
-        regex(pattern = NON_WHITESPACE_SCHEMA_PATTERN)
-    )]
+    #[schemars(length(min = 1))]
     pub cmd: String,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     /// Absolute path, or relative to the workspace base directory. The workspace is not a sandbox boundary.
@@ -72,7 +66,6 @@ pub struct StartSessionArgs {
     #[schemars(
         with = "String",
         length(min = 1),
-        regex(pattern = NON_WHITESPACE_SCHEMA_PATTERN),
         skip_serializing_if = "Option::is_none"
     )]
     pub cmd: Option<String>,
