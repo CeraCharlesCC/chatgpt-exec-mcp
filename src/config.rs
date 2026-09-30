@@ -21,8 +21,30 @@ pub struct Config {
     pub output_store_dir: PathBuf,
     pub output_store_retention: Duration,
     pub output_store_max_bytes: u64,
+    pub events: Option<EventsConfig>,
     pub(crate) additional_instructions: Option<String>,
     pub(crate) child_env: ChildEnv,
+}
+
+/// One authenticated account per core/tunnel instance. Inbound request headers
+/// and metadata never supply or override this deployment identity.
+#[derive(Clone, Debug)]
+pub struct EventsConfig {
+    pub database_path: PathBuf,
+    pub principal: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileEventsConfig {
+    database_path: PathBuf,
+    principal: String,
+}
+
+fn present_events<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<FileEventsConfig>, D::Error> {
+    FileEventsConfig::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -33,6 +55,8 @@ struct FileConfig {
     shell: PathBuf,
     output_store_dir: PathBuf,
     child_env: EnvConfig,
+    #[serde(default, deserialize_with = "present_events")]
+    events: Option<FileEventsConfig>,
     #[serde(default, deserialize_with = "present_path")]
     instructions_file: Option<PathBuf>,
     #[serde(default = "three")]
@@ -196,6 +220,19 @@ impl Config {
             .transpose()?;
         let output_store_dir = resolve(base, &raw.output_store_dir, "output_store_dir")?;
         let child_env = resolve_env(raw.child_env, base, env)?;
+        let events = raw.events.map(|events| {
+            if events.principal.is_empty()
+                || events.principal.len() > 128
+                || events.principal.chars().any(char::is_control)
+                || events.principal.trim() != events.principal
+            {
+                bail!("events.principal must be a non-empty account identifier of at most 128 bytes");
+            }
+            Ok(EventsConfig {
+                database_path: resolve(base, &events.database_path, "events.database_path")?,
+                principal: events.principal,
+            })
+        }).transpose()?;
         let config = Self {
             workspace,
             shell,
@@ -210,6 +247,7 @@ impl Config {
             output_cap_bytes: raw.output_cap_bytes,
             output_store_retention: Duration::from_secs(raw.output_store_retention),
             output_store_max_bytes: raw.output_store_max_bytes,
+            events,
         };
         config.validate_limits()?;
         Ok(config)

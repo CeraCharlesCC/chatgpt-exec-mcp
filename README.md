@@ -1,12 +1,13 @@
 # chatgpt-exec-mcp
 
-An stdio MCP server for running shell commands
+An MCP server for running shell commands and exchanging messages between agents
+through MCP Events. It supports stdio and Unix-socket Streamable HTTP.
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the vendored PTY utility.
 
 ## Tools
 
-The MCP server exposes four tools:
+The MCP server exposes four execution tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -17,9 +18,25 @@ The MCP server exposes four tools:
 
 Session IDs are short memorable handles such as `amber-river`. The server enforces separate quotas and idle timeouts for explicit sessions and `exec_command` continuations.
 
+With `events` configured, `pool_members(pool)` lists active members and
+`pool_send(pool, agent, message)` queues a `multiagent.message` webhook. Subscribe
+through `events/subscribe` with `pool` and a unique `agent` to join; refresh the
+subscription before expiry and use `events/unsubscribe` to leave. `events/list`
+describes the event. The reserved send target `global` reaches other active members
+of the pool and cannot be subscribed as an agent name.
+
+The sender is resolved from matching `_meta["openai/session"]` on subscription
+and tool calls. When a subscription lacks that correlation value, `pool_send`
+accepts `from_agent`. Successful sends confirm queueing, not ChatGPT activation.
+Delivery uses Standard Webhooks signatures, HTTPS public callbacks, and up to six
+attempts with bounded backoff; there is no replay cursor. Memberships and pending
+deliveries persist in SQLite. Each instance is for one authenticated account;
+deploy separate core, tunnel, socket and database for different accounts. See
+[Events configuration](docs/configuration.md#events-and-account-scope).
+
 ## Build
 
-Rust 1.85 or newer is required (edition 2024).
+Rust 1.88 or newer is required (edition 2024).
 
 ```bash
 cargo build --release --locked
@@ -41,6 +58,19 @@ Run the server over stdio:
 ```bash
 ./target/release/chatgpt-exec-mcp --config examples/minimal.json
 ```
+
+Or run HTTP with an existing socket parent directory:
+
+```bash
+./target/release/chatgpt-exec-mcp --config examples/minimal.json --listen-unix /absolute/path/mcp.sock
+```
+
+The HTTP endpoint `/mcp` advertises only MCP `2026-07-28`, requires modern
+per-request metadata, and uses JSON responses without `Mcp-Session-Id`.
+`/readyz` probes local readiness. Run the forwarding tunnel as the same Unix user
+as core to access the `0600` socket. Separate core and tunnel services preserve
+core-owned PTYs across tunnel restarts; restarting core ends PTYs. See
+[HTTP configuration](docs/configuration.md#unix-streamable-http).
 
 Versioned JSON configuration is required. Workspace, shell, output directory and child environment policy are explicit; see [configuration version 1](docs/configuration.md) for defaults, validation and the breaking changes from the old CLI.
 
@@ -80,7 +110,7 @@ share one byte capacity limit. See [configuration](docs/configuration.md#optiona
 Tool argument validation uses rmcp’s standard `isError: true` tool results; unknown
 tool names return a JSON-RPC invalid-params error.
 
-The server writes MCP JSON-RPC to stdout and diagnostics to stderr.
+In stdio mode, the server writes MCP JSON-RPC to stdout and diagnostics to stderr.
 
 ## License
 

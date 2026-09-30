@@ -396,7 +396,7 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         .unwrap();
     let stopped = request(&mut stdin, &mut stdout, json!({
         "jsonrpc": "2.0", "id": 29, "method": "tools/call",
-        "params": { "name": "write_stdin", "arguments": { "session_id": default_id, "chars": "exit\n" } }
+        "params": { "name": "write_stdin", "arguments": { "session_id": default_id, "chars": "exit 0\n" } }
     })).await;
     assert_eq!(stopped["result"]["structuredContent"]["exit_code"], 0);
 

@@ -123,6 +123,38 @@ fn rejects_schema_errors_and_invalid_paths_and_limits() {
 }
 
 #[test]
+fn events_require_an_explicit_principal_and_database_path() {
+    for events in [
+        Value::Null,
+        json!({}),
+        json!({"database_path":"events.sqlite3"}),
+        json!({"principal":"owner"}),
+        json!({"principal":"", "database_path":"events.sqlite3"}),
+        json!({"principal":" owner", "database_path":"events.sqlite3"}),
+        json!({"principal":"owner\n", "database_path":"events.sqlite3"}),
+        json!({"principal":"owner", "database_path":""}),
+        json!({"principal":"owner", "database_path":"events.sqlite3", "unknown":"SECRET_SENTINEL"}),
+    ] {
+        let mut value = config();
+        value["events"] = events;
+        rejected(&value.to_string(), &[]);
+    }
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("config.json");
+    let mut value = config();
+    value["events"] = json!({"principal":"dedicated-owner", "database_path":"events.sqlite3"});
+    std::fs::write(&path, value.to_string()).unwrap();
+    let settings = chatgpt_exec_mcp::Config::load(&path).unwrap();
+    let events = settings.events.unwrap();
+    assert_eq!(events.principal, "dedicated-owner");
+    assert_eq!(events.database_path, dir.path().join("events.sqlite3"));
+    assert!(
+        !events.database_path.exists(),
+        "validation must not create the database"
+    );
+}
+
+#[test]
 fn rejects_legacy_environment_and_invalid_policy() {
     for name in [
         "CHATGPT_EXEC_WORKSPACE",

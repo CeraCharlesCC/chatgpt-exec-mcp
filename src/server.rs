@@ -1,12 +1,16 @@
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use rmcp::handler::server::{
     router::tool::ToolRouter, tool::schema_for_output, wrapper::Parameters,
 };
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock, CustomRequest, CustomResult, ErrorCode, Implementation,
+    ProtocolVersion, ServerCapabilities, ServerConfig,
+};
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
+use crate::events::{EventStore, PoolMembersArgs, PoolMembersResult, PoolSendArgs, PoolSendResult};
 use crate::process_manager::ProcessManager;
 use crate::tools::{
     ExecCommandArgs, ExecResponse, StartSessionArgs, WaitForExitArgs, WriteStdinArgs,
@@ -16,14 +20,98 @@ use crate::tools::{
 pub struct ExecMcpServer {
     manager: Arc<ProcessManager>,
     tool_router: ToolRouter<Self>,
+    events: Option<Arc<EventStore>>,
+    principal: Option<String>,
+    strict_http: bool,
 }
 
 #[tool_router]
 impl ExecMcpServer {
     pub fn new(manager: Arc<ProcessManager>) -> Self {
+        let mut tool_router = Self::tool_router();
+        tool_router.disable_route("pool_members");
+        tool_router.disable_route("pool_send");
         Self {
             manager,
-            tool_router: Self::tool_router(),
+            tool_router,
+            events: None,
+            principal: None,
+            strict_http: false,
+        }
+    }
+
+    /// The dedicated, authenticated tunnel belongs to this configured account.
+    /// Request metadata cannot change the principal.
+    pub fn with_events(mut self, store: Arc<EventStore>, principal: String) -> Self {
+        self.events = Some(store);
+        self.principal = Some(principal);
+        self.tool_router.enable_route("pool_members");
+        self.tool_router.enable_route("pool_send");
+        self
+    }
+
+    pub fn with_http_protocol(mut self) -> Self {
+        self.strict_http = true;
+        self
+    }
+
+    pub fn events_enabled(&self) -> bool {
+        self.events.is_some() && self.principal.as_ref().is_some_and(|s| !s.is_empty())
+    }
+
+    fn events_context(&self) -> Result<(&EventStore, &str), McpError> {
+        match (&self.events, &self.principal) {
+            (Some(events), Some(owner)) if !owner.is_empty() => Ok((events, owner)),
+            _ => Err(McpError::new(
+                ErrorCode(-32000),
+                "Events require an authenticated account configuration",
+                None,
+            )),
+        }
+    }
+
+    /// List active agent names in the caller's account-scoped pool.
+    #[tool(output_schema = schema_for_output::<PoolMembersResult>(), annotations(read_only_hint = true))]
+    async fn pool_members(
+        &self,
+        Parameters(args): Parameters<PoolMembersArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let (events, owner) = self.events_context()?;
+        Self::pool_result(events.members(owner, args))
+    }
+
+    /// Queue a message to a named member, or to global for all other active members.
+    /// Receipt means queued for webhook delivery; it does not confirm chat activation.
+    #[tool(output_schema = schema_for_output::<PoolSendResult>(), annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true, idempotent_hint = false))]
+    async fn pool_send(
+        &self,
+        Parameters(args): Parameters<PoolSendArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (events, owner) = self.events_context()?;
+        let session = context
+            .meta
+            .get("openai/session")
+            .and_then(serde_json::Value::as_str);
+        Self::pool_result(events.send(owner, args, session))
+    }
+
+    fn pool_result<T: serde::Serialize>(
+        result: Result<T, McpError>,
+    ) -> Result<CallToolResult, McpError> {
+        match result {
+            Ok(value) => {
+                let structured = serde_json::to_value(value).map_err(|_| {
+                    McpError::internal_error("pool response serialization failed", None)
+                })?;
+                let mut result =
+                    CallToolResult::success(vec![ContentBlock::text(structured.to_string())]);
+                result.structured_content = Some(structured);
+                Ok(result)
+            }
+            Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                error.message,
+            )])),
         }
     }
 
@@ -118,8 +206,42 @@ impl ExecMcpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ExecMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, McpError> {
+        if !matches!(
+            request.method.as_str(),
+            "events/list" | "events/subscribe" | "events/unsubscribe"
+        ) {
+            return Err(McpError::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                "Unknown method",
+                None,
+            ));
+        }
+        let (events, owner) = self.events_context()?;
+        let session = context
+            .meta
+            .get("openai/session")
+            .and_then(serde_json::Value::as_str);
+        events
+            .custom_request(owner, &request.method, request.params, session)
+            .await
+            .map(CustomResult)
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        if self.strict_http {
+            Cow::Borrowed(&[ProtocolVersion::V_2026_07_28])
+        } else {
+            Cow::Borrowed(ProtocolVersion::KNOWN_VERSIONS)
+        }
+    }
+
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new("chatgpt-exec-mcp", env!("CARGO_PKG_VERSION"))
                     .with_title("Exec MCP"),
