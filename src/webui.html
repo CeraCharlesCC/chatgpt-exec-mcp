@@ -51,7 +51,7 @@ function interacting(root) {
     (selection && !selection.isCollapsed &&
       (root.contains(selection.anchorNode) || root.contains(selection.focusNode)));
 }
-function syncList(root, items, key, markup, emptyText, className = '') {
+function syncList(root, items, key, markup, emptyText, className = '', update = (node, html) => { node.innerHTML = html; }) {
   if (interacting(root)) return;
   const bounds = root.getBoundingClientRect();
   const anchor = root.scrollTop > 0 && [...root.children].find(node =>
@@ -71,7 +71,7 @@ function syncList(root, items, key, markup, emptyText, className = '') {
     const html = markup(item);
     if (node._markup !== html) {
       node.className = className;
-      node.innerHTML = html;
+      update(node, html);
       node._markup = html;
     }
     if (node !== cursor) root.insertBefore(node, cursor);
@@ -199,14 +199,14 @@ function messages(events, finishes) {
       const agents = [from, a.target, ...(result?.value?.recipients || [])];
       rows.push({...a, key: 'send:' + e.id, from, to: a.target, timestamp_ms: e.timestamp_ms,
         kind: 'message.send', level: failed ? 'error' : 'info', message_id: result?.value?.message_id,
-        agents, sessions: e.session ? [e.session] : [],
+        agents, sessions: e.session ? [e.session] : [], recipient_count: (result?.value?.recipients || []).length,
         status: !finish ? 'Sending…' : failed ? `Failed: ${result?.error || 'Send failed'}` :
           `Queued for ${(result?.value?.recipients || []).length} recipient(s)`});
     }
     if (e.kind === 'admin.message.send') {
       const agents = ['admin', d.target, ...(e.agents || []).filter(a => a.pool === d.pool).map(a => a.agent)];
       rows.push({...d, key: 'admin:' + e.id, from: 'admin', to: d.target,
-        timestamp_ms: e.timestamp_ms, kind: 'message.send', agents, sessions: [],
+        timestamp_ms: e.timestamp_ms, kind: 'message.send', agents, sessions: [], recipient_count: d.delivery_count,
         status: `Queued for ${d.delivery_count} recipient(s)`});
     }
     for (const m of d.result?.peer_messages || []) {
@@ -217,7 +217,51 @@ function messages(events, finishes) {
     }
   }
   for (const m of state.data?.admin_messages || []) receive({...m, to: 'admin'}, m.created_ms);
-  return rows.sort((a, b) => b.timestamp_ms - a.timestamp_ms);
+  // Keep sends before receipts at the same timestamp in chronological order.
+  return coalesceMessages(rows.sort((a, b) => a.timestamp_ms - b.timestamp_ms ||
+    Number(a.kind === 'message.receive') - Number(b.kind === 'message.receive'))).reverse();
+}
+function coalesceMessages(rows) {
+  const result = [], merged = new Map();
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    let send;
+    if (row.kind === 'message.receive' && row.message_id) {
+      // Measure the gap before folding rows, so repeated deliveries cannot
+      // keep an old send eligible indefinitely. Five intervening rows stay separate.
+      for (let j = i - 1; j >= Math.max(0, i - 5); j--) {
+        const candidate = rows[j];
+        if (candidate.kind === 'message.send' && candidate.level !== 'error' &&
+          candidate.pool === row.pool && candidate.message_id === row.message_id && candidate.from === row.from) {
+          send = candidate;
+          break;
+        }
+      }
+    }
+    if (!send) {
+      result.push({...row});
+      continue;
+    }
+    let message = merged.get(send.key);
+    if (!message) {
+      message = result.find(m => m.key === send.key);
+      message.kind = 'message.receive';
+      message.deliveries = [];
+      merged.set(send.key, message);
+    }
+    message.deliveries.push(row);
+    message.agents = [...new Set([...message.agents, ...row.agents])];
+    message.sessions = [...new Set([...message.sessions, ...row.sessions])];
+    const notes = message.deliveries.map(m => {
+      const sameName = message.deliveries.filter(d => d.to === m.to).length > 1;
+      const recipient = m.to + (sameName && m.sessions.length ? ` (${m.sessions.join(', ')})` : '');
+      return m.to === 'admin' ? 'Received' : `${m.status} to ${recipient}`;
+    });
+    const pending = send.recipient_count - new Set(message.deliveries.map(m => m.to)).size;
+    if (pending > 0) notes.push(`Queued for ${pending} recipient(s)`);
+    message.status = notes.join(' · ');
+  }
+  return result;
 }
 function renderFilters(events, starts, finishes, conversation) {
   const names = new Set((state.data?.pools || []).map(p => p.name));
@@ -260,6 +304,20 @@ function eventMarkup(e) {
 function messageMarkup(m) {
   return `<article class="event lvl-${esc(m.level || 'info')}"><div class="event-head"><span class="event-kind">${esc(m.from)} → ${esc(m.to)}</span>${time(m.timestamp_ms)}</div><div class="chips"><span class="chip">${esc(m.pool)}</span><span class="chip">${esc(m.kind)}</span>${m.message_id ? `<span class="chip">${esc(m.message_id)}</span>` : ''}${m.in_reply_to ? `<span class="chip">reply to ${esc(m.in_reply_to)}</span>` : ''}</div><div class="message-body">${esc(m.message)}</div><div class="message-status">${esc(m.status)}</div></article>`;
 }
+function updateMessage(node, html) {
+  if (!node.firstElementChild) {
+    node.innerHTML = html;
+    return;
+  }
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  node.firstElementChild.className = template.content.firstElementChild.className;
+  // Delivery updates must not replace a body that the user has scrolled.
+  for (const selector of ['.event-head', '.chips', '.message-body', '.message-status']) {
+    const current = node.querySelector(selector), next = template.content.querySelector(selector);
+    if (current.innerHTML !== next.innerHTML) current.innerHTML = next.innerHTML;
+  }
+}
 function renderEvents() {
   const root = $('#events'), events = state.data?.events || [];
   const starts = new Map(events.filter(e => e.kind === 'tool.start').map(e => [e.id, e]));
@@ -285,7 +343,7 @@ function renderEvents() {
   syncList(root, shown, item => `${state.view}:${conversation ? 'message:' : 'event:'}${item.key || item.id}`,
     conversation ? messageMarkup : eventMarkup,
     state.pool || state.agent || state.session || state.filter !== 'all' ? 'No entries match these filters' : 'No activity yet',
-    state.view === 'logs' ? 'logline' : '');
+    state.view === 'logs' ? 'logline' : '', conversation ? updateMessage : undefined);
   $('#filterCount').textContent = `${shown.length} / ${all.length} ${conversation ? 'messages' : 'events'}`;
 }
 function render() {

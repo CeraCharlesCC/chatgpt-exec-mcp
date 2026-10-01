@@ -158,6 +158,121 @@ test('messages show sent/received text, deduplicate deliveries and exclude pool 
   assert.equal(await page.locator('#events .message-body', {hasText: 'beta incoming'}).count(), 1);
 });
 
+test('a nearby delivery updates the queued card in place and preserves body scroll', async t => {
+  const data = fixture();
+  const text = Array.from({length: 100}, (_, i) => `long message line ${i}`).join('\n');
+  data.events[2].detail.arguments.message = text;
+  const {page, poll} = await open(t, data);
+  await page.selectOption('#activityFilter', 'messages');
+  const card = page.locator('[data-key="activity:message:send:3"]');
+  assert.match(await card.innerText(), /Queued for 1 recipient/);
+  await card.evaluate(node => {
+    window.sentCard = node;
+    window.sentBody = node.querySelector('.message-body');
+    window.sentBody.scrollTop = 180;
+  });
+  data.events.push({
+    id: 12, kind: 'tool.finish', level: 'info', timestamp_ms: data.events[10].timestamp_ms + 1,
+    session: 'chat-bob', agents: [{pool: 'beta', agent: 'Bob'}],
+    detail: {tool: 'pool_members', result: {peer_messages: [{
+      pool: 'beta', message_id: 'sent-1', from: 'Alice', to: 'Bob', target: 'Bob', message: text,
+    }]}},
+  });
+  await poll();
+  assert.equal(await page.locator('#events .event').count(), 5);
+  assert.match(await card.innerText(), /message.receive/);
+  assert.match(await card.innerText(), /Offered in tool response to Bob/);
+  assert.doesNotMatch(await card.innerText(), /Queued/);
+  assert.deepEqual(await card.evaluate(node => [
+    node === window.sentCard, node.querySelector('.message-body') === window.sentBody, window.sentBody.scrollTop,
+  ]), [true, true, 180]);
+  assert.equal(await card.locator('[data-time]').getAttribute('data-time'), String(data.events[2].timestamp_ms));
+  for (const session of ['chat-beta', 'chat-bob']) {
+    await page.selectOption('#activitySession', session);
+    assert.equal(await card.count(), 1, 'both sender and recipient session filters retain the message');
+  }
+  await page.selectOption('#activitySession', '');
+  await page.click('[data-view="logs"]');
+  assert.equal(await page.locator('[data-key="logs:event:12"]').count(), 1, 'raw delivery remains in MCP log');
+});
+
+test('admin inbox receipts merge even when send and receipt have the same timestamp', async t => {
+  const data = fixture();
+  data.events[2].detail.arguments.target = 'admin';
+  data.events[3].detail.result.value.recipients = ['admin'];
+  data.admin_messages = [{
+    pool: 'beta', message_id: 'sent-1', from: 'Alice', message: data.events[2].detail.arguments.message,
+    created_ms: data.events[2].timestamp_ms,
+  }];
+  const {page} = await open(t, data);
+  await page.selectOption('#activityFilter', 'messages');
+  const card = page.locator('[data-key="activity:message:send:3"]');
+  assert.equal(await page.locator('#events .event').count(), 4);
+  assert.equal(await card.locator('.message-status').innerText(), 'Received');
+  assert.match(await card.innerText(), /Alice → admin/);
+  assert.equal(await page.locator('#inbox .message').count(), 1, 'admin inbox is unchanged');
+});
+
+test('four intervening messages merge, while five or six keep delivery separate', async t => {
+  for (const gap of [4, 5, 6]) await t.test(`${gap} intervening messages`, async t => {
+    const data = fixture();
+    data.events = data.events.slice(2, 4);
+    data.admin_messages = [];
+    const now = data.events[1].timestamp_ms;
+    for (let i = 0; i < gap; i++) data.events.push({
+      id: 10 + i, kind: 'admin.message.send', level: 'info', timestamp_ms: now + i + 1,
+      agents: [], session: null, detail: {
+        pool: 'beta', target: 'Bob', message: `intervening ${i}`, message_id: `gap-${i}`, delivery_count: 1,
+      },
+    });
+    data.events.push({
+      id: 30, kind: 'tool.finish', level: 'info', timestamp_ms: now + 30,
+      agents: [{pool: 'beta', agent: 'Bob'}], session: 'chat-bob',
+      detail: {tool: 'pool_members', result: {peer_messages: [{
+        pool: 'beta', message_id: 'sent-1', from: 'Alice', to: 'Bob', message: data.events[0].detail.arguments.message,
+      }]}},
+    });
+    const {page, poll} = await open(t, data);
+    await page.selectOption('#activityFilter', 'messages');
+    const merged = gap === 4;
+    assert.equal(await page.locator('#events .event').count(), gap + (merged ? 1 : 2));
+    const card = page.locator('[data-key="activity:message:send:3"]');
+    assert.equal(await card.locator('.message-status').innerText(), merged ? 'Offered in tool response to Bob' : 'Queued for 1 recipient(s)');
+    const keys = await page.locator('#events > [data-key]').evaluateAll(nodes => nodes.map(n => n.dataset.key));
+    await poll();
+    assert.deepEqual(await page.locator('#events > [data-key]').evaluateAll(nodes => nodes.map(n => n.dataset.key)), keys);
+  });
+});
+
+test('a nearby broadcast tracks partial offers, deduplicates repeats and retains recipient sessions', async t => {
+  const {page, data, poll} = await open(t);
+  await page.selectOption('#activityFilter', 'messages');
+  const card = page.locator('[data-key="activity:message:admin:9"]');
+  const offer = (id, to, session) => ({
+    id, kind: 'tool.finish', level: 'info', timestamp_ms: data.events[10].timestamp_ms + id,
+    agents: [{pool: 'beta', agent: to}], session,
+    detail: {tool: 'pool_members', result: {peer_messages: [{
+      pool: 'beta', message_id: 'admin-1', from: 'admin', to, target: 'global', message: 'admin broadcast',
+    }]}},
+  });
+  data.events.push(offer(12, 'Alice', 'chat-beta'), offer(13, 'Alice', 'chat-beta'));
+  await poll();
+  assert.equal(await page.locator('#events .event').count(), 5);
+  assert.equal(await card.locator('.message-status').innerText(), 'Offered in tool response to Alice · Queued for 1 recipient(s)');
+  data.events.push(offer(14, 'Bob', 'chat-bob'), offer(15, 'Alice', 'former-session'));
+  await poll();
+  const status = await card.locator('.message-status').innerText();
+  assert.doesNotMatch(status, /Queued/);
+  assert.match(status, /Alice \(chat-beta\)/);
+  assert.match(status, /Bob/);
+  assert.match(status, /Alice \(former-session\)/);
+  assert.equal(await page.locator('#events .event').count(), 5);
+  for (const session of ['chat-beta', 'chat-bob', 'former-session']) {
+    await page.selectOption('#activitySession', session);
+    assert.equal(await card.count(), 1);
+  }
+});
+
 test('pool, agent and session filters compose and survive polling', async t => {
   const {page, poll} = await open(t);
   await page.selectOption('#activityPool', 'beta');
