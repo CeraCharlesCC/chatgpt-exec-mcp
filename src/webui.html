@@ -156,7 +156,7 @@ function eventPools(e, starts) {
 function isMessageEvent(e, starts) {
   const start = e.kind === 'tool.start' ? e : starts.get(e.detail?.start_event_id);
   return e.kind === 'admin.message.send' ||
-    (start?.detail?.tool === 'pool_send' && typeof start.detail.arguments?.message === 'string' && !start.detail.arguments.operation) ||
+    (start?.detail?.tool === 'pool_send' && typeof start.detail.arguments?.message === 'string' && !start.detail.arguments.action) ||
     (e.detail?.result?.peer_messages || []).length > 0;
 }
 function eventIdentities(e, starts, finishes) {
@@ -188,7 +188,7 @@ function messages(events, finishes) {
   }
   for (const e of events) {
     const d = e.detail || {};
-    if (e.kind === 'tool.start' && d.tool === 'pool_send' && typeof d.arguments?.message === 'string' && !d.arguments.operation) {
+    if (e.kind === 'tool.start' && d.tool === 'pool_send' && typeof d.arguments?.message === 'string' && !d.arguments.action) {
       const a = d.arguments, finish = finishes.get(e.id), result = finish?.detail?.result;
       const from = result?.value?.assigned_agent ||
         [...(finish?.agents || []), ...(e.agents || [])].find(x => x.pool === a.pool)?.agent ||

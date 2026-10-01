@@ -41,7 +41,7 @@ pub struct PoolMembersArgs {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(crate = "rmcp::schemars", transform = pool_send_schema)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct PoolSendArgs {
     /// Pool name within this account.
     #[schemars(length(min = 1, max = MAX_NAME_CHARS))]
@@ -77,43 +77,21 @@ pub struct PoolSendArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub in_reply_to: Option<String>,
-    /// Omit for a normal send. Set to exit to remove this session from the pool.
+    /// Omit for a normal send. Set to leave to remove this session from the pool.
     #[serde(
         default,
-        deserialize_with = "deserialize_optional_non_null_operation",
+        deserialize_with = "deserialize_optional_non_null_action",
         skip_serializing_if = "Option::is_none"
     )]
-    #[schemars(with = "PoolExitOperation", skip_serializing_if = "Option::is_none")]
-    pub operation: Option<PoolExitOperation>,
+    #[schemars(with = "PoolAction", skip_serializing_if = "Option::is_none")]
+    pub action: Option<PoolAction>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[schemars(crate = "rmcp::schemars")]
-pub enum PoolExitOperation {
-    Exit,
-}
-
-fn pool_send_schema(schema: &mut rmcp::schemars::Schema) {
-    schema.insert(
-        "oneOf".to_owned(),
-        json!([
-            {
-                "required": ["target", "message"],
-                "not": {"required": ["operation"]}
-            },
-            {
-                "required": ["operation"],
-                "not": {
-                    "anyOf": [
-                        {"required": ["target"]},
-                        {"required": ["message"]},
-                        {"required": ["in_reply_to"]}
-                    ]
-                }
-            }
-        ]),
-    );
+pub enum PoolAction {
+    Leave,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
@@ -200,13 +178,13 @@ where
     )
 }
 
-fn deserialize_optional_non_null_operation<'de, D>(
+fn deserialize_optional_non_null_action<'de, D>(
     deserializer: D,
-) -> Result<Option<PoolExitOperation>, D::Error>
+) -> Result<Option<PoolAction>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<PoolExitOperation>::deserialize(deserializer)?.map_or_else(
+    Option::<PoolAction>::deserialize(deserializer)?.map_or_else(
         || {
             Err(serde::de::Error::custom(
                 "null is not allowed; omit the field instead",
@@ -865,12 +843,12 @@ impl AgentPoolStore {
         session: Option<&str>,
     ) -> Result<PoolSendResult, McpError> {
         validate_name(&args.pool, "pool")?;
-        match args.operation {
-            Some(PoolExitOperation::Exit) => {
+        match args.action {
+            Some(PoolAction::Leave) => {
                 if args.target.is_some() || args.message.is_some() || args.in_reply_to.is_some() {
-                    return Err(invalid("operation=exit accepts only pool and operation"));
+                    return Err(invalid("action=leave accepts only pool and action"));
                 }
-                self.exit_pool(principal, &args.pool, session)
+                self.leave_pool(principal, &args.pool, session)
             }
             None => {
                 let target = args
@@ -891,7 +869,7 @@ impl AgentPoolStore {
         }
     }
 
-    fn exit_pool(
+    fn leave_pool(
         &self,
         principal: &str,
         pool: &str,
@@ -1226,17 +1204,17 @@ mod tests {
             target: Some(target.into()),
             message: Some(body.into()),
             in_reply_to: None,
-            operation: None,
+            action: None,
         }
     }
 
-    fn exit(pool: &str) -> PoolSendArgs {
+    fn leave(pool: &str) -> PoolSendArgs {
         PoolSendArgs {
             pool: pool.into(),
             target: None,
             message: None,
             in_reply_to: None,
-            operation: Some(PoolExitOperation::Exit),
+            action: Some(PoolAction::Leave),
         }
     }
 
@@ -1285,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_names_exhaust_exit_reuse_and_failed_join_rolls_back() {
+    fn automatic_names_exhaust_leave_reuse_and_failed_join_rolls_back() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
@@ -1322,7 +1300,7 @@ mod tests {
                 .contains("dictionary is exhausted")
         );
 
-        store.send("owner", exit("p"), Some("a")).unwrap();
+        store.send("owner", leave("p"), Some("a")).unwrap();
         assert_eq!(
             store
                 .send("owner", send("p", "global", "join"), Some("c"))
@@ -1349,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn exit_is_pool_scoped_for_a_session() {
+    fn leave_is_pool_scoped_for_a_session() {
         let (_directory, store) = store();
         store
             .send("owner", send("left", "global", "join"), Some("session"))
@@ -1358,7 +1336,7 @@ mod tests {
             .send("owner", send("right", "global", "join"), Some("session"))
             .unwrap();
 
-        store.send("owner", exit("left"), Some("session")).unwrap();
+        store.send("owner", leave("left"), Some("session")).unwrap();
         let left = store
             .members(
                 "owner",
@@ -1383,8 +1361,8 @@ mod tests {
         assert_eq!(right.agents, ["alice"]);
         assert_eq!(right.self_agent.as_deref(), Some("alice"));
 
-        // Repeated exit is intentionally idempotent.
-        store.send("owner", exit("left"), Some("session")).unwrap();
+        // Repeated leave is intentionally idempotent.
+        store.send("owner", leave("left"), Some("session")).unwrap();
     }
 
     #[tokio::test]

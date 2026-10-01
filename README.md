@@ -78,14 +78,14 @@ later sends infer that name from the chat session.
 ```text
 pool_send(pool="project", target="global", message="Joining the project")
 pool_send(pool="project", target="Augustus", message="Tests passed")
-pool_send(pool="project", operation="exit")
+pool_send(pool="project", action="leave")
 ```
 
 Requests must supply `_meta["openai/session"]` to identify the chat. Messages
 arrive as `peer_messages` on the recipient's next tool call; they do not wake an
 idle chat. The following call acknowledges the messages. The first send returns
 `assigned_agent`; `pool_members` returns `self_agent` for a joined caller. Empty
-recipient lists and other unused result fields are omitted. `operation="exit"`
+recipient lists and other unused result fields are omitted. `action="leave"`
 removes only this chat's membership in that pool; otherwise membership expires
 after inactivity (one day by default).
 

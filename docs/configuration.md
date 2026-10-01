@@ -108,7 +108,7 @@ characters or surrounding whitespace, and cannot be the reserved names
 `global` or `admin`. If omitted, the built-in dictionary uses a sequence of
 Roman rulers beginning with `Caesar`, `Augustus`, and `Tiberius`. Exhausting the
 dictionary rejects a new membership until a name is freed by expiry or
-`pool_send(pool=..., operation="exit")`.
+`pool_send(pool=..., action="leave")`.
 
 ## Unix Streamable HTTP
 

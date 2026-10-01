@@ -257,7 +257,7 @@ impl ExecMcpServer {
 
     /// Send to target (an active member or global). The first send automatically
     /// allocates this session an agent name from the configured dictionary. To
-    /// leave the pool explicitly, call with operation=exit and the pool only.
+    /// leave the pool explicitly, call with action=leave and the pool only.
     #[tool(output_schema = schema_for_output::<PoolSendResult>(), annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true, idempotent_hint = false))]
     async fn pool_send(
         &self,

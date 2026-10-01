@@ -184,10 +184,10 @@ impl Server {
         self.tool("pool_send", arguments, Some(session)).await
     }
 
-    async fn exit(&self, session: &str) -> Value {
+    async fn leave(&self, session: &str) -> Value {
         self.tool(
             "pool_send",
-            json!({"pool":"Imperator", "operation":"exit"}),
+            json!({"pool":"Imperator", "action":"leave"}),
             Some(session),
         )
         .await
@@ -242,19 +242,16 @@ async fn piggyback_agent_pool_acceptance_path() {
         .unwrap();
     assert_eq!(send_schema["inputSchema"]["type"], "object");
     assert_eq!(send_schema["inputSchema"]["additionalProperties"], false);
-    assert!(
-        send_schema["inputSchema"]["oneOf"]
-            .as_array()
-            .is_some_and(|v| v.len() == 2)
-    );
+    assert!(send_schema["inputSchema"].get("oneOf").is_none());
+    assert_eq!(send_schema["inputSchema"]["required"], json!(["pool"]));
     assert!(
         send_schema["inputSchema"]["properties"]
             .get("register_as")
             .is_none()
     );
     assert_eq!(
-        send_schema["inputSchema"]["$defs"]["PoolExitOperation"]["enum"],
-        json!(["exit"])
+        send_schema["inputSchema"]["$defs"]["PoolAction"]["enum"],
+        json!(["leave"])
     );
     assert!(
         send_schema["inputSchema"]["properties"]["message"]
@@ -317,7 +314,7 @@ async fn piggyback_agent_pool_acceptance_path() {
 
     for arguments in [
         json!({"pool":"Imperator","target":null,"message":"x"}),
-        json!({"pool":"Imperator","target":"global","message":"x","operation":null}),
+        json!({"pool":"Imperator","target":"global","message":"x","action":null}),
     ] {
         let invalid = server
             .tool("pool_send", arguments, Some("invalid-null"))
@@ -441,28 +438,28 @@ async fn piggyback_agent_pool_acceptance_path() {
     );
     assert_eq!(structured(&members)["self_agent"], "Augustus");
 
-    // Explicit exit is idempotent and ordinary tool activity must not resurrect membership.
-    let exited = server.exit("session-a").await;
-    assert_eq!(structured(&exited), &json!({}));
+    // Explicit leave is idempotent and ordinary tool activity must not resurrect membership.
+    let left = server.leave("session-a").await;
+    assert_eq!(structured(&left), &json!({}));
     let _ = server.exec("session-a").await;
-    let after_exit = server
+    let after_leave = server
         .tool(
             "pool_members",
             json!({"pool":"Imperator"}),
             Some("session-b"),
         )
         .await;
-    assert_eq!(structured(&after_exit)["agents"], json!(["Tiberius"]));
-    assert_eq!(structured(&after_exit)["self_agent"], "Tiberius");
+    assert_eq!(structured(&after_leave)["agents"], json!(["Tiberius"]));
+    assert_eq!(structured(&after_leave)["self_agent"], "Tiberius");
 
-    let mixed_exit = server
+    let mixed_leave = server
         .tool(
             "pool_send",
-            json!({"pool":"Imperator","operation":"exit","target":"global","message":"no"}),
+            json!({"pool":"Imperator","action":"leave","target":"global","message":"no"}),
             Some("session-b"),
         )
         .await;
-    assert_eq!(mixed_exit["result"]["isError"], true);
+    assert_eq!(mixed_leave["result"]["isError"], true);
 
     let rejoined = server.send("session-a", "global", "back").await;
     assert_eq!(structured(&rejoined)["assigned_agent"], "Augustus");

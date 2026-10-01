@@ -44,7 +44,7 @@ function fixture() {
       event(4, 'tool.finish', {tool: 'pool_send', start_event_id: 3, result: {value: {assigned_agent: 'Alice', message_id: 'sent-1', recipients: ['Bob']}}}, [identity('beta', 'Alice')], 'chat-beta'),
       event(5, 'tool.finish', {tool: 'exec_command', result: {peer_messages: [peer]}}, [identity('alpha', 'Alice'), identity('beta', 'Alice')], 'chat-beta'),
       event(6, 'tool.finish', {tool: 'exec_command', result: {peer_messages: [peer]}}, [identity('beta', 'Alice')], 'chat-beta'),
-      event(7, 'tool.start', {tool: 'pool_send', arguments: {pool: 'old-pool', operation: 'exit'}}, [], 'old-chat'),
+      event(7, 'tool.start', {tool: 'pool_send', arguments: {pool: 'old-pool', action: 'leave'}}, [], 'old-chat'),
       event(8, 'tool.finish', {tool: 'pool_send', start_event_id: 7, result: {value: {}}}, [], 'old-chat'),
       event(9, 'admin.message.send', {pool: 'beta', target: 'global', message: 'admin broadcast', message_id: 'admin-1', delivery_count: 2}, [identity('beta', 'Alice'), identity('beta', 'Bob')], null),
       event(10, 'tool.start', {tool: 'pool_send', arguments: {pool: 'beta', target: 'missing', message: 'failed message'}}, [identity('beta', 'Alice')], 'chat-beta'),
@@ -142,7 +142,7 @@ test('new events preserve the viewport anchor while reading older events', async
   assert.ok(Math.abs(before - after) < 1, `anchor moved by ${after - before}px`);
 });
 
-test('messages show sent/received text, deduplicate deliveries and exclude pool exit', async t => {
+test('messages show sent/received text, deduplicate deliveries and exclude pool leave', async t => {
   const {page} = await open(t);
   await page.selectOption('#activityFilter', 'messages');
   assert.equal(await page.locator('#events .event').count(), 5);
@@ -183,7 +183,7 @@ test('pool, agent and session filters compose and survive polling', async t => {
   assert.match(await page.locator('#events').innerText(), /No entries match/);
 });
 
-test('historical pools, exit finishes and identical agent names stay correctly scoped', async t => {
+test('historical pools, leave finishes and identical agent names stay correctly scoped', async t => {
   const {page} = await open(t);
   await page.selectOption('#activityPool', 'old-pool');
   assert.deepEqual(await page.locator('#events > [data-key]').evaluateAll(nodes => nodes.map(n => n.dataset.key)),
