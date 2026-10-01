@@ -52,7 +52,7 @@ impl Server {
             client: reqwest::Client::builder()
                 .unix_socket(socket)
                 .no_proxy()
-                .timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(55))
                 .build()
                 .unwrap(),
             webui_client: reqwest::Client::builder()
@@ -213,6 +213,10 @@ fn structured(value: &Value) -> &Value {
 async fn piggyback_agent_pool_acceptance_path() {
     let mut server = Server::new().await;
 
+    let empty = server.exec("unjoined").await;
+    assert_eq!(structured(&empty), &json!({"exit_code": 0}));
+    assert_eq!(empty["result"]["content"][0]["text"], "exit_code=0");
+
     let discovery = server.call("server/discover", json!({}), None).await;
     assert_eq!(
         discovery["result"]["supportedVersions"],
@@ -292,7 +296,13 @@ async fn piggyback_agent_pool_acceptance_path() {
             .get("call_wall_time_seconds")
             .is_none()
     );
-    for sparse in ["output", "output_truncated", "output_encoding_loss"] {
+    for sparse in [
+        "output",
+        "output_truncated",
+        "output_encoding_loss",
+        "capture_error",
+        "output_ref",
+    ] {
         assert!(
             exec_schema["outputSchema"]["properties"]
                 .get(sparse)
@@ -306,6 +316,15 @@ async fn piggyback_agent_pool_acceptance_path() {
         .find(|tool| tool["name"] == "pool_members")
         .unwrap();
     assert_eq!(members_schema["annotations"]["readOnlyHint"], true);
+    assert_eq!(members_schema["inputSchema"]["required"], json!(["pool"]));
+    assert_eq!(
+        members_schema["inputSchema"]["properties"]["wait_seconds"]["minimum"],
+        5
+    );
+    assert_eq!(
+        members_schema["inputSchema"]["properties"]["wait_seconds"]["maximum"],
+        45
+    );
     assert!(
         members_schema["outputSchema"]["properties"]
             .get("self_agent")
@@ -350,6 +369,30 @@ async fn piggyback_agent_pool_acceptance_path() {
         .json()
         .await
         .unwrap();
+    let exec_event = snapshot["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "tool.finish" && event["session"] == "unjoined")
+        .unwrap();
+    let detail = &exec_event["detail"]["result"];
+    assert_eq!(detail["exit_code"], 0);
+    assert_eq!(detail["output_bytes"], 0);
+    assert!(detail["call_wall_time_seconds"].as_f64().is_some());
+    for omitted in [
+        "session_id",
+        "output",
+        "output_truncated",
+        "output_encoding_loss",
+        "capture_error",
+        "output_ref",
+        "peer_messages",
+    ] {
+        assert!(
+            detail.get(omitted).is_none(),
+            "unexpected {omitted}: {detail}"
+        );
+    }
     assert!(snapshot["pools"].as_array().unwrap().iter().any(|pool| {
         pool["name"] == "WebUI"
             && pool["agents"]
@@ -390,7 +433,7 @@ async fn piggyback_agent_pool_acceptance_path() {
     // First send allocates a name; later sends infer it without another field.
     let augustus = server.send("session-a", "global", "joined").await;
     assert_eq!(structured(&augustus)["assigned_agent"], "Augustus");
-    assert!(structured(&augustus).get("recipients").is_none());
+    assert_eq!(structured(&augustus)["recipients"], json!([]));
     assert!(structured(&augustus).get("message_id").is_none());
 
     let again = server.send("session-a", "global", "still alone").await;
@@ -440,7 +483,7 @@ async fn piggyback_agent_pool_acceptance_path() {
 
     // Explicit leave is idempotent and ordinary tool activity must not resurrect membership.
     let left = server.leave("session-a").await;
-    assert_eq!(structured(&left), &json!({}));
+    assert_eq!(structured(&left), &json!({"recipients":[]}));
     let _ = server.exec("session-a").await;
     let after_leave = server
         .tool(
@@ -488,4 +531,54 @@ async fn piggyback_agent_pool_acceptance_path() {
         structured(&durable)["peer_messages"][0]["message"],
         "survives restart"
     );
+}
+
+#[tokio::test]
+async fn blocking_members_wakes_and_pool_text_contains_each_body_once() {
+    let server = Server::new().await;
+    server.send("session-a", "global", "join-a").await;
+    server.send("session-b", "global", "join-b").await;
+    server.exec("session-a").await;
+    // A new pool_members call ACKs join-b exactly once before waiting.
+    let wait = server.tool(
+        "pool_members",
+        json!({"pool":"Imperator", "wait_seconds":35}),
+        Some("session-a"),
+    );
+    let send = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server
+            .send("session-b", "Augustus", "unique-wait-body")
+            .await
+    };
+    let (received, sent) =
+        tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(wait, send) })
+            .await
+            .unwrap();
+    assert_eq!(structured(&sent)["recipients"], json!(["Augustus"]));
+    let peers = structured(&received)["peer_messages"].as_array().unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0]["to"], "Augustus");
+    assert_eq!(peers[0]["target"], "Augustus");
+    assert!(peers[0]["sent_at_ms"].as_i64().unwrap() > 0);
+    let text = received["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text.matches("unique-wait-body").count(), 1);
+    let acknowledged = server
+        .tool(
+            "pool_members",
+            json!({"pool":"Imperator"}),
+            Some("session-a"),
+        )
+        .await;
+    assert!(structured(&acknowledged).get("peer_messages").is_none());
+    for value in [json!(0), json!(4), json!(46), json!(null), json!(10.5)] {
+        let invalid = server
+            .tool(
+                "pool_members",
+                json!({"pool":"Imperator", "wait_seconds":value}),
+                Some("session-a"),
+            )
+            .await;
+        assert_eq!(invalid["result"]["isError"], true, "{invalid}");
+    }
 }

@@ -92,8 +92,10 @@ impl ProcessManager {
 
     pub(crate) fn instructions(&self) -> String {
         let default_instructions = concat!(
-            "Use exec_command for ordinary stateless commands and start_session only when state must persist. When a returned session only needs time to finish, prefer wait_for_exit; ordinary stdout/stderr does not wake that wait. Use write_stdin when input, interruption, or immediate output polling is needed. ",
-            "Oversized output uses head/tail and an output_ref raw-log path.",
+            "Use exec_command for commands; start_session only for persistent state. ",
+            "Prefer wait_for_exit for completion; ordinary output does not wake it. ",
+            "Use write_stdin for input, Ctrl-C, or output polling. ",
+            "Truncated output includes output_ref for the raw log.",
         );
         match &self.config.additional_instructions {
             Some(extra) => format!(

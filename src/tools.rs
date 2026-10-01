@@ -23,11 +23,11 @@ pub const MAX_WAIT_SECONDS: u64 = 100;
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ExecCommandArgs {
-    /// Shell command passed to the server-configured shell with -c.
+    /// Command for the configured shell (-c).
     #[schemars(length(min = 1))]
     pub cmd: String,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    /// Absolute path, or relative to the workspace base directory. The workspace is not a sandbox boundary.
+    /// Workspace-relative or absolute directory; not a sandbox boundary.
     #[schemars(
         with = "String",
         length(min = 1),
@@ -35,14 +35,14 @@ pub struct ExecCommandArgs {
     )]
     pub workdir: Option<String>,
     #[serde(default)]
-    /// Allocate a PTY.
+    /// Use a PTY.
     pub tty: bool,
     #[serde(default, deserialize_with = "deserialize_optional_yield_ms")]
-    /// Initial wait before a still-running command becomes a continuation.
+    /// Initial wait in ms; returns session_id if still running, without stopping it.
     #[schemars(with = "u64", range(min = MIN_YIELD_MS, max = MAX_YIELD_MS), extend("default" = DEFAULT_EXEC_YIELD_MS))]
     pub yield_time_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_optional_positive_usize")]
-    /// Optional display budget: approximately four bytes per token.
+    /// Display budget (~4 bytes per token).
     #[schemars(
         with = "usize",
         range(min = 1),
@@ -62,7 +62,7 @@ impl ExecCommandArgs {
 #[schemars(crate = "rmcp::schemars")]
 pub struct StartSessionArgs {
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    /// Long-lived shell command. Omit to use the server-configured shell.
+    /// Command; omit for the configured shell.
     #[schemars(
         with = "String",
         length(min = 1),
@@ -70,7 +70,7 @@ pub struct StartSessionArgs {
     )]
     pub cmd: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    /// Absolute path, or relative to the workspace base directory. The workspace is not a sandbox boundary.
+    /// Workspace-relative or absolute directory; not a sandbox boundary.
     #[schemars(
         with = "String",
         length(min = 1),
@@ -78,11 +78,11 @@ pub struct StartSessionArgs {
     )]
     pub workdir: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    /// Allocate a PTY (default true).
+    /// Use a PTY.
     #[schemars(with = "bool", extend("default" = true))]
     pub tty: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_optional_positive_usize")]
-    /// Optional display budget: approximately four bytes per token.
+    /// Display budget (~4 bytes per token).
     #[schemars(
         with = "usize",
         range(min = 1),
@@ -95,14 +95,14 @@ pub struct StartSessionArgs {
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct WriteStdinArgs {
-    /// Memorable process handle returned by exec_command or start_session.
+    /// Process handle from exec_command or start_session.
     #[schemars(regex(pattern = "^[a-z]+-[a-z]+$"))]
     pub session_id: String,
     #[serde(default)]
-    /// Raw input. Empty input returns pending output immediately.
+    /// Raw input; empty polls output. Ctrl-C alone interrupts the process group.
     pub chars: String,
     #[serde(default, deserialize_with = "deserialize_optional_positive_usize")]
-    /// Optional display budget: approximately four bytes per token.
+    /// Display budget (~4 bytes per token).
     #[schemars(
         with = "usize",
         range(min = 1),
@@ -115,18 +115,18 @@ pub struct WriteStdinArgs {
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct WaitForExitArgs {
-    /// Memorable process handle returned by exec_command or start_session.
+    /// Process handle from exec_command or start_session.
     #[schemars(regex(pattern = "^[a-z]+-[a-z]+$"))]
     pub session_id: String,
     #[serde(
         default = "default_wait_seconds",
         deserialize_with = "deserialize_wait_seconds"
     )]
-    /// Maximum time to wait for process exit. Ordinary output does not end the wait.
+    /// Maximum wait in seconds.
     #[schemars(with = "u64", range(min = MIN_WAIT_SECONDS, max = MAX_WAIT_SECONDS))]
     pub wait_seconds: u64,
     #[serde(default, deserialize_with = "deserialize_optional_positive_usize")]
-    /// Optional display budget: approximately four bytes per token.
+    /// Display budget (~4 bytes per token).
     #[schemars(
         with = "usize",
         range(min = 1),

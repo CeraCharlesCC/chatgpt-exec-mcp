@@ -179,12 +179,14 @@ function eventIdentities(e, starts, finishes) {
 function messages(events, finishes) {
   const rows = [], received = new Set();
   const identities = (state.data?.pools || []).flatMap(p => p.agents);
-  function receive(m, timestamp_ms, session) {
-    const key = JSON.stringify([m.pool, m.message_id, m.to]);
+  function receive(m, timestamp_ms, session, recipient) {
+    const to = recipient || m.to;
+    const key = JSON.stringify([m.pool, m.message_id, session || to]);
     if (received.has(key)) return;
     received.add(key);
-    rows.push({...m, key: 'receive:' + key, timestamp_ms, kind: 'message.receive', status: 'Received',
-      agents: [m.from, m.to], sessions: session ? [session] : []});
+    rows.push({...m, to, key: 'receive:' + key, timestamp_ms, kind: 'message.receive',
+      status: to === 'admin' ? 'Received' : 'Offered in tool response',
+      agents: [m.from, to], sessions: session ? [session] : []});
   }
   for (const e of events) {
     const d = e.detail || {};
@@ -207,7 +209,12 @@ function messages(events, finishes) {
         timestamp_ms: e.timestamp_ms, kind: 'message.send', agents, sessions: [],
         status: `Queued for ${d.delivery_count} recipient(s)`});
     }
-    for (const m of d.result?.peer_messages || []) receive(m, e.timestamp_ms, e.session);
+    for (const m of d.result?.peer_messages || []) {
+      // Older snapshots use to=global. Event identities retain the recipient
+      // even after that member has left or its name has been reused.
+      const recipient = m.to === 'global' ? (e.agents || []).find(a => a.pool === m.pool)?.agent : m.to;
+      receive(m, e.timestamp_ms, e.session, recipient);
+    }
   }
   for (const m of state.data?.admin_messages || []) receive({...m, to: 'admin'}, m.created_ms);
   return rows.sort((a, b) => b.timestamp_ms - a.timestamp_ms);

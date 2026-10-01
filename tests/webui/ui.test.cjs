@@ -183,6 +183,38 @@ test('pool, agent and session filters compose and survive polling', async t => {
   assert.match(await page.locator('#events').innerText(), /No entries match/);
 });
 
+test('broadcast offers remain visible per recipient session, including old snapshots', async t => {
+  const data = fixture();
+  const makeOffer = (id, to, session, recipient) => ({
+    id, kind: 'tool.finish', level: 'info', timestamp_ms: Date.now() + id, session,
+    agents: [{pool: 'beta', agent: recipient}],
+    detail: {tool: 'pool_members', result: {peer_messages: [{
+      pool: 'beta', message_id: 'broadcast', from: 'admin', to, target: 'global', message: 'shared broadcast',
+    }]}},
+  });
+  data.events.push(
+    makeOffer(12, 'Alice', 'chat-beta', 'Alice'),
+    makeOffer(13, 'Alice', 'chat-beta', 'Alice'), // Re-offer to this session is deduplicated.
+    makeOffer(14, 'Bob', 'chat-bob', 'Bob'),
+    makeOffer(15, 'global', 'former-session', 'Alice'), // Same name, different recipient session.
+  );
+  const {page, poll} = await open(t, data);
+  await page.selectOption('#activityFilter', 'messages');
+  assert.equal(await page.locator('#events .message-body', {hasText: 'shared broadcast'}).count(), 3);
+  for (const [session, recipient] of [['chat-beta', 'Alice'], ['chat-bob', 'Bob'], ['former-session', 'Alice']]) {
+    await page.selectOption('#activitySession', session);
+    const row = page.locator('#events .event', {hasText: 'shared broadcast'});
+    assert.equal(await row.count(), 1);
+    assert.match(await row.innerText(), new RegExp(`admin → ${recipient}`));
+    assert.match(await row.innerText(), /Offered in tool response/);
+    await poll();
+    assert.equal(await row.count(), 1);
+  }
+  await page.selectOption('#activitySession', '');
+  await page.selectOption('#activityAgent', 'Bob');
+  assert.equal(await page.locator('#events .message-body', {hasText: 'shared broadcast'}).count(), 1);
+});
+
 test('historical pools, leave finishes and identical agent names stay correctly scoped', async t => {
   const {page} = await open(t);
   await page.selectOption('#activityPool', 'old-pool');

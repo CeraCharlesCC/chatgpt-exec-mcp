@@ -19,7 +19,7 @@ use rmcp::schemars::JsonSchema;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, watch};
 use uuid::Uuid;
 
 const DEFAULT_TTL_MS: i64 = 86_400_000;
@@ -37,16 +37,27 @@ const MAX_ADMIN_MESSAGES: i64 = 1_000;
 pub struct PoolMembersArgs {
     #[schemars(length(min = 1, max = MAX_NAME_CHARS))]
     pub pool: String,
+    /// Wait timeout in seconds; omit for an immediate snapshot.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null_wait",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(
+        with = "u64",
+        range(min = 5, max = 45),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wait_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct PoolSendArgs {
-    /// Pool name within this account.
     #[schemars(length(min = 1, max = MAX_NAME_CHARS))]
     pub pool: String,
-    /// Active member name, or global for all other active members.
+    /// Member name, or global for other current members.
     #[serde(
         default,
         deserialize_with = "deserialize_optional_non_null_string",
@@ -54,7 +65,7 @@ pub struct PoolSendArgs {
     )]
     #[schemars(with = "String", length(min = 1, max = MAX_NAME_CHARS), skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
-    /// Message text, 1 to 65,536 UTF-8 bytes.
+    /// UTF-8 text, at most 65,536 bytes.
     #[serde(
         default,
         deserialize_with = "deserialize_optional_non_null_string",
@@ -77,7 +88,7 @@ pub struct PoolSendArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub in_reply_to: Option<String>,
-    /// Omit for a normal send. Set to leave to remove this session from the pool.
+    /// Omit to send; leave removes this membership (pool and action only).
     #[serde(
         default,
         deserialize_with = "deserialize_optional_non_null_action",
@@ -101,6 +112,9 @@ pub struct PeerMessage {
     pub pool: String,
     pub from: String,
     pub to: String,
+    /// Original send target.
+    pub target: String,
+    pub sent_at_ms: i64,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String", default)]
@@ -137,7 +151,7 @@ pub struct AdminMessage {
 #[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
 pub struct PoolMembersResult {
     pub agents: Vec<String>,
-    /// This session's allocated name in the pool, when joined.
+    /// This session's member name.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String", default)]
     pub self_agent: Option<String>,
@@ -149,15 +163,15 @@ pub struct PoolMembersResult {
 #[derive(Debug, Default, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
 pub struct PoolSendResult {
-    /// Name allocated on this session's first send to the pool.
+    /// Name assigned on joining.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String", default)]
     pub assigned_agent: Option<String>,
-    /// Message id when at least one delivery was queued; omitted otherwise.
+    /// Present when a delivery is queued.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String", default)]
     pub message_id: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Queued recipients.
     pub recipients: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<PeerMessage>", default)]
@@ -176,6 +190,15 @@ where
         },
         |value| Ok(Some(value)),
     )
+}
+
+fn deserialize_optional_non_null_wait<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer)?
+        .ok_or_else(|| serde::de::Error::custom("null is not allowed; omit the field instead"))
+        .map(Some)
 }
 
 fn deserialize_optional_non_null_action<'de, D>(
@@ -214,6 +237,14 @@ pub struct AgentPoolStore {
     session_orders: Mutex<HashMap<SessionKey, SessionOrderWeak>>,
     lease_ttl_ms: i64,
     agent_names: Arc<[String]>,
+    changes: watch::Sender<()>,
+}
+
+struct MembersState {
+    result: PoolMembersResult,
+    member_ids: Vec<i64>,
+    next_expiry_ms: Option<i64>,
+    pending: bool,
 }
 
 impl AgentPoolStore {
@@ -349,6 +380,7 @@ impl AgentPoolStore {
             session_orders: Mutex::new(HashMap::new()),
             lease_ttl_ms,
             agent_names: agent_names.into(),
+            changes: watch::channel(()).0,
         })
     }
 
@@ -487,7 +519,7 @@ impl AgentPoolStore {
         let rows: Vec<(i64, i64, PeerMessage)> = {
             let mut statement = transaction
                 .prepare(
-                    "SELECT i.cursor,m.id,msg.id,msg.pool,msg.sender,msg.target,msg.body,msg.in_reply_to
+                    "SELECT i.cursor,m.id,msg.id,msg.pool,msg.sender,m.agent,msg.body,msg.in_reply_to,msg.target,msg.created
                      FROM inbox i
                      JOIN members m ON m.id=i.member_id
                      JOIN messages msg ON msg.id=i.message_id
@@ -509,6 +541,8 @@ impl AgentPoolStore {
                                 to: row.get(5)?,
                                 message: row.get(6)?,
                                 in_reply_to: row.get(7)?,
+                                target: row.get(8)?,
+                                sent_at_ms: row.get(9)?,
                             },
                         ))
                     },
@@ -527,6 +561,7 @@ impl AgentPoolStore {
                 + message.pool.len()
                 + message.from.len()
                 + message.to.len()
+                + message.target.len()
                 + message.in_reply_to.as_ref().map_or(0, String::len)
                 + 64;
             if !messages.is_empty() && bytes.saturating_add(size) > MAX_BATCH_BYTES {
@@ -753,6 +788,7 @@ impl AgentPoolStore {
             Some(message_id)
         };
         transaction.commit().map_err(|_| storage_error())?;
+        self.changes.send_replace(());
         Ok(PoolSendResult {
             assigned_agent: None,
             message_id,
@@ -785,6 +821,7 @@ impl AgentPoolStore {
             .map_err(|_| storage_error())?;
         prune_messages(&transaction)?;
         transaction.commit().map_err(|_| storage_error())?;
+        self.changes.send_replace(());
         Ok(deleted > 0)
     }
 
@@ -794,6 +831,56 @@ impl AgentPoolStore {
         args: PoolMembersArgs,
         session: Option<&str>,
     ) -> Result<PoolMembersResult, McpError> {
+        Ok(self.members_state(principal, &args, session)?.result)
+    }
+
+    pub async fn wait_members(
+        &self,
+        principal: &str,
+        args: PoolMembersArgs,
+        session: Option<&str>,
+    ) -> Result<PoolMembersResult, McpError> {
+        let Some(seconds) = args.wait_seconds else {
+            return self.members(principal, args, session);
+        };
+        if !(5..=45).contains(&seconds) {
+            return Err(invalid("wait_seconds must be between 5 and 45"));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        // Subscribe before checking the database. A commit between the check
+        // and changed().await remains visible, including to multiple waiters.
+        let mut changes = self.changes.subscribe();
+        let mut state = self.members_state(principal, &args, session)?;
+        let initial_members = state.member_ids.clone();
+        loop {
+            if state.pending
+                || state.member_ids != initial_members
+                || tokio::time::Instant::now() >= deadline
+            {
+                return Ok(state.result);
+            }
+            let wake_at = state.next_expiry_ms.map_or(deadline, |expires| {
+                deadline.min(
+                    tokio::time::Instant::now()
+                        + Duration::from_millis((expires - now_ms()).max(0) as u64),
+                )
+            });
+            // No database or session-order lock is held while awaiting.
+            tokio::select! {
+                _ = changes.changed() => {},
+                _ = tokio::time::sleep_until(wake_at) => {},
+            }
+            // Observe state only: internal wakeups never ACK or offer messages.
+            state = self.members_state(principal, &args, session)?;
+        }
+    }
+
+    fn members_state(
+        &self,
+        principal: &str,
+        args: &PoolMembersArgs,
+        session: Option<&str>,
+    ) -> Result<MembersState, McpError> {
         validate_name(principal, "principal")?;
         validate_name(&args.pool, "pool")?;
         if let Some(session) = session {
@@ -803,17 +890,23 @@ impl AgentPoolStore {
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|_| storage_error())?;
         cleanup(&transaction, now)?;
-        let agents = {
+        let members = {
             let mut statement = transaction
                 .prepare(
-                    "SELECT agent FROM members
+                    "SELECT id,agent,expires FROM members
                      WHERE principal=?1 AND pool=?2 AND expires>?3 ORDER BY agent",
                 )
                 .map_err(|_| storage_error())?;
             statement
-                .query_map(params![principal, args.pool, now], |row| row.get(0))
+                .query_map(params![principal, args.pool, now], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
                 .map_err(|_| storage_error())?
-                .collect::<rusqlite::Result<Vec<String>>>()
+                .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|_| storage_error())?
         };
         let self_agent = match session {
@@ -828,11 +921,27 @@ impl AgentPoolStore {
                 .map_err(|_| storage_error())?,
             None => None,
         };
+        let pending = match session {
+            Some(session) => transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM inbox i JOIN members m ON m.id=i.member_id
+                 WHERE m.principal=?1 AND m.session=?2 AND m.expires>?3)",
+                    params![principal, session, now],
+                    |row| row.get(0),
+                )
+                .map_err(|_| storage_error())?,
+            None => false,
+        };
         transaction.commit().map_err(|_| storage_error())?;
-        Ok(PoolMembersResult {
-            agents,
-            self_agent,
-            peer_messages: None,
+        Ok(MembersState {
+            result: PoolMembersResult {
+                agents: members.iter().map(|(_, agent, _)| agent.clone()).collect(),
+                self_agent,
+                peer_messages: None,
+            },
+            member_ids: members.iter().map(|(id, _, _)| *id).collect(),
+            next_expiry_ms: members.iter().map(|(_, _, expires)| *expires).min(),
+            pending,
         })
     }
 
@@ -892,6 +1001,7 @@ impl AgentPoolStore {
             .map_err(|_| storage_error())?;
         prune_messages(&transaction)?;
         transaction.commit().map_err(|_| storage_error())?;
+        self.changes.send_replace(());
         Ok(PoolSendResult::default())
     }
 
@@ -989,6 +1099,7 @@ impl AgentPoolStore {
                 )
                 .map_err(|_| storage_error())?;
             transaction.commit().map_err(|_| storage_error())?;
+            self.changes.send_replace(());
             return Ok(PoolSendResult {
                 assigned_agent,
                 message_id: Some(message_id),
@@ -1079,6 +1190,7 @@ impl AgentPoolStore {
             Some(message_id)
         };
         transaction.commit().map_err(|_| storage_error())?;
+        self.changes.send_replace(());
         Ok(PoolSendResult {
             assigned_agent,
             message_id,
@@ -1218,6 +1330,262 @@ mod tests {
         }
     }
 
+    fn waiting(pool: &str, seconds: u64) -> PoolMembersArgs {
+        PoolMembersArgs {
+            pool: pool.into(),
+            wait_seconds: Some(seconds),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_bounds_immediate_snapshot_and_timeout() {
+        let (_directory, store) = store();
+        for seconds in [0, 4, 46, u64::MAX] {
+            assert!(
+                store
+                    .wait_members("owner", waiting("p", seconds), None)
+                    .await
+                    .is_err()
+            );
+        }
+        for value in [json!(null), json!(-1), json!(10.5), json!("35")] {
+            assert!(
+                serde_json::from_value::<PoolMembersArgs>(
+                    json!({"pool":"p", "wait_seconds":value})
+                )
+                .is_err()
+            );
+        }
+        let before = tokio::time::Instant::now();
+        let args = serde_json::from_value(json!({"pool":"p"})).unwrap();
+        assert!(
+            store
+                .wait_members("owner", args, None)
+                .await
+                .unwrap()
+                .agents
+                .is_empty()
+        );
+        assert_eq!(tokio::time::Instant::now(), before);
+        for seconds in [5, 10, 45] {
+            let before = tokio::time::Instant::now();
+            assert!(
+                store
+                    .wait_members("owner", waiting("p", seconds), None)
+                    .await
+                    .unwrap()
+                    .agents
+                    .is_empty()
+            );
+            assert_eq!(
+                tokio::time::Instant::now() - before,
+                Duration::from_secs(seconds)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_wakes_all_observers_on_join_leave_and_name_reuse() {
+        let (_directory, store) = store();
+        let store = Arc::new(store);
+        let observe = || {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .wait_members("owner", waiting("p", 35), None)
+                    .await
+                    .unwrap()
+            })
+        };
+        let first = observe();
+        let second = observe();
+        tokio::task::yield_now().await;
+        // Unrelated pool/account changes must not finish the wait.
+        store
+            .send("owner", send("other", "global", "join"), Some("other"))
+            .unwrap();
+        store
+            .send("other-owner", send("p", "global", "join"), Some("other"))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished() && !second.is_finished());
+        store
+            .send("owner", send("p", "global", "join"), Some("a"))
+            .unwrap();
+        for task in [first, second] {
+            let result = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.agents, ["alice"]);
+            assert!(result.self_agent.is_none());
+        }
+        let reused = observe();
+        tokio::task::yield_now().await;
+        // The same visible name is a new member, even if leave/join coalesce.
+        store.send("owner", leave("p"), Some("a")).unwrap();
+        store
+            .send("owner", send("p", "global", "rejoin"), Some("a"))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), reused)
+                .await
+                .unwrap()
+                .unwrap()
+                .agents,
+            ["alice"]
+        );
+        let left = observe();
+        tokio::task::yield_now().await;
+        store.admin_terminate("owner", "p", "alice").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), left)
+                .await
+                .unwrap()
+                .unwrap()
+                .agents
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_messages_across_pools_are_offered_once_and_cancellation_keeps_inbox() {
+        let (_directory, store) = store();
+        let store = Arc::new(store);
+        store
+            .send("owner", send("p", "global", "join"), Some("a"))
+            .unwrap();
+        store
+            .send("owner", send("q", "global", "join"), Some("a"))
+            .unwrap();
+        let turn = store.start_tool("owner", Some("a")).await.unwrap();
+        let waiter = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .wait_members("owner", waiting("p", 35), Some("a"))
+                    .await
+                    .unwrap()
+            })
+        };
+        tokio::task::yield_now().await;
+        store
+            .admin_send("owner", "q", "alice", "cross-pool", None)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        let peers = store
+            .finish_tool_turn("owner", Some("a"), turn.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].message, "cross-pool");
+        assert_eq!(peers[0].pool, "q");
+        let turn = store.start_tool("owner", Some("a")).await.unwrap();
+        assert!(
+            store
+                .finish_tool_turn("owner", Some("a"), turn.as_ref())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let cancelled = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .wait_members("owner", waiting("p", 35), Some("a"))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        store
+            .admin_send("owner", "p", "alice", "retain", None)
+            .unwrap();
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        let turn = store.start_tool("owner", Some("a")).await.unwrap();
+        // Already pending messages return immediately without an internal offer.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            store.wait_members("owner", waiting("p", 35), Some("a")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let peers = store
+            .finish_tool_turn("owner", Some("a"), turn.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].message, "retain");
+        assert_eq!(
+            store
+                .members(
+                    "owner",
+                    PoolMembersArgs {
+                        pool: "p".into(),
+                        wait_seconds: None
+                    },
+                    Some("a")
+                )
+                .unwrap()
+                .self_agent
+                .as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_observes_expiry_without_a_notification() {
+        let (_directory, store) = store();
+        store
+            .send("owner", send("p", "global", "join"), Some("a"))
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute("UPDATE members SET expires=?1", [now_ms() + 100])
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.wait_members("owner", waiting("p", 35), None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.agents.is_empty());
+    }
+
+    #[test]
+    fn broadcast_identifies_each_recipient_and_original_target() {
+        let (_directory, store) = store();
+        for session in ["a", "b", "c"] {
+            store
+                .send("owner", send("p", "global", "join"), Some(session))
+                .unwrap();
+            store.begin_tool_state("owner", Some(session)).unwrap();
+        }
+        for session in ["a", "b", "c"] {
+            store.collect_tool_messages("owner", Some(session)).unwrap();
+            store.begin_tool_state("owner", Some(session)).unwrap();
+        }
+        let before = now_ms();
+        let sent = store
+            .send("owner", send("p", "global", "broadcast"), Some("a"))
+            .unwrap();
+        for (session, recipient) in [("b", "bob"), ("c", "carol")] {
+            let peers = store.collect_tool_messages("owner", Some(session)).unwrap();
+            assert_eq!(peers.len(), 1);
+            assert_eq!(Some(&peers[0].message_id), sent.message_id.as_ref());
+            assert_eq!(peers[0].to, recipient);
+            assert_eq!(peers[0].target, "global");
+            assert!((before..=now_ms()).contains(&peers[0].sent_at_ms));
+        }
+    }
+
     #[test]
     fn implicit_join_fanout_acknowledgement_and_sender_checks() {
         let (_directory, store) = store();
@@ -1342,6 +1710,7 @@ mod tests {
                 "owner",
                 PoolMembersArgs {
                     pool: "left".into(),
+                    wait_seconds: None,
                 },
                 Some("session"),
             )
@@ -1354,6 +1723,7 @@ mod tests {
                 "owner",
                 PoolMembersArgs {
                     pool: "right".into(),
+                    wait_seconds: None,
                 },
                 Some("session"),
             )
@@ -1469,7 +1839,14 @@ mod tests {
         }
         assert_eq!(
             restarted
-                .members("owner", PoolMembersArgs { pool: "p".into() }, Some("a"))
+                .members(
+                    "owner",
+                    PoolMembersArgs {
+                        pool: "p".into(),
+                        wait_seconds: None
+                    },
+                    Some("a")
+                )
                 .unwrap()
                 .agents,
             ["alice"]
@@ -1525,6 +1902,7 @@ mod tests {
                     owner,
                     PoolMembersArgs {
                         pool: "project".into(),
+                        wait_seconds: None,
                     },
                     Some("alice-session"),
                 )

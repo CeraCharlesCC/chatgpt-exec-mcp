@@ -119,10 +119,13 @@ impl ExecMcpServer {
         peers: &[PeerMessage],
     ) -> (bool, Value) {
         match result {
-            Ok(value) => (true, json!({"value": value, "peer_messages": peers})),
+            Ok(value) => (
+                true,
+                Self::activity_with_peers(json!({"value": value}), peers),
+            ),
             Err(error) => (
                 false,
-                json!({"error": error.message.to_string(), "peer_messages": peers}),
+                Self::activity_with_peers(json!({"error": error.message.to_string()}), peers),
             ),
         }
     }
@@ -135,24 +138,37 @@ impl ExecMcpServer {
             Ok(response) => (true, Self::exec_response_detail(response, peers)),
             Err(error) => (
                 false,
-                json!({"error": error.to_string(), "peer_messages": peers}),
+                Self::activity_with_peers(json!({"error": error.to_string()}), peers),
             ),
         }
     }
 
     fn exec_response_detail(response: &ExecResponse, peers: &[PeerMessage]) -> Value {
-        json!({
-            "exit_code": response.exit_code,
-            "session_id": response.session_id,
-            "output": Self::activity_preview(&response.output),
-            "output_bytes": response.output.len(),
-            "output_truncated": response.output_truncated,
-            "output_encoding_loss": response.output_encoding_loss,
-            "capture_error": response.capture_error,
-            "output_ref": response.output_ref,
-            "peer_messages": peers,
-            "call_wall_time_seconds": response.call_wall_time_seconds,
-        })
+        // Use the wire result's sparse fields; add diagnostics only to activity.
+        let mut detail = json!(response);
+        if let Some(object) = detail.as_object_mut() {
+            if !response.output.is_empty() {
+                object.insert(
+                    "output".into(),
+                    json!(Self::activity_preview(&response.output)),
+                );
+            }
+            object.insert("output_bytes".into(), json!(response.output.len()));
+            object.insert(
+                "call_wall_time_seconds".into(),
+                json!(response.call_wall_time_seconds),
+            );
+        }
+        Self::activity_with_peers(detail, peers)
+    }
+
+    fn activity_with_peers(mut detail: Value, peers: &[PeerMessage]) -> Value {
+        if !peers.is_empty()
+            && let Some(object) = detail.as_object_mut()
+        {
+            object.insert("peer_messages".into(), json!(peers));
+        }
+        detail
     }
 
     fn activity_preview(value: &str) -> String {
@@ -231,7 +247,8 @@ impl ExecMcpServer {
         }
     }
 
-    /// List active agent names in the caller's account-scoped pool.
+    /// List leased members; optionally wait for session messages (any pool) or
+    /// membership changes here. Does not join.
     #[tool(output_schema = schema_for_output::<PoolMembersResult>(), annotations(read_only_hint = true))]
     async fn pool_members(
         &self,
@@ -246,7 +263,17 @@ impl ExecMcpServer {
         );
         let turn = self.begin_tool(session.as_deref()).await?;
         let (pool, principal) = self.agent_pool_context()?;
-        let result = pool.members(principal, args, session.as_deref());
+        let result = tokio::select! {
+            biased;
+            _ = context.ct.cancelled() => {
+                self.tool_finished("pool_members", session.as_deref(), started, false,
+                    json!({"error": "pool_members cancelled"}));
+                // Cancellation must not offer unread inbox rows in a response
+                // the caller will discard. Membership and pending rows remain.
+                return Err(McpError::internal_error("pool_members cancelled", None));
+            },
+            result = pool.wait_members(principal, args, session.as_deref()) => result,
+        };
         let peers = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
@@ -255,9 +282,8 @@ impl ExecMcpServer {
         Self::pool_result(result, peers)
     }
 
-    /// Send to target (an active member or global). The first send automatically
-    /// allocates this session an agent name from the configured dictionary. To
-    /// leave the pool explicitly, call with action=leave and the pool only.
+    /// Queue a message; first send joins and assigns a name. Messages arrive on
+    /// tool calls, never wake idle chats; no ACK reply needed.
     #[tool(output_schema = schema_for_output::<PoolSendResult>(), annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true, idempotent_hint = false))]
     async fn pool_send(
         &self,
@@ -300,9 +326,8 @@ impl ExecMcpServer {
                         })?,
                     );
                 }
-                let mut text = structured.to_string();
-                Self::append_peer_block(&mut text, &peers);
-                let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+                let mut result =
+                    CallToolResult::success(vec![ContentBlock::text(structured.to_string())]);
                 result.structured_content = Some(structured);
                 Ok(result)
             }
@@ -318,7 +343,7 @@ impl ExecMcpServer {
         }
     }
 
-    /// Run a stateless shell command. Returns exit_code when finished, or a memorable session_id when still running after yield_time_ms.
+    /// Run a stateless shell command; returns exit_code when done, session_id while running.
     #[tool(output_schema = schema_for_output::<ExecResponse>())]
     async fn exec_command(
         &self,
@@ -347,7 +372,7 @@ impl ExecMcpServer {
         Self::respond(response, peers)
     }
 
-    /// Explicitly start a stateful shell, REPL, or long-running process. The process uses a PTY by default.
+    /// Start a persistent shell, REPL, or long-running process.
     #[tool(output_schema = schema_for_output::<ExecResponse>())]
     async fn start_session(
         &self,
@@ -381,7 +406,7 @@ impl ExecMcpServer {
         Self::respond(response, peers)
     }
 
-    /// Write raw characters to a running process or poll it with empty chars. A chars value containing only Ctrl-C interrupts the process group.
+    /// Send raw input or poll output; Ctrl-C alone interrupts the process group.
     #[tool(output_schema = schema_for_output::<ExecResponse>())]
     async fn write_stdin(
         &self,
@@ -408,7 +433,7 @@ impl ExecMcpServer {
         Self::respond(response, peers)
     }
 
-    /// Wait for a running process to exit or for wait_seconds to elapse. Ordinary stdout/stderr output does not wake the wait; use write_stdin for immediate output polling, input, or interruption.
+    /// Wait for process exit or timeout; ordinary output does not wake the wait.
     #[tool(output_schema = schema_for_output::<ExecResponse>())]
     async fn wait_for_exit(
         &self,
@@ -458,7 +483,7 @@ impl ExecMcpServer {
                     session.as_deref(),
                     started,
                     false,
-                    json!({"error": error.to_string(), "peer_messages": peers}),
+                    Self::activity_with_peers(json!({"error": error.to_string()}), &peers),
                 );
                 Ok(Self::tool_error(error, peers))
             }
@@ -492,13 +517,12 @@ impl ExecMcpServer {
     }
 
     fn response_summary(response: &ExecResponse) -> String {
-        let mut parts = Vec::with_capacity(7);
+        let mut parts = Vec::with_capacity(6);
         if let Some(exit_code) = response.exit_code {
             parts.push(format!("exit_code={exit_code}"));
         } else if let Some(session_id) = response.session_id.as_deref() {
             parts.push(format!("session_id={session_id}"));
         }
-        parts.push(format!("output_bytes={}", response.output.len()));
         if response.output_truncated {
             parts.push("output_truncated=true".into());
         }

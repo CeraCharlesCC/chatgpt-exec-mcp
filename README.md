@@ -64,9 +64,14 @@ lines. Referenced logs have configurable retention and capacity limits; see
 [configuration](docs/configuration.md#optional-limits).
 
 Structured execution results are sparse: empty `output`, false truncation or
-encoding-loss flags, and unavailable state fields are omitted. A completed
-command therefore usually needs only its `exit_code` (plus output when it has
+encoding-loss flags, absent `capture_error` / `output_ref`, and unavailable
+state fields are omitted. A completed command usually needs only its
+`exit_code` (plus output when it has
 any); a running command returns its `session_id`.
+
+The text summary carries only status and exceptional conditions; byte counts
+and call duration remain WebUI activity diagnostics. Tool descriptions keep
+operational semantics short; detailed behavior belongs in this README.
 
 ## Agent pools
 
@@ -78,16 +83,36 @@ later sends infer that name from the chat session.
 ```text
 pool_send(pool="project", target="global", message="Joining the project")
 pool_send(pool="project", target="Augustus", message="Tests passed")
+pool_members(pool="project")                  # Immediate snapshot
+pool_members(pool="project", wait_seconds=35) # Optional integer, 5–45 seconds
 pool_send(pool="project", action="leave")
 ```
 
 Requests must supply `_meta["openai/session"]` to identify the chat. Messages
 arrive as `peer_messages` on the recipient's next tool call; they do not wake an
 idle chat. The following call acknowledges the messages. The first send returns
-`assigned_agent`; `pool_members` returns `self_agent` for a joined caller. Empty
-recipient lists and other unused result fields are omitted. `action="leave"`
+`assigned_agent`; `pool_members` returns `self_agent` for a joined caller.
+`recipients` always lists the queued inboxes, including `[]` when none; it does
+not confirm receipt, acceptance, or completion. Other unused fields are omitted.
+Peer messages identify the actual recipient in `to`, the original send target
+in `target`, and the server send time in `sent_at_ms`. Broadcasts reach only
+current members, with no replay for later joiners. `action="leave"`
 removes only this chat's membership in that pool; otherwise membership expires
 after inactivity (one day by default).
+
+Active means the membership lease has not expired, not that an agent is busy
+or available. With `wait_seconds`, an already queued message returns immediately;
+otherwise the call waits for a message to this session in any joined pool,
+a membership change (including expiry) in the named pool, or timeout. Unjoined
+callers can wait for membership changes without joining. Waiting does not ACK
+messages internally; the next tool call performs the usual implicit ACK.
+
+Read the shared plan to identify the coordinator. Announce readiness once,
+then use blocking wait when asked to stay available and no independent work
+remains. Reply once for assignment acceptance, a blocker, or a usable handoff;
+routine delivery needs no ACK reply. A handoff should name the files, version
+or checksum, validation, remaining gaps, and expected further edits. Announce
+additional edits after handoff before they are integrated.
 
 Run each instance behind a private, authenticated tunnel for one account.
 Restarting only the tunnel preserves PTYs; restarting core ends PTYs but
