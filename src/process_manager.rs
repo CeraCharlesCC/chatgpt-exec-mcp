@@ -91,15 +91,17 @@ impl ProcessManager {
     }
 
     pub(crate) fn instructions(&self) -> String {
-        let mut instructions = concat!(
+        let default_instructions = concat!(
             "Use exec_command for ordinary stateless commands and start_session only when state must persist. When a returned session only needs time to finish, prefer wait_for_exit; ordinary stdout/stderr does not wake that wait. Use write_stdin when input, interruption, or immediate output polling is needed. ",
             "Oversized output uses head/tail and an output_ref raw-log path.",
-        ).to_owned();
-        if let Some(extra) = &self.config.additional_instructions {
-            instructions.push_str("\n\n");
-            instructions.push_str(extra);
+        );
+        match &self.config.additional_instructions {
+            Some(extra) => format!(
+                "{}\n\n{default_instructions}",
+                extra.trim_end_matches(['\r', '\n'])
+            ),
+            None => default_instructions.to_owned(),
         }
-        instructions
     }
 
     pub fn spawn_reaper(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -803,6 +805,34 @@ mod tests {
         .unwrap();
         let config = Config::load(&path).unwrap();
         ProcessManager::new(config).unwrap()
+    }
+
+    #[test]
+    fn additional_instructions_precede_default_instructions() {
+        let workspace = TempDir::new().unwrap();
+        let instructions_path = workspace.path().join("instructions.md");
+        std::fs::write(&instructions_path, "Read README first.\n").unwrap();
+        let config_path = workspace.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::json!({
+                "version": 1,
+                "workspace": ".",
+                "shell": "/bin/bash",
+                "output_store_dir": "outputs",
+                "instructions_file": "instructions.md",
+                "child_env": { "inherit": [], "rules": [] }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let manager = ProcessManager::new(Config::load(&config_path).unwrap()).unwrap();
+        assert!(
+            manager
+                .instructions()
+                .starts_with("Read README first.\n\nUse exec_command")
+        );
     }
 
     async fn test_session(manager: &Arc<ProcessManager>, command: &str) -> String {
