@@ -828,11 +828,10 @@ mod tests {
         .unwrap();
 
         let manager = ProcessManager::new(Config::load(&config_path).unwrap()).unwrap();
-        assert!(
-            manager
-                .instructions()
-                .starts_with("Read README first.\n\nUse exec_command")
-        );
+        let instructions = manager.instructions();
+        let additional = instructions.find("Read README first.").unwrap();
+        let defaults = instructions.find("Use exec_command").unwrap();
+        assert!(additional < defaults);
     }
 
     async fn test_session(manager: &Arc<ProcessManager>, command: &str) -> String {

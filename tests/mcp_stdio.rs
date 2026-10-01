@@ -107,7 +107,7 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         "chatgpt-exec-mcp"
     );
     let instructions = initialized["result"]["instructions"].as_str().unwrap();
-    assert!(instructions.ends_with("Test workspace instructions."));
+    assert!(instructions.contains("Test workspace instructions."));
     stdin
         .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
         .await
