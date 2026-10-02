@@ -14,7 +14,8 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-CI uses the locked dependency graph and runs the Rust tests and Clippy checks.
+CI runs on pull requests and pushes to main. It tests, lints, and builds the
+standalone binary using the locked dependency graph.
 
 ## Browser tests
 
@@ -48,5 +49,6 @@ Published binaries can be checked with GitHub's attestation tooling:
 gh attestation verify <binary> --repo CeraCharlesCC/chatgpt-exec-mcp
 ```
 
-Tagged releases are published by the GitHub Actions release workflow; normal
-contributions do not need to create release artifacts manually.
+The release workflow runs when a v* tag is pushed. The tagged commit must be in
+main history; the workflow then tests, builds, attests, and publishes the binary.
+Normal contributions do not need to create release artifacts manually.
