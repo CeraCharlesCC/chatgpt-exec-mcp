@@ -551,7 +551,7 @@ async fn cancelling_wait_for_exit_keeps_process_running_and_output_pending() {
             "params": {
                 "name": "exec_command",
                 "arguments": {
-                    "cmd": "sleep 0.02; printf after-cancel; sleep 0.30",
+                    "cmd": ": > ready; while ! test -f emit; do /bin/sleep 0.01; done; printf after-cancel; : > produced; while ! test -f finish; do /bin/sleep 0.01; done",
                     "yield_time_ms": 10
                 }
             }
@@ -582,7 +582,33 @@ async fn cancelling_wait_for_exit_keeps_process_running_and_output_pending() {
         .await
         .unwrap();
     stdin.flush().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // A completed independent request is a dispatch barrier for the earlier
+    // waiter. The child stays gated until the server is handling requests.
+    let barrier = request(
+        &mut stdin,
+        &mut stdout,
+        json!({"jsonrpc": "2.0", "id": 30, "method": "tools/list", "params": {}}),
+    )
+    .await;
+    assert_eq!(barrier["id"], 30);
+    std::fs::write(workspace.path().join("emit"), "").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let captured = std::fs::read_dir(workspace.path().join("outputs"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    std::fs::read(entry.path().join("raw.log"))
+                        .is_ok_and(|bytes| bytes == b"after-cancel")
+                });
+            if workspace.path().join("produced").exists() && captured {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("child output readiness timed out");
     stdin
         .write_all(
             format!(
@@ -624,6 +650,7 @@ async fn cancelling_wait_for_exit_keeps_process_running_and_output_pending() {
         "after-cancel"
     );
 
+    std::fs::write(workspace.path().join("finish"), "").unwrap();
     let finished = request(
         &mut stdin,
         &mut stdout,

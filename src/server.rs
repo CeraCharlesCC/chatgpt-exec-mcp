@@ -17,6 +17,7 @@ use crate::agent_pool::{
     AgentIdentity, AgentPoolStore, PeerMessage, PoolMembersArgs, PoolMembersResult, PoolSendArgs,
     PoolSendResult, SessionTurn,
 };
+use crate::agent_pool_context::AgentPoolContext;
 use crate::process_manager::ProcessManager;
 use crate::tools::{
     ExecCommandArgs, ExecResponse, StartSessionArgs, WaitForExitArgs, WriteStdinArgs,
@@ -26,8 +27,7 @@ use crate::tools::{
 pub struct ExecMcpServer {
     manager: Arc<ProcessManager>,
     tool_router: ToolRouter<Self>,
-    agent_pool: Option<Arc<AgentPoolStore>>,
-    principal: Option<String>,
+    agent_pool: Option<AgentPoolContext>,
     activity: Arc<ActivityHub>,
     strict_http: bool,
 }
@@ -42,7 +42,6 @@ impl ExecMcpServer {
             manager,
             tool_router,
             agent_pool: None,
-            principal: None,
             activity: Arc::new(ActivityHub::new(500)),
             strict_http: false,
         }
@@ -51,8 +50,7 @@ impl ExecMcpServer {
     /// The dedicated, authenticated tunnel belongs to this configured account.
     /// Request metadata cannot change the principal.
     pub fn with_agent_pool(mut self, store: Arc<AgentPoolStore>, principal: String) -> Self {
-        self.agent_pool = Some(store);
-        self.principal = Some(principal);
+        self.agent_pool = Some(AgentPoolContext::new(store, principal));
         self.tool_router.enable_route("pool_members");
         self.tool_router.enable_route("pool_send");
         self
@@ -67,20 +65,20 @@ impl ExecMcpServer {
         Arc::clone(&self.activity)
     }
 
-    pub(crate) fn admin_context(&self) -> Option<(Arc<AgentPoolStore>, String)> {
-        match (&self.agent_pool, &self.principal) {
-            (Some(pool), Some(principal)) => Some((Arc::clone(pool), principal.clone())),
-            _ => None,
-        }
+    pub(crate) fn admin_context(&self) -> Option<AgentPoolContext> {
+        self.agent_pool.clone()
     }
 
     fn activity_agents(&self, session: Option<&str>) -> Vec<AgentIdentity> {
-        match (&self.agent_pool, &self.principal) {
-            (Some(pool), Some(principal)) => pool
-                .identities_for_session(principal, session)
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        }
+        self.agent_pool
+            .as_ref()
+            .and_then(|context| {
+                context
+                    .store()
+                    .identities_for_session(context.principal(), session)
+                    .ok()
+            })
+            .unwrap_or_default()
     }
 
     fn tool_started(&self, tool: &str, session: Option<&str>, arguments: Value) -> u64 {
@@ -184,9 +182,11 @@ impl ExecMcpServer {
     }
 
     fn agent_pool_context(&self) -> Result<(&AgentPoolStore, &str), McpError> {
-        match (&self.agent_pool, &self.principal) {
-            (Some(pool), Some(principal)) if !principal.is_empty() => Ok((pool, principal)),
-            _ => Err(McpError::new(
+        match self.agent_pool.as_ref() {
+            Some(context) if !context.principal().is_empty() => {
+                Ok((context.store(), context.principal()))
+            }
+            None | Some(_) => Err(McpError::new(
                 ErrorCode(-32000),
                 "Agent pools require an authenticated account configuration",
                 None,
@@ -203,10 +203,13 @@ impl ExecMcpServer {
     }
 
     async fn begin_tool(&self, session: Option<&str>) -> Result<Option<SessionTurn>, McpError> {
-        let (Some(pool), Some(principal)) = (&self.agent_pool, &self.principal) else {
+        let Some(context) = self.agent_pool.as_ref() else {
             return Ok(None);
         };
-        pool.start_tool(principal, session).await
+        context
+            .store()
+            .start_tool(context.principal(), session)
+            .await
     }
 
     async fn finish_tool(
@@ -214,10 +217,13 @@ impl ExecMcpServer {
         session: Option<&str>,
         turn: Option<&SessionTurn>,
     ) -> Result<Vec<PeerMessage>, McpError> {
-        let (Some(pool), Some(principal)) = (&self.agent_pool, &self.principal) else {
+        let Some(context) = self.agent_pool.as_ref() else {
             return Ok(Vec::new());
         };
-        pool.finish_tool_turn(principal, session, turn).await
+        context
+            .store()
+            .finish_tool_turn(context.principal(), session, turn)
+            .await
     }
 
     /// Piggyback collection happens after the primary tool operation. Storage

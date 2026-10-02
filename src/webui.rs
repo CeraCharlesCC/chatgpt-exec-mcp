@@ -13,6 +13,7 @@ use serde_json::json;
 
 use crate::activity::{ActivityEvent, ActivityHub};
 use crate::agent_pool::{AdminMember, AdminMessage, AgentIdentity, AgentPoolStore};
+use crate::agent_pool_context::AgentPoolContext;
 
 struct WebError {
     status: StatusCode,
@@ -36,30 +37,43 @@ impl IntoResponse for WebError {
 
 #[derive(Clone)]
 pub struct WebUiState {
-    pool: Option<Arc<AgentPoolStore>>,
-    principal: Option<String>,
+    pool: Option<AgentPoolContext>,
     activity: Arc<ActivityHub>,
     started: Instant,
 }
 
 impl WebUiState {
-    pub fn new(
-        pool: Option<Arc<AgentPoolStore>>,
-        principal: Option<String>,
+    /// Construct a dashboard for process activity without agent-pool controls.
+    pub fn without_pool(activity: Arc<ActivityHub>) -> Self {
+        Self::new(None, activity)
+    }
+
+    /// Construct a dashboard scoped to one authenticated account.
+    pub fn for_principal(
+        store: Arc<AgentPoolStore>,
+        principal: String,
         activity: Arc<ActivityHub>,
-    ) -> Self {
+    ) -> Result<Self, rmcp::ErrorData> {
+        // Validate the account before exposing any handlers.
+        store.identities_for_session(&principal, None)?;
+        Ok(Self::new(
+            Some(AgentPoolContext::new(store, principal)),
+            activity,
+        ))
+    }
+
+    pub(crate) fn new(pool: Option<AgentPoolContext>, activity: Arc<ActivityHub>) -> Self {
         Self {
             pool,
-            principal,
             activity,
             started: Instant::now(),
         }
     }
 
-    fn pool_context(&self) -> Result<(&AgentPoolStore, &str), WebError> {
-        match (&self.pool, &self.principal) {
-            (Some(pool), Some(principal)) => Ok((pool, principal)),
-            _ => Err(WebError::new(
+    fn pool_context(&self) -> Result<&AgentPoolContext, WebError> {
+        match self.pool.as_ref() {
+            Some(context) => Ok(context),
+            None => Err(WebError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "agent pool is not configured",
             )),
@@ -120,9 +134,15 @@ async fn index() -> Html<&'static str> {
 
 async fn snapshot(State(state): State<WebUiState>) -> Result<Response, WebError> {
     let (members, admin_messages) = match state.pool_context() {
-        Ok((pool, principal)) => (
-            pool.admin_members(principal).map_err(pool_error)?,
-            pool.admin_messages(principal, 200).map_err(pool_error)?,
+        Ok(context) => (
+            context
+                .store()
+                .admin_members(context.principal())
+                .map_err(pool_error)?,
+            context
+                .store()
+                .admin_messages(context.principal(), 200)
+                .map_err(pool_error)?,
         ),
         Err(_) => (Vec::new(), Vec::new()),
     };
@@ -152,10 +172,11 @@ async fn snapshot(State(state): State<WebUiState>) -> Result<Response, WebError>
 async fn send(State(state): State<WebUiState>, body: Bytes) -> Result<Response, WebError> {
     let request: SendRequest = serde_json::from_slice(&body)
         .map_err(|error| WebError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let (pool, principal) = state.pool_context()?;
-    let result = pool
+    let context = state.pool_context()?;
+    let result = context
+        .store()
         .admin_send(
-            principal,
+            context.principal(),
             &request.pool,
             &request.target,
             &request.message,
@@ -190,9 +211,10 @@ async fn send(State(state): State<WebUiState>, body: Bytes) -> Result<Response, 
 async fn terminate(State(state): State<WebUiState>, body: Bytes) -> Result<Response, WebError> {
     let request: TerminateRequest = serde_json::from_slice(&body)
         .map_err(|error| WebError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let (pool, principal) = state.pool_context()?;
-    let terminated = pool
-        .admin_terminate(principal, &request.pool, &request.agent)
+    let context = state.pool_context()?;
+    let terminated = context
+        .store()
+        .admin_terminate(context.principal(), &request.pool, &request.agent)
         .map_err(pool_error)?;
     state.activity.emit(
         "admin.membership.terminate",

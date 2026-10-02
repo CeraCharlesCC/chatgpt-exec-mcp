@@ -151,34 +151,66 @@ async fn long_running_pipe_can_be_polled_and_interrupted() {
     manager.shutdown_all().await;
 }
 
+async fn wait_for_ready_file(path: &std::path::Path) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("child readiness signal timed out");
+}
+
+async fn wait_for_captured_output(workspace: &TempDir, expected: &[u8]) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let captured = std::fs::read_dir(workspace.path().join("outputs"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    std::fs::read(entry.path().join("raw.log")).is_ok_and(|bytes| bytes == expected)
+                });
+            if captured {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("output capture readiness timed out");
+}
+
 #[tokio::test]
 async fn wait_for_exit_returns_on_exit_and_does_not_wake_on_output() {
     let workspace = TempDir::new().unwrap();
     let manager = ProcessManager::new(test_config(&workspace)).unwrap();
     let started = manager
         .start_session(StartSessionArgs {
-            cmd: Some("sleep 0.35; printf first; sleep 0.20; printf second".into()),
+            cmd: Some(": > ready; while ! test -f emit-first; do /bin/sleep 0.01; done; printf first; : > first-produced; while ! test -f finish; do /bin/sleep 0.01; done; printf second".into()),
             tty: Some(false),
             ..Default::default()
         })
         .await
         .unwrap();
     let session_id = started.session_id.unwrap();
+    wait_for_ready_file(&workspace.path().join("ready")).await;
+    assert_eq!(started.output, "");
 
-    let began = std::time::Instant::now();
-    let response = manager
-        .wait_for_exit(wait_args(&session_id, 15))
-        .await
-        .unwrap();
+    let waiter = manager.wait_for_exit(wait_args(&session_id, 15));
+    tokio::pin!(waiter);
+    poll_pending(waiter.as_mut()).await;
+    std::fs::write(workspace.path().join("emit-first"), "").unwrap();
+    wait_for_ready_file(&workspace.path().join("first-produced")).await;
+    wait_for_captured_output(&workspace, b"first").await;
+    // Ordinary output must leave the completion waiter pending, even after
+    // capture has visibly completed. Only the explicit exit gate releases it.
+    poll_pending(waiter.as_mut()).await;
+    std::fs::write(workspace.path().join("finish"), "").unwrap();
+    let response = waiter.await.unwrap();
 
     assert_eq!(response.exit_code, Some(0));
     assert!(response.session_id.is_none());
     assert_eq!(response.output, "firstsecond");
-    assert!(
-        began.elapsed() >= Duration::from_millis(250),
-        "ordinary output woke wait_for_exit early after {:?}",
-        began.elapsed()
-    );
     manager.shutdown_all().await;
 }
 
@@ -188,23 +220,24 @@ async fn wait_for_exit_returns_output_pending_before_and_produced_during_wait() 
     let manager = ProcessManager::new(test_config(&workspace)).unwrap();
     let started = manager
         .start_session(StartSessionArgs {
-            cmd: Some("sleep 0.30; printf before; sleep 0.30; printf after".into()),
+            cmd: Some(": > ready; while ! test -f emit-before; do /bin/sleep 0.01; done; printf before; : > before-produced; while ! test -f finish; do /bin/sleep 0.01; done; printf after".into()),
             tty: Some(false),
             ..Default::default()
         })
         .await
         .unwrap();
     let session_id = started.session_id.unwrap();
+    wait_for_ready_file(&workspace.path().join("ready")).await;
     assert_eq!(started.output, "");
 
-    // start_session uses a fixed 250 ms settle window. Waiting another 150 ms
-    // makes `before` pending before wait_for_exit starts, while `after` is still
-    // produced during the completion wait.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let response = manager
-        .wait_for_exit(wait_args(&session_id, 15))
-        .await
-        .unwrap();
+    std::fs::write(workspace.path().join("emit-before"), "").unwrap();
+    wait_for_ready_file(&workspace.path().join("before-produced")).await;
+    wait_for_captured_output(&workspace, b"before").await;
+    let waiter = manager.wait_for_exit(wait_args(&session_id, 15));
+    tokio::pin!(waiter);
+    poll_pending(waiter.as_mut()).await;
+    std::fs::write(workspace.path().join("finish"), "").unwrap();
+    let response = waiter.await.unwrap();
 
     assert_eq!(response.exit_code, Some(0));
     assert!(response.session_id.is_none());

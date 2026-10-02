@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -20,13 +20,12 @@ use crate::config::Config;
 use crate::output_store::OutputStore;
 use crate::output_store::OutputStoreManager;
 use crate::output_summary::BuildOutput;
+use crate::response_delivery::{self, PreparedExecResponse};
 use crate::session::Session;
 use crate::session::SessionOrigin;
-use crate::session::TerminalDelivery;
 use crate::session_id::SessionId;
 use crate::tools::ExecCommandArgs;
 use crate::tools::ExecResponse;
-use crate::tools::OutputRef;
 use crate::tools::StartSessionArgs;
 use crate::tools::WaitForExitArgs;
 use crate::tools::WriteStdinArgs;
@@ -36,16 +35,46 @@ use crate::tools::{MAX_WAIT_SECONDS, MAX_YIELD_MS, MIN_WAIT_SECONDS, MIN_YIELD_M
 #[derive(Default)]
 struct StoreState {
     sessions: HashMap<SessionId, Arc<Session>>,
-    reserved: HashMap<SessionId, SessionOrigin>,
+    reserved: HashMap<SessionId, ReservedSession>,
 }
 
-struct PreparedExecResponse {
-    response: ExecResponse,
-    commit_end: Option<u64>,
-    range_start: u64,
-    range_end: u64,
-    terminal: bool,
-    delete_output: bool,
+struct ReservedSession {
+    origin: SessionOrigin,
+    lease: Weak<()>,
+}
+
+/// Owns quota until the process and artifact enter the registered session map.
+/// A dropped startup releases quota immediately, even if the registry is busy.
+struct StartupReservation {
+    id: SessionId,
+    lease: Arc<()>,
+    state: Arc<Mutex<StoreState>>,
+}
+
+impl Drop for StartupReservation {
+    fn drop(&mut self) {
+        let id = self.id.clone();
+        let lease = Arc::downgrade(&self.lease);
+        let remove = move |state: &mut StoreState| {
+            if state
+                .reserved
+                .get(&id)
+                .is_some_and(|entry| Weak::ptr_eq(&entry.lease, &lease))
+            {
+                state.reserved.remove(&id);
+            }
+        };
+        if let Ok(mut state) = self.state.try_lock() {
+            remove(&mut state);
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let state = Arc::clone(&self.state);
+            runtime.spawn(async move {
+                remove(&mut *state.lock().await);
+            });
+        }
+        // The weak lease expires when this owner is dropped. reserve() ignores
+        // expired leases, so deferred map cleanup never prevents quota reuse.
+    }
 }
 
 struct StartAndWaitArgs {
@@ -61,7 +90,7 @@ struct StartAndWaitArgs {
 pub struct ProcessManager {
     config: Config,
     output_store_manager: OutputStoreManager,
-    state: Mutex<StoreState>,
+    state: Arc<Mutex<StoreState>>,
     shutting_down: AtomicBool,
     shutdown_notify: Notify,
 }
@@ -84,7 +113,7 @@ impl ProcessManager {
         Ok(Arc::new(Self {
             config,
             output_store_manager,
-            state: Mutex::new(StoreState::default()),
+            state: Arc::new(Mutex::new(StoreState::default())),
             shutting_down: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         }))
@@ -178,24 +207,16 @@ impl ProcessManager {
         } = args;
         let started = Instant::now();
         let cwd = self.resolve_workdir(workdir.as_deref())?;
-        let id = self.reserve(origin).await?;
-        let output_store = match self.create_output_store().await {
-            Ok(store) => store,
-            Err(error) => {
-                self.release_reservation(&id).await;
-                return Err(error.into());
-            }
-        };
-        let spawned = match self.spawn(&id, origin, &command, &cwd, tty).await {
-            Ok(spawned) => spawned,
-            Err(error) => {
-                self.release_reservation(&id).await;
-                let _ = delete_unstarted_output(output_store).await;
-                return Err(error);
-            }
-        };
-        let session = Session::new(id.clone(), origin, spawned, output_store, build_output);
-        self.commit_reservation(id.clone(), Arc::clone(&session))
+        let reservation = self.reserve(origin).await?;
+        let id = reservation.id.clone();
+        // Blocking artifact creation owns its result; a cancelled waiter drops
+        // the unpublished store and removes its files when creation finishes.
+        let output_store = self.create_output_store().await?;
+        let spawned = self.spawn(&id, origin, &command, &cwd, tty).await?;
+        // Registration transfers ownership to the manager. A cancelled initial
+        // wait then follows the existing registered-session lifetime policy.
+        let session = self
+            .commit_reservation(reservation, origin, spawned, output_store, build_output)
             .await?;
         session
             .wait_until_exit_or_timeout(Duration::from_millis(yield_ms))
@@ -220,7 +241,7 @@ impl ProcessManager {
             if !args.chars.is_empty() {
                 bail!("process has already finished; input was not sent");
             }
-            return Ok(Self::delivered_terminal_response(
+            return Ok(response_delivery::delivered_terminal_response(
                 &session, delivery, started,
             ));
         }
@@ -292,7 +313,7 @@ impl ProcessManager {
         session.touch();
 
         if let Some(delivery) = session.terminal_delivery() {
-            return Ok(Some(Self::delivered_terminal_response(
+            return Ok(Some(response_delivery::delivered_terminal_response(
                 &session, delivery, started,
             )));
         }
@@ -301,7 +322,11 @@ impl ProcessManager {
         // have changed while this passive wait was pending or while a concurrent
         // write_stdin owned the lock.
         let max_output_tokens = output_tokens(args.max_output_tokens, session.build_output());
-        let prepare = self.prepare_response(&id, &session, started, max_output_tokens);
+        let prepare = response_delivery::prepare_response(
+            &session,
+            started,
+            self.response_budget(max_output_tokens),
+        );
         tokio::pin!(prepare);
         let prepared = tokio::select! {
             biased;
@@ -336,7 +361,7 @@ impl ProcessManager {
         self.commit_prepared_response(&id, &session, &prepared, state.as_deref_mut())?;
         drop(state);
 
-        self.finish_prepared_response(&session, prepared, started)
+        response_delivery::finish_prepared_response(&session, prepared, started)
             .await
             .map(Some)
     }
@@ -349,13 +374,16 @@ impl ProcessManager {
         max_output_tokens: usize,
     ) -> anyhow::Result<ExecResponse> {
         if let Some(delivery) = session.terminal_delivery() {
-            return Ok(Self::delivered_terminal_response(
+            return Ok(response_delivery::delivered_terminal_response(
                 session, delivery, started,
             ));
         }
-        let prepared = self
-            .prepare_response(id, session, started, max_output_tokens)
-            .await?;
+        let prepared = response_delivery::prepare_response(
+            session,
+            started,
+            self.response_budget(max_output_tokens),
+        )
+        .await?;
         let mut state = if prepared.terminal {
             Some(self.state.lock().await)
         } else {
@@ -363,101 +391,7 @@ impl ProcessManager {
         };
         self.commit_prepared_response(id, session, &prepared, state.as_deref_mut())?;
         drop(state);
-        self.finish_prepared_response(session, prepared, started)
-            .await
-    }
-
-    async fn prepare_response(
-        &self,
-        _id: &SessionId,
-        session: &Arc<Session>,
-        started: Instant,
-        max_output_tokens: usize,
-    ) -> anyhow::Result<PreparedExecResponse> {
-        let mut prepared = session
-            .prepare_output(self.response_budget(max_output_tokens))
-            .await?;
-        let mut capture_error = session.terminal_reason();
-
-        if let Some(read_error) = prepared.read_error.as_deref() {
-            let reason = format!("output projection failed: {read_error}");
-            merge_error(&mut capture_error, reason.clone());
-            session.mark_forced_incomplete(&reason);
-            session.terminate().await;
-        }
-
-        // Latch terminal state before committing the response cursor. If capture
-        // completed after the first snapshot, refresh from the same cursor so the
-        // final response includes every committed byte. If it completes later,
-        // keep the session for one more poll instead of deleting unseen output.
-        let terminal = session.is_terminal();
-        if terminal && prepared.read_error.is_none() {
-            prepared = session
-                .prepare_output(self.response_budget(max_output_tokens))
-                .await?;
-            if let Some(read_error) = prepared.read_error.as_deref() {
-                let reason = format!("output projection failed: {read_error}");
-                merge_error(&mut capture_error, reason.clone());
-                session.mark_forced_incomplete(&reason);
-                session.terminate().await;
-            }
-        }
-
-        if terminal {
-            if let Some(reason) = session.terminal_reason().or_else(|| capture_error.clone()) {
-                if let Err(error) = session.seal_incomplete(&reason).await {
-                    merge_error(
-                        &mut capture_error,
-                        format!("failed to seal incomplete output artifact: {error}"),
-                    );
-                }
-            } else if let Err(error) = session.seal_complete().await {
-                let reason = format!("failed to seal output artifact: {error}");
-                merge_error(&mut capture_error, reason.clone());
-                session.mark_forced_incomplete(&reason);
-                let _ = session.seal_incomplete(&reason).await;
-            }
-        }
-
-        if let Some(reason) = session.terminal_reason() {
-            merge_error(&mut capture_error, reason);
-        }
-
-        let recovery_published = session.recovery_path_published().await?;
-        let need_ref = recovery_published
-            || prepared.truncated
-            || prepared.encoding_loss
-            || capture_error.is_some();
-        let output_ref = if need_ref {
-            Some(
-                Self::output_ref_for_range(session, prepared.snapshot.start, prepared.snapshot.end)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        Ok(PreparedExecResponse {
-            response: ExecResponse {
-                call_wall_time_seconds: started.elapsed().as_secs_f64(),
-                exit_code: terminal.then(|| session.known_exit_code()).flatten(),
-                session_id: (!terminal).then(|| session.id.to_string()),
-                output: prepared.output,
-                output_truncated: prepared.truncated,
-                output_encoding_loss: prepared.encoding_loss,
-                capture_error,
-                output_ref,
-                peer_messages: None,
-            },
-            commit_end: prepared
-                .read_error
-                .is_none()
-                .then_some(prepared.snapshot.end),
-            range_start: prepared.snapshot.start,
-            range_end: prepared.snapshot.end,
-            terminal,
-            delete_output: terminal && !need_ref,
-        })
+        response_delivery::finish_prepared_response(session, prepared, started).await
     }
 
     fn commit_prepared_response(
@@ -476,80 +410,9 @@ impl ProcessManager {
         if prepared.terminal {
             let state = state.expect("terminal response commit requires manager state lock");
             Self::remove_if_same_locked(state, id, session);
-            session.record_terminal_delivery(&prepared.response);
+            session.record_terminal_delivery(prepared.terminal_delivery());
         }
         Ok(())
-    }
-
-    fn delivered_terminal_response(
-        session: &Session,
-        delivery: TerminalDelivery,
-        started: Instant,
-    ) -> ExecResponse {
-        ExecResponse {
-            call_wall_time_seconds: started.elapsed().as_secs_f64(),
-            exit_code: session.known_exit_code(),
-            session_id: None,
-            output: String::new(),
-            output_truncated: false,
-            output_encoding_loss: false,
-            capture_error: delivery.capture_error,
-            output_ref: delivery.output_ref,
-            peer_messages: None,
-        }
-    }
-
-    async fn finish_prepared_response(
-        &self,
-        session: &Arc<Session>,
-        mut prepared: PreparedExecResponse,
-        started: Instant,
-    ) -> anyhow::Result<ExecResponse> {
-        if prepared.delete_output
-            && let Err(error) = session.delete_output().await
-        {
-            let cleanup_error = format!("failed to remove delivered output artifact: {error}");
-            merge_error(&mut prepared.response.capture_error, cleanup_error);
-            // The response has already committed, so preserve the artifact as a
-            // recovery target instead of leaving an unreachable complete spool.
-            match Self::output_ref_for_range(session, prepared.range_start, prepared.range_end)
-                .await
-            {
-                Ok(output_ref) => {
-                    session.publish_output_ref()?;
-                    prepared.response.output_ref = Some(output_ref);
-                }
-                Err(error) => merge_error(
-                    &mut prepared.response.capture_error,
-                    format!("failed to publish output recovery reference: {error}"),
-                ),
-            }
-        }
-
-        prepared.response.call_wall_time_seconds = started.elapsed().as_secs_f64();
-        if prepared.terminal {
-            // Include post-commit cleanup errors before releasing the interaction
-            // lock to callers already pinned to this terminal session.
-            session.record_terminal_delivery(&prepared.response);
-        }
-        Ok(prepared.response)
-    }
-
-    async fn output_ref_for_range(
-        session: &Session,
-        range_start: u64,
-        range_end: u64,
-    ) -> io::Result<OutputRef> {
-        let info = session.output_ref_info().await?;
-        Ok(OutputRef {
-            path: info.path.display().to_string(),
-            range_start,
-            range_end,
-            stored_bytes: info.stored_bytes,
-            capture_status: info.capture_status.into(),
-            expires_at_unix_seconds: info.expires_at_unix_seconds,
-            incomplete_reason: info.incomplete_reason,
-        })
     }
 
     async fn create_output_store(&self) -> io::Result<OutputStore> {
@@ -571,24 +434,30 @@ impl ProcessManager {
         validate_directory(&cwd).context("invalid spawn workdir")?;
         let mut environment = self.config.child_env.for_spawn(origin, &cwd);
         environment.insert("CHATGPT_EXEC_SESSION".into(), id.to_string());
-        let program = self.config.shell.to_string_lossy();
+        let program = self.config.shell.to_string_lossy().into_owned();
         let arguments = vec!["-c".to_owned(), command.to_owned()];
-        let arg0 = None;
-        if tty {
-            spawn_pty_process(
-                &program,
-                &arguments,
-                &cwd,
-                &environment,
-                &arg0,
-                TerminalSize::default(),
-                &[],
-            )
-            .await
-        } else {
-            spawn_pipe_process(&program, &arguments, &cwd, &environment, &arg0, &[]).await
-        }
-        .with_context(|| format!("failed to spawn command in `{}`", cwd.display()))
+        // Do not cancel the backend mid-spawn: the task owns any in-flight
+        // child until it returns a ProcessHandle. A dropped waiter detaches the
+        // task, whose undelivered handle terminates the child on drop.
+        complete_spawn(async move {
+            let arg0 = None;
+            let result = if tty {
+                spawn_pty_process(
+                    &program,
+                    &arguments,
+                    &cwd,
+                    &environment,
+                    &arg0,
+                    TerminalSize::default(),
+                    &[],
+                )
+                .await
+            } else {
+                spawn_pipe_process(&program, &arguments, &cwd, &environment, &arg0, &[]).await
+            };
+            result.with_context(|| format!("failed to spawn command in `{}`", cwd.display()))
+        })
+        .await
     }
 
     fn resolve_workdir(&self, workdir: Option<&str>) -> anyhow::Result<PathBuf> {
@@ -609,11 +478,17 @@ impl ProcessManager {
         std::fs::canonicalize(&path).context("workdir canonicalize failed")
     }
 
-    async fn reserve(&self, origin: SessionOrigin) -> anyhow::Result<SessionId> {
+    async fn reserve(&self, origin: SessionOrigin) -> anyhow::Result<StartupReservation> {
         if self.shutting_down.load(Ordering::SeqCst) {
             bail!("server is shutting down");
         }
         let mut state = self.state.lock().await;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            bail!("server is shutting down");
+        }
+        state
+            .reserved
+            .retain(|_, reservation| reservation.lease.strong_count() > 0);
         let active = state
             .sessions
             .values()
@@ -622,7 +497,7 @@ impl ProcessManager {
             + state
                 .reserved
                 .values()
-                .filter(|reserved_origin| **reserved_origin == origin)
+                .filter(|reservation| reservation.origin == origin)
                 .count();
         let limit = match origin {
             SessionOrigin::ExecContinuation => self.config.max_exec_continuations,
@@ -641,29 +516,51 @@ impl ProcessManager {
         let id = SessionId::generate_unique(|candidate| {
             state.sessions.contains_key(candidate) || state.reserved.contains_key(candidate)
         })?;
-        state.reserved.insert(id.clone(), origin);
-        Ok(id)
+        let lease = Arc::new(());
+        state.reserved.insert(
+            id.clone(),
+            ReservedSession {
+                origin,
+                lease: Arc::downgrade(&lease),
+            },
+        );
+        Ok(StartupReservation {
+            id,
+            lease,
+            state: Arc::clone(&self.state),
+        })
     }
 
-    async fn release_reservation(&self, id: &SessionId) {
-        self.state.lock().await.reserved.remove(id);
-    }
-
-    async fn commit_reservation(&self, id: SessionId, session: Arc<Session>) -> anyhow::Result<()> {
-        let committed = {
-            let mut state = self.state.lock().await;
-            if state.reserved.remove(&id).is_some() {
-                state.sessions.insert(id, Arc::clone(&session));
-                true
-            } else {
-                false
-            }
-        };
-        if !committed {
-            session.terminate().await;
+    async fn commit_reservation(
+        &self,
+        reservation: StartupReservation,
+        origin: SessionOrigin,
+        spawned: codex_utils_pty::SpawnedProcess,
+        output_store: OutputStore,
+        build_output: Option<BuildOutput>,
+    ) -> anyhow::Result<Arc<Session>> {
+        let mut state = self.state.lock().await;
+        if self.shutting_down.load(Ordering::SeqCst)
+            || state.reserved.remove(&reservation.id).is_none()
+        {
+            // Both resources are still directly owned here: dropping the
+            // process kills it, and dropping the unpublished artifact deletes it.
             bail!("session reservation disappeared before commit");
         }
-        Ok(())
+        // Session capture tasks start only after acquiring the registry lock.
+        // No await separates task ownership from registration.
+        let session = Session::new(
+            reservation.id.clone(),
+            origin,
+            spawned,
+            output_store,
+            build_output,
+        );
+        state
+            .sessions
+            .insert(reservation.id.clone(), Arc::clone(&session));
+        drop(state);
+        Ok(session)
     }
 
     fn remove_if_same_locked(state: &mut StoreState, id: &SessionId, expected: &Arc<Session>) {
@@ -737,18 +634,25 @@ impl ProcessManager {
     }
 }
 
+/// Let an in-flight backend finish constructing its owning process handle even
+/// when its caller is cancelled. Undelivered task results are dropped by Tokio.
+async fn complete_spawn<F>(spawn: F) -> anyhow::Result<codex_utils_pty::SpawnedProcess>
+where
+    F: std::future::Future<Output = anyhow::Result<codex_utils_pty::SpawnedProcess>>
+        + Send
+        + 'static,
+{
+    tokio::spawn(spawn)
+        .await
+        .context("process startup task failed")?
+}
+
 fn validate_directory(path: &Path) -> anyhow::Result<()> {
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_dir() {
         bail!("path is not a directory");
     }
     Ok(())
-}
-
-fn merge_error(target: &mut Option<String>, message: String) {
-    if target.is_none() {
-        *target = Some(message);
-    }
 }
 
 fn output_tokens(requested: Option<usize>, build_output: Option<BuildOutput>) -> usize {
@@ -780,12 +684,6 @@ fn validate_output_tokens(value: Option<usize>) -> anyhow::Result<()> {
         bail!("max_output_tokens must be at least 1");
     }
     Ok(())
-}
-
-async fn delete_unstarted_output(mut store: OutputStore) -> io::Result<()> {
-    tokio::task::spawn_blocking(move || store.delete())
-        .await
-        .map_err(|error| io::Error::other(format!("output cleanup task failed: {error}")))?
 }
 
 #[cfg(test)]
@@ -989,7 +887,7 @@ mod tests {
         let delivery = session.terminal_delivery().unwrap();
         assert_eq!(delivery.capture_error, response.capture_error);
         let delivery_ref = delivery.output_ref.unwrap();
-        assert_eq!(delivery_ref.path, output_ref.path);
+        assert_eq!(delivery_ref.info.path, PathBuf::from(&output_ref.path));
         assert_eq!(delivery_ref.range_start, 9);
         assert_eq!(delivery_ref.range_end, 9);
         assert_eq!(std::fs::read(raw_path).unwrap(), b"delivered");
@@ -1085,25 +983,13 @@ mod tests {
         let session_id = test_session(&manager, "sleep 60").await;
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let wait_manager = Arc::clone(&manager);
-        let wait_id = session_id.clone();
-        let waiter = tokio::spawn(async move {
-            wait_manager
-                .wait_for_exit_cancellable(test_wait_args(&wait_id), async move {
-                    let _ = cancel_rx.await;
-                })
-                .await
-                .unwrap()
+        let waiter = manager.wait_for_exit_cancellable(test_wait_args(&session_id), async move {
+            let _ = cancel_rx.await;
         });
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        tokio::pin!(waiter);
+        poll_pending(waiter.as_mut()).await;
         cancel_tx.send(()).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), waiter)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_none()
-        );
+        assert!(waiter.await.unwrap().is_none());
         assert_eq!(manager.active_session_count().await, 1);
 
         let interrupted = manager
@@ -1122,37 +1008,40 @@ mod tests {
     async fn wait_for_exit_cancellation_while_terminal_commit_is_blocked_rolls_back_delivery() {
         let workspace = TempDir::new().unwrap();
         let manager = test_manager(&workspace);
-        let session_id = test_session(&manager, "sleep 0.40; printf commit-output").await;
+        let session_id = test_session(&manager, "read line; printf commit-output").await;
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let wait_manager = Arc::clone(&manager);
-        let wait_id = session_id.clone();
         let session = pinned_session(&manager, &session_id).await;
-        let waiter = tokio::spawn(async move {
-            let mut args = test_wait_args(&wait_id);
-            args.max_output_tokens = Some(1);
-            wait_manager
-                .wait_for_exit_cancellable(args, async move {
-                    let _ = cancel_rx.await;
-                })
-                .await
-                .unwrap()
+        let mut args = test_wait_args(&session_id);
+        args.max_output_tokens = Some(1);
+        let waiter = manager.wait_for_exit_cancellable(args, async move {
+            let _ = cancel_rx.await;
         });
-
-        // Give the waiter time to pin the session, then block the terminal map
-        // removal step. Cancellation while this lock is held must leave both the
-        // output cursor and session map unchanged.
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        tokio::pin!(waiter);
+        poll_pending(waiter.as_mut()).await;
         let state_guard = manager.state.lock().await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        session.send_input(b"finish\n".to_vec()).await.unwrap();
+        session
+            .wait_until_exit_or_timeout(Duration::from_secs(5))
+            .await;
+        assert!(session.is_capture_complete());
+        // Drive preparation to completion, observing the interaction lock, then
+        // block at the registry commit boundary without an elapsed-time guess.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                poll_pending(waiter.as_mut()).await;
+                if session.interaction_lock.try_lock().is_err()
+                    && session.output_ref_info().await.unwrap().capture_status == "complete"
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         cancel_tx.send(()).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), waiter)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_none()
-        );
+        assert!(waiter.await.unwrap().is_none());
         assert!(!session.recovery_path_published().await.unwrap());
         drop(state_guard);
 
@@ -1166,5 +1055,309 @@ mod tests {
         assert!(delivered.output_ref.is_none());
         assert_eq!(manager.active_session_count().await, 0);
         manager.shutdown_all().await;
+    }
+
+    async fn startup(
+        manager: &ProcessManager,
+        origin: SessionOrigin,
+        command: &str,
+        tty: bool,
+    ) -> anyhow::Result<ExecResponse> {
+        match origin {
+            SessionOrigin::ExecContinuation => {
+                manager
+                    .exec_command(ExecCommandArgs {
+                        cmd: command.into(),
+                        tty,
+                        yield_time_ms: Some(MIN_YIELD_MS),
+                        workdir: None,
+                        max_output_tokens: None,
+                    })
+                    .await
+            }
+            SessionOrigin::ExplicitSession => {
+                manager
+                    .start_session(StartSessionArgs {
+                        cmd: Some(command.into()),
+                        tty: Some(tty),
+                        ..Default::default()
+                    })
+                    .await
+            }
+        }
+    }
+
+    async fn completed_startup(
+        manager: &ProcessManager,
+        origin: SessionOrigin,
+        command: &str,
+    ) -> ExecResponse {
+        let initial = startup(manager, origin, command, false).await.unwrap();
+        if let Some(id) = initial.session_id.as_ref() {
+            let mut completed = manager.wait_for_exit(test_wait_args(id)).await.unwrap();
+            completed.output.insert_str(0, &initial.output);
+            completed
+        } else {
+            initial
+        }
+    }
+
+    fn quota_one_manager(workspace: &TempDir) -> Arc<ProcessManager> {
+        let mut manager = test_manager(workspace);
+        let config = &mut Arc::get_mut(&mut manager).unwrap().config;
+        config.max_exec_continuations = 1;
+        config.max_explicit_sessions = 1;
+        manager
+    }
+
+    async fn no_artifacts(manager: &ProcessManager) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let has_artifact = std::fs::read_dir(&manager.config.output_store_dir)
+                    .unwrap()
+                    .any(|entry| entry.unwrap().file_type().unwrap().is_dir());
+                if !has_artifact {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unregistered startup artifact was not cleaned up");
+    }
+
+    #[test]
+    fn dropped_startup_during_artifact_creation_reuses_quota_and_cleans_files() {
+        // Occupy the only blocking worker to position cancellation before
+        // artifact creation finishes, without a filesystem speed assumption.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for origin in [
+                SessionOrigin::ExecContinuation,
+                SessionOrigin::ExplicitSession,
+            ] {
+                let workspace = TempDir::new().unwrap();
+                let manager = quota_one_manager(&workspace);
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+                started_rx.await.unwrap();
+                let mut cancelled =
+                    Box::pin(startup(&manager, origin, "touch cancelled-child", false));
+                poll_pending(cancelled.as_mut()).await;
+                let error = startup(&manager, origin, "true", false)
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("quota reached"), "{error}");
+                drop(cancelled);
+                let mut replacement =
+                    Box::pin(completed_startup(&manager, origin, "printf quota-reused"));
+                poll_pending(replacement.as_mut()).await;
+                release_tx.send(()).unwrap();
+                blocker.await.unwrap();
+                let response = replacement.await;
+                assert_eq!(response.output, "quota-reused");
+                assert_eq!(response.exit_code, Some(0));
+                assert!(!workspace.path().join("cancelled-child").exists());
+                no_artifacts(&manager).await;
+                manager.shutdown_all().await;
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn dropped_reservation_releases_quota_while_registry_is_locked() {
+        let workspace = TempDir::new().unwrap();
+        let manager = quota_one_manager(&workspace);
+        for origin in [
+            SessionOrigin::ExecContinuation,
+            SessionOrigin::ExplicitSession,
+        ] {
+            let reservation = manager.reserve(origin).await.unwrap();
+            let state = manager.state.lock().await;
+            drop(reservation);
+            drop(state);
+            // Do not yield to the deferred map-removal task before reuse.
+            let replacement = manager.reserve(origin).await.unwrap();
+            drop(replacement);
+        }
+        manager.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    async fn child_pid(workspace: &TempDir) -> i32 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(workspace.path().join("child.pid"))
+                    && let Ok(pid) = pid.trim().parse()
+                {
+                    return pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("child did not reach its stdin gate")
+    }
+
+    #[cfg(unix)]
+    async fn child_terminated(pid: i32) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled startup left a live child");
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_in_flight_spawn_finishes_ownership_and_terminates_child() {
+        for tty in [false, true] {
+            let workspace = TempDir::new().unwrap();
+            let manager = quota_one_manager(&workspace);
+            let reservation = manager
+                .reserve(SessionOrigin::ExecContinuation)
+                .await
+                .unwrap();
+            let id = reservation.id.clone();
+            let cwd = workspace.path().to_path_buf();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let worker_manager = Arc::clone(&manager);
+            let mut spawning = Box::pin(complete_spawn(async move {
+                let spawned = worker_manager
+                    .spawn(
+                        &id,
+                        SessionOrigin::ExecContinuation,
+                        "echo $$ > child.pid; read line",
+                        &cwd,
+                        tty,
+                    )
+                    .await?;
+                ready_tx.send(()).unwrap();
+                let _ = finish_rx.await;
+                Ok(spawned)
+            }));
+            poll_pending(spawning.as_mut()).await;
+            ready_rx.await.unwrap();
+            let pid = child_pid(&workspace).await;
+            drop(spawning);
+            drop(reservation);
+            let response =
+                completed_startup(&manager, SessionOrigin::ExecContinuation, "printf reused").await;
+            assert_eq!(response.output, "reused");
+            finish_tx.send(()).unwrap();
+            child_terminated(pid).await;
+            no_artifacts(&manager).await;
+            assert_eq!(manager.active_session_count().await, 0);
+            manager.shutdown_all().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_registration_drops_child_and_artifact_before_session_tasks_start() {
+        for tty in [false, true] {
+            let workspace = TempDir::new().unwrap();
+            let manager = quota_one_manager(&workspace);
+            let reservation = manager
+                .reserve(SessionOrigin::ExecContinuation)
+                .await
+                .unwrap();
+            let store = manager.create_output_store().await.unwrap();
+            let raw = store.snapshot(0).path;
+            let spawned = manager
+                .spawn(
+                    &reservation.id,
+                    SessionOrigin::ExecContinuation,
+                    "echo $$ > child.pid; read line",
+                    workspace.path(),
+                    tty,
+                )
+                .await
+                .unwrap();
+            let pid = child_pid(&workspace).await;
+            let state = manager.state.lock().await;
+            let mut registering = Box::pin(manager.commit_reservation(
+                reservation,
+                SessionOrigin::ExecContinuation,
+                spawned,
+                store,
+                None,
+            ));
+            poll_pending(registering.as_mut()).await;
+            drop(registering);
+            assert!(!raw.exists());
+            drop(state);
+            child_terminated(pid).await;
+            assert_eq!(manager.active_session_count().await, 0);
+            let response =
+                completed_startup(&manager, SessionOrigin::ExecContinuation, "printf reused").await;
+            assert_eq!(response.output, "reused");
+            no_artifacts(&manager).await;
+            manager.shutdown_all().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_error_and_shutdown_before_registration_clean_startup_resources() {
+        use std::os::unix::fs::PermissionsExt;
+        let workspace = TempDir::new().unwrap();
+        let mut manager = quota_one_manager(&workspace);
+        let invalid_shell = workspace.path().join("invalid-shell");
+        std::fs::write(&invalid_shell, "not executable").unwrap();
+        std::fs::set_permissions(&invalid_shell, std::fs::Permissions::from_mode(0o600)).unwrap();
+        Arc::get_mut(&mut manager).unwrap().config.shell = invalid_shell;
+        for _ in 0..2 {
+            let error = startup(&manager, SessionOrigin::ExecContinuation, "true", false)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("failed to spawn"), "{error}");
+            no_artifacts(&manager).await;
+        }
+        Arc::get_mut(&mut manager).unwrap().config.shell = PathBuf::from("/bin/bash");
+        let reservation = manager
+            .reserve(SessionOrigin::ExecContinuation)
+            .await
+            .unwrap();
+        let store = manager.create_output_store().await.unwrap();
+        let spawned = manager
+            .spawn(
+                &reservation.id,
+                SessionOrigin::ExecContinuation,
+                "echo $$ > child.pid; read line",
+                workspace.path(),
+                false,
+            )
+            .await
+            .unwrap();
+        let pid = child_pid(&workspace).await;
+        manager.shutdown_all().await;
+        let result = manager
+            .commit_reservation(
+                reservation,
+                SessionOrigin::ExecContinuation,
+                spawned,
+                store,
+                None,
+            )
+            .await;
+        assert!(result.is_err());
+        child_terminated(pid).await;
+        no_artifacts(&manager).await;
+        assert_eq!(manager.active_session_count().await, 0);
     }
 }

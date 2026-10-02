@@ -33,12 +33,7 @@ pub async fn serve_unix(
         Vec::new(),
         serde_json::json!({"unix_socket": path.display().to_string(), "mcp_path": "/mcp"}),
     );
-    let webui_state = server
-        .admin_context()
-        .map(|(pool, principal)| {
-            WebUiState::new(Some(pool), Some(principal), Arc::clone(&activity))
-        })
-        .unwrap_or_else(|| WebUiState::new(None, None, Arc::clone(&activity)));
+    let webui_state = WebUiState::new(server.admin_context(), Arc::clone(&activity));
 
     let mut config = StreamableHttpServerConfig::default();
     config.legacy_session_mode = false;
@@ -198,7 +193,16 @@ mod tests {
     fn stale_socket_is_reclaimed_and_cleanup_preserves_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.sock");
-        drop(UnixListener::bind(&path).unwrap());
+        let stale = UnixListener::bind(&path).unwrap();
+        // A concurrent process spawn may briefly inherit this descriptor until
+        // exec closes it. Disable listening on the shared socket before drop so
+        // the fixture is stale even while a forked copy still exists.
+        use std::os::fd::AsRawFd;
+        assert_eq!(
+            unsafe { libc::shutdown(stale.as_raw_fd(), libc::SHUT_RDWR) },
+            0
+        );
+        drop(stale);
         prepare_socket_path(&path).unwrap();
         assert!(!path.exists());
         let listener = UnixListener::bind(&path).unwrap();
