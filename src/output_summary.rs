@@ -5,7 +5,8 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::output_store::{Projection, read_utf8_safe_head, read_utf8_safe_tail};
+use crate::output_projection::Projection;
+use crate::output_projection::{omitted_marker, read_utf8_safe_head, read_utf8_safe_tail};
 
 const SCAN_BYTES: u64 = 64 * 1024;
 const MAX_LINE_BYTES: usize = 512;
@@ -157,10 +158,6 @@ fn summary_text(bytes: &[u8]) -> Option<String> {
     Some(plain.trim().to_owned())
 }
 
-fn omitted(bytes: u64) -> String {
-    format!("\n... {bytes} bytes omitted ...\n")
-}
-
 pub(crate) fn add_build_summary(
     mut baseline: Projection,
     kind: Option<BuildOutput>,
@@ -193,7 +190,7 @@ fn summary_projection(
     Read::by_ref(&mut file)
         .take(range.min(SCAN_BYTES))
         .read_to_end(&mut scan)?;
-    let marker_cost = omitted(range).len();
+    let marker_cost = omitted_marker(range).len();
     let mut candidates = Vec::new();
     let mut offset = scan_start;
     for line in scan.split_inclusive(|byte| *byte == b'\n') {
@@ -252,14 +249,14 @@ fn summary_projection(
             return Ok(None);
         }
         if excerpt.start > cursor {
-            bytes.extend_from_slice(omitted(excerpt.start - cursor).as_bytes());
+            bytes.extend_from_slice(omitted_marker(excerpt.start - cursor).as_bytes());
         }
         bytes.extend_from_slice(excerpt.label().as_bytes());
         bytes.extend_from_slice(&excerpt.bytes);
         cursor = excerpt.end;
     }
     if tail_start > cursor {
-        bytes.extend_from_slice(omitted(tail_start - cursor).as_bytes());
+        bytes.extend_from_slice(omitted_marker(tail_start - cursor).as_bytes());
     }
     bytes.extend_from_slice(&tail);
     Ok(String::from_utf8(bytes)
@@ -270,6 +267,7 @@ fn summary_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output_projection::project;
     use crate::output_store::{OutputStore, OutputStoreManager};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -342,19 +340,24 @@ mod tests {
 
     #[test]
     fn buried_summary_keeps_head_tail_and_exact_raw_byte_accounting() {
-        let bytes = log("BUILD FAILED in 1s\n");
+        let summary = "BUILD FAILED in 1s\n";
+        let bytes = log(summary);
         let (_root, store) = store(&bytes);
-        let baseline = store.project(store.snapshot(0), 1024, false).unwrap();
+        let baseline = project(store.snapshot(0), 1024, false).unwrap();
         assert!(!baseline.output.contains("BUILD FAILED"));
         let result = add_build_summary(baseline, Some(BuildOutput::Gradle), 1024);
         assert!(result.output.starts_with("head\n"));
         assert!(result.output.ends_with("tail\n"));
         assert!(result.output.contains("BUILD FAILED in 1s\n"));
-        assert!(
-            result
-                .output
-                .contains("[build summary excerpt; bytes 9005..9024]")
-        );
+        let summary_start = bytes
+            .windows(summary.len())
+            .position(|window| window == summary.as_bytes())
+            .unwrap();
+        assert!(result.output.contains(&format!(
+            "[build summary excerpt; bytes {}..{}]",
+            summary_start,
+            summary_start + summary.len()
+        )));
         assert!(result.truncated);
         assert!(!result.encoding_loss);
         assert!(result.output.len() <= 1024);
@@ -387,7 +390,7 @@ mod tests {
             [b"progress\n".repeat(1000), b"BUILD FAILED in 1s\n".to_vec()].concat(),
         ] {
             let (_root, store) = store(&bytes);
-            let baseline = store.project(store.snapshot(0), 1024, false).unwrap();
+            let baseline = project(store.snapshot(0), 1024, false).unwrap();
             let result = add_build_summary(baseline.clone(), None, 1024);
             assert_eq!(result.output, baseline.output);
             if bytes.len() < 1024 || bytes.ends_with(b"BUILD FAILED in 1s\n") {
@@ -399,22 +402,24 @@ mod tests {
 
     #[test]
     fn summary_does_not_cross_snapshot_boundaries_or_scan_the_whole_log() {
-        let bytes = log("BUILD FAILED in 1s\n");
+        let summary = "BUILD FAILED in 1s\n";
+        let bytes = log(summary);
         let (_root, mut store) = store(&bytes);
-        let summary_start = 9005;
+        let summary_start = bytes
+            .windows(summary.len())
+            .position(|window| window == summary.as_bytes())
+            .unwrap() as u64;
         let mut snapshot = store.snapshot(0);
         snapshot.end = summary_start + 8;
-        let baseline = store.project(snapshot, 1024, true).unwrap();
+        let baseline = project(snapshot, 1024, true).unwrap();
         let result = add_build_summary(baseline.clone(), Some(BuildOutput::Gradle), 1024);
         assert_eq!(result.output, baseline.output);
         // A poll beginning inside the keyword must not recover prior output.
-        let baseline = store
-            .project(store.snapshot(summary_start + 8), 1024, false)
-            .unwrap();
+        let baseline = project(store.snapshot(summary_start + 8), 1024, false).unwrap();
         let result = add_build_summary(baseline.clone(), Some(BuildOutput::Gradle), 1024);
         assert_eq!(result.output, baseline.output);
         store.append(&b"cleanup\n".repeat(10_000)).unwrap();
-        let baseline = store.project(store.snapshot(0), 1024, false).unwrap();
+        let baseline = project(store.snapshot(0), 1024, false).unwrap();
         let result = add_build_summary(baseline.clone(), Some(BuildOutput::Gradle), 1024);
         assert_eq!(result.output, baseline.output);
     }
@@ -446,7 +451,7 @@ mod tests {
             ),
         ] {
             let (_root, store) = store(&log(summary));
-            let baseline = store.project(store.snapshot(0), 2048, false).unwrap();
+            let baseline = project(store.snapshot(0), 2048, false).unwrap();
             let result = add_build_summary(baseline, Some(kind), 2048);
             assert!(
                 result.output.contains("[build summary excerpt;"),
@@ -470,7 +475,7 @@ mod tests {
         .concat();
         let (_root, store) = store(&bytes);
         for budget in [1, 32, 128, 511, 512, 1024, 4096] {
-            let baseline = store.project(store.snapshot(0), budget, false).unwrap();
+            let baseline = project(store.snapshot(0), budget, false).unwrap();
             let result = add_build_summary(baseline.clone(), Some(BuildOutput::Gradle), budget);
             assert!(result.output.len() <= budget);
             assert!(!result.encoding_loss);
@@ -487,7 +492,7 @@ mod tests {
             .map(|n| format!("BUILD SUCCESSFUL in {n}s\n"))
             .collect();
         let (_root, store) = store(&log(&summaries));
-        let baseline = store.project(store.snapshot(0), 8192, false).unwrap();
+        let baseline = project(store.snapshot(0), 8192, false).unwrap();
         let result = add_build_summary(baseline.clone(), Some(BuildOutput::Gradle), 8192);
         assert_eq!(result.output.matches("[build summary excerpt;").count(), 3);
         assert!(!result.output.contains("BUILD SUCCESSFUL in 6s"));

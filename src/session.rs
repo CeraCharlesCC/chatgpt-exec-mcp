@@ -15,12 +15,11 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+use crate::output_projection::{Snapshot, project};
 use crate::output_store::OutputRefInfo;
 use crate::output_store::OutputStore;
-use crate::output_store::Snapshot;
 use crate::output_summary::{BuildOutput, add_build_summary};
 use crate::session_id::SessionId;
-use crate::tools::{ExecResponse, OutputRef};
 
 const CAPTURE_QUEUE_CHUNKS: usize = 128;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -53,9 +52,16 @@ struct CaptureChunk {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct OutputReference {
+    pub info: OutputRefInfo,
+    pub range_start: u64,
+    pub range_end: u64,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct TerminalDelivery {
     pub capture_error: Option<String>,
-    pub output_ref: Option<OutputRef>,
+    pub output_ref: Option<OutputReference>,
 }
 
 pub struct Session {
@@ -324,9 +330,8 @@ impl Session {
             .clone()
     }
 
-    pub(crate) fn record_terminal_delivery(&self, response: &ExecResponse) {
-        let mut output_ref = response.output_ref.clone();
-        if let Some(output_ref) = &mut output_ref {
+    pub(crate) fn record_terminal_delivery(&self, mut delivery: TerminalDelivery) {
+        if let Some(output_ref) = &mut delivery.output_ref {
             // A pinned concurrent caller receives no new bytes, but can still
             // recover the retained log and inspect its final capture status.
             output_ref.range_start = output_ref.range_end;
@@ -334,10 +339,7 @@ impl Session {
         *self
             .terminal_delivery
             .lock()
-            .expect("terminal delivery lock poisoned") = Some(TerminalDelivery {
-            capture_error: response.capture_error.clone(),
-            output_ref,
-        });
+            .expect("terminal delivery lock poisoned") = Some(delivery);
     }
 
     pub async fn has_pending_output(&self) -> io::Result<bool> {
@@ -484,13 +486,13 @@ impl Session {
         let projection_snapshot = snapshot.clone();
         let hold_incomplete_utf8 = !self.is_terminal();
         let build_output = self.build_output;
-        match self
-            .with_store(move |store| {
-                let projection =
-                    store.project(projection_snapshot, max_bytes, hold_incomplete_utf8)?;
-                Ok(add_build_summary(projection, build_output, max_bytes))
-            })
-            .await
+        match tokio::task::spawn_blocking(move || {
+            let projection = project(projection_snapshot, max_bytes, hold_incomplete_utf8)?;
+            Ok(add_build_summary(projection, build_output, max_bytes))
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("output projection task failed: {error}")))
+        .and_then(|result| result)
         {
             Ok(projection) => Ok(PreparedOutput {
                 snapshot: projection.snapshot,

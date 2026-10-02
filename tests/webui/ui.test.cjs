@@ -69,19 +69,14 @@ async function open(t, data = fixture(), viewport = {width: 1440, height: 900}) 
   }};
 }
 
-test('polls preserve tool.start/tool.finish nested scroll, DOM identity and focus', async t => {
+test('polls preserve nested scroll, focus and working pool/send interactions', async t => {
   const {page, data, poll} = await open(t);
+  await page.selectOption('#poolSelect', 'beta');
+  await page.selectOption('#targetSelect', 'Bob');
+  await page.fill('#message', 'draft survives polls');
   await page.evaluate(() => {
-    window.savedBodies = [1, 2].map(id => {
-      const pre = document.querySelector(`[data-key="activity:event:${id}"] pre`);
-      pre.scrollTop = 180;
-      return pre;
-    });
-    window.poolTitle = document.querySelector('.pool-filter');
-    window.inboxMessage = document.querySelector('#inbox .message');
+    for (const id of [1, 2]) document.querySelector(`[data-key="activity:event:${id}"] pre`).scrollTop = 180;
     document.querySelector('.danger').focus();
-    window.terminateButton = document.activeElement;
-    window.poolOptions = document.querySelector('#poolSelect').firstElementChild;
   });
   for (let n = 0; n < 3; n++) {
     data.pools[0].agents[0].last_seen_ms += 1500;
@@ -89,14 +84,29 @@ test('polls preserve tool.start/tool.finish nested scroll, DOM identity and focu
     await poll();
   }
   assert.deepEqual(await page.evaluate(() => ({
-    bodies: window.savedBodies.map((pre, index) => ({
-      same: pre === document.querySelector(`[data-key="activity:event:${index + 1}"] pre`), scroll: pre.scrollTop,
-    })),
-    title: window.poolTitle === document.querySelector('.pool-filter'),
-    inbox: window.inboxMessage === document.querySelector('#inbox .message'),
-    focus: document.activeElement === window.terminateButton,
-    options: window.poolOptions === document.querySelector('#poolSelect').firstElementChild,
-  })), {bodies: [{same: true, scroll: 180}, {same: true, scroll: 180}], title: true, inbox: true, focus: true, options: true});
+    scroll: [1, 2].map(id => document.querySelector(`[data-key="activity:event:${id}"] pre`).scrollTop),
+    focusedAgent: document.activeElement.dataset.agent,
+    focusedPool: document.activeElement.dataset.pool,
+  })), {scroll: [180, 180], focusedAgent: 'Alice', focusedPool: 'alpha'});
+  assert.match(await page.locator('#inbox').innerText(), /Former agent/);
+  assert.match(await page.locator('#inbox').innerText(), /inbox message/);
+  assert.equal(await page.inputValue('#poolSelect'), 'beta');
+  assert.equal(await page.inputValue('#targetSelect'), 'Bob');
+  assert.equal(await page.inputValue('#message'), 'draft survives polls');
+
+  let sent;
+  await page.route('**/_admin/api/send', route => {
+    sent = route.request().postDataJSON();
+    return route.fulfill({json: {recipients: ['Bob']}});
+  });
+  await page.click('#send');
+  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('Queued for 1'));
+  assert.deepEqual(sent, {pool: 'beta', target: 'Bob', message: 'draft survives polls'});
+  await page.click('.pool-filter[data-pool="alpha"]');
+  assert.equal(await page.inputValue('#activityPool'), 'alpha');
+  assert.equal(await page.locator('.pool-filter[data-pool="alpha"]').getAttribute('aria-pressed'), 'true');
+  await page.selectOption('#poolSelect', 'alpha');
+  assert.deepEqual(await page.locator('#targetSelect option').evaluateAll(nodes => nodes.map(node => node.value)), ['global', 'Alice']);
 });
 
 test('dragging tool.start/tool.finish headers across polls preserves only the selected text', async t => {
