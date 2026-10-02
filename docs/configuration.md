@@ -73,7 +73,7 @@ inherited and destination names must be unique. Names starting with
 
 ## Agent pool and account scope
 
-The optional `agent_pool` object enables [agent messaging](../README.md#agent-pools).
+The optional `agent_pool` object enables [agent messaging](agent-pools.md).
 It requires `database_path` and `principal`.
 
 ```json
