@@ -127,6 +127,6 @@ the human administration surface; `/mcp` remains on the private Unix socket.
 Recent activity is kept in memory and is reset when core restarts.
 
 The Admin inbox provides an ACK button for each message. ACKed messages stay
-visible, including after a browser reload, until core restarts. On startup, core
-removes ACKed admin messages and keeps unacknowledged messages, subject to the
-existing limit of 1,000 stored admin messages per account.
+visible, including after a browser reload, until history is cleared or core
+restarts. On startup, core removes ACKed admin messages and keeps unacknowledged
+messages, subject to the existing limit of 1,000 stored admin messages per account.

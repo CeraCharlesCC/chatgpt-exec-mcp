@@ -97,7 +97,7 @@ async fn disabled_pool_snapshot_keeps_activity_and_rejects_controls() {
         vec![],
         json!({"output": "ready"}),
     );
-    let server = Dashboard::start(WebUiState::without_pool(activity)).await;
+    let server = Dashboard::start(WebUiState::without_pool(activity.clone())).await;
     let snapshot = server.snapshot().await;
     assert_eq!(snapshot["version"], env!("CARGO_PKG_VERSION"));
     assert!(snapshot["generated_ms"].as_i64().unwrap() > 0);
@@ -120,6 +120,113 @@ async fn disabled_pool_snapshot_keeps_activity_and_rejects_controls() {
             "agent pool is not configured"
         );
     }
+    assert_eq!(
+        server.post("clear", json!({}), StatusCode::OK).await,
+        json!({"cleared_events":1, "cleared_admin_messages":0})
+    );
+    assert_eq!(server.snapshot().await["events"], json!([]));
+    let next_id = activity.emit("tool.start", "info", None, vec![], json!({}));
+    assert_eq!(next_id, 2, "clearing must not reuse event IDs");
+}
+
+#[tokio::test]
+async fn clear_removes_all_history_and_only_the_current_accounts_admin_inbox() {
+    let workspace = TempDir::new().unwrap();
+    let path = workspace.path().join("private/pool.sqlite");
+    let store = Arc::new(AgentPoolStore::open(&path).unwrap());
+    // Include messages beyond the dashboard's 200-row snapshot, in two pools.
+    for i in 0..205 {
+        let mut args = send_args(Some("admin"), Some("history"));
+        if i % 2 == 1 {
+            args.pool = "second-pool".into();
+        }
+        let sent = store.send("account-a", args, Some("session")).unwrap();
+        if i == 0 {
+            store
+                .admin_ack("account-a", sent.message_id.as_deref().unwrap())
+                .unwrap();
+        }
+    }
+    store
+        .send(
+            "account-b",
+            send_args(Some("admin"), Some("keep")),
+            Some("session"),
+        )
+        .unwrap();
+    let members = store.admin_members("account-a").unwrap();
+    let agent = &members.iter().find(|m| m.pool == "team").unwrap().agent;
+    store
+        .admin_send("account-a", "team", agent, "pending delivery", None)
+        .unwrap();
+    let activity = Arc::new(ActivityHub::new(500));
+    for _ in 0..450 {
+        activity.emit(
+            "tool.finish",
+            "info",
+            None,
+            vec![],
+            json!({"output":"history"}),
+        );
+    }
+    let server = Dashboard::start(
+        WebUiState::for_principal(store.clone(), "account-a".into(), activity.clone()).unwrap(),
+    )
+    .await;
+    server
+        .post(
+            "clear",
+            json!({"principal":"account-b"}),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    let before = server.snapshot().await;
+    assert_eq!(before["events"].as_array().unwrap().len(), 400);
+    assert_eq!(before["admin_messages"].as_array().unwrap().len(), 200);
+    assert_eq!(
+        server.post("clear", json!({}), StatusCode::OK).await,
+        json!({"cleared_events":450, "cleared_admin_messages":205})
+    );
+    for _ in 0..2 {
+        let after = server.snapshot().await;
+        assert_eq!(after["events"], json!([]));
+        assert_eq!(after["admin_messages"], json!([]));
+        assert_eq!(after["pools"], before["pools"]);
+        assert_eq!(
+            store.admin_messages("account-b", 10).unwrap()[0].message,
+            "keep"
+        );
+    }
+    assert_eq!(
+        server.post("clear", json!({}), StatusCode::OK).await,
+        json!({"cleared_events":0, "cleared_admin_messages":0})
+    );
+    let turn = store
+        .start_tool("account-a", Some("session"))
+        .await
+        .unwrap();
+    let offered = store
+        .finish_tool_turn("account-a", Some("session"), turn.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(offered.len(), 1);
+    assert_eq!(offered[0].message, "pending delivery");
+    let id = activity.emit("tool.start", "info", None, vec![], json!({}));
+    assert_eq!(id, 451);
+    assert_eq!(server.snapshot().await["events"][0]["id"], id);
+    drop(server);
+    drop(store);
+    let reopened = AgentPoolStore::open(&path).unwrap();
+    assert!(
+        reopened
+            .admin_messages("account-a", 500)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        reopened.admin_messages("account-b", 10).unwrap()[0].message,
+        "keep"
+    );
 }
 
 #[tokio::test]

@@ -120,6 +120,16 @@ struct AckResponse {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ClearRequest {}
+
+#[derive(Serialize)]
+struct ClearResponse {
+    cleared_events: usize,
+    cleared_admin_messages: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TerminateRequest {
     pool: String,
     agent: String,
@@ -136,6 +146,7 @@ pub fn router(state: WebUiState) -> Router {
         .route("/_admin/api/snapshot", get(snapshot))
         .route("/_admin/api/send", post(send))
         .route("/_admin/api/ack", post(ack))
+        .route("/_admin/api/clear", post(clear))
         .route("/_admin/api/terminate", post(terminate))
         .with_state(state)
 }
@@ -229,6 +240,26 @@ async fn ack(State(state): State<WebUiState>, body: Bytes) -> Result<Response, W
         .admin_ack(context.principal(), &request.message_id)
         .map_err(pool_error)?;
     json_response(StatusCode::OK, &AckResponse { acknowledged })
+}
+
+async fn clear(State(state): State<WebUiState>, body: Bytes) -> Result<Response, WebError> {
+    let _: ClearRequest = serde_json::from_slice(&body)
+        .map_err(|error| WebError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let cleared_admin_messages = match state.pool.as_ref() {
+        Some(context) => context
+            .store()
+            .admin_clear_messages(context.principal())
+            .map_err(pool_error)?,
+        None => 0,
+    };
+    let cleared_events = state.activity.clear();
+    json_response(
+        StatusCode::OK,
+        &ClearResponse {
+            cleared_events,
+            cleared_admin_messages,
+        },
+    )
 }
 
 async fn terminate(State(state): State<WebUiState>, body: Bytes) -> Result<Response, WebError> {

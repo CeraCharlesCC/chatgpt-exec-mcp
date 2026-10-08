@@ -69,6 +69,16 @@ impl ActivityHub {
         let take = limit.min(events.len());
         events.iter().skip(events.len() - take).cloned().collect()
     }
+
+    /// Discard retained history without resetting event IDs.
+    pub fn clear(&self) -> usize {
+        let Ok(mut events) = self.events.lock() else {
+            return 0;
+        };
+        let count = events.len();
+        events.clear();
+        count
+    }
 }
 
 fn now_ms() -> i64 {

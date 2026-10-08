@@ -452,3 +452,157 @@ test('slow snapshot requests do not overlap and race newer snapshots', async t =
   await page.evaluate(async () => { await window.pendingRefresh; });
   assert.equal(await page.evaluate(() => state.refreshing), false);
 });
+
+test('the header indicator follows connectivity and the drawer supports keyboard dismissal', async t => {
+  const {page, data, poll} = await open(t);
+  const toggle = page.locator('#menuToggle');
+  assert.doesNotMatch(await page.locator('.top').innerText(), /debug console|up 0m/);
+  assert.equal(await page.locator('.brand .dot').count(), 1);
+  assert.equal(await page.locator('#connectionStatus').getAttribute('data-connection'), 'connected');
+  await page.route('**/_admin/api/snapshot', route => route.fulfill({status: 503, body: 'offline'}));
+  await poll();
+  assert.equal(await page.locator('#connectionStatus').getAttribute('aria-label'), 'Disconnected');
+  await page.route('**/_admin/api/snapshot', route => route.fulfill({json: data}));
+  await poll();
+  assert.equal(await page.locator('#connectionStatus').getAttribute('aria-label'), 'Connected');
+
+  await toggle.focus();
+  await page.keyboard.press('Enter');
+  assert.equal(await toggle.getAttribute('aria-expanded'), 'true');
+  assert.equal(await page.evaluate(() => document.querySelector('main').inert), true);
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'menuClose');
+  await page.keyboard.press('Tab');
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'clearCover');
+  await page.keyboard.press('Enter');
+  assert.equal(await page.locator('#clearHistory').isEnabled(), true);
+  await page.keyboard.press('Shift+Tab');
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'clearHistory');
+  await page.keyboard.press('Escape');
+  assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'menuToggle');
+  assert.equal(await page.evaluate(() => document.querySelector('main').inert), false);
+  assert.equal(await page.locator('#clearHistory').isDisabled(), true);
+  await toggle.click();
+  await page.locator('#menuBackdrop').click({position: {x: 10, y: 10}});
+  assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
+});
+
+test('the menu covers the admin column and fits mobile and short screens', async t => {
+  for (const viewport of [{width: 1440, height: 900}, {width: 390, height: 844}, {width: 320, height: 480}]) {
+    const {page} = await open(t, fixture(), viewport);
+    await page.emulateMedia({reducedMotion: 'reduce'});
+    await page.locator('#menuToggle').click();
+    const menu = await page.locator('#consoleMenu').boundingBox();
+    const admin = await page.locator('.right').boundingBox();
+    assert.ok(menu.x >= 0 && menu.x + menu.width <= viewport.width);
+    assert.ok(menu.y >= 52 && menu.y + menu.height <= viewport.height);
+    if (viewport.width === 1440) {
+      assert.equal(menu.x, admin.x);
+      assert.equal(menu.width, admin.width);
+    }
+    await page.locator('#clearCover').click();
+    await page.locator('#clearHistory').scrollIntoViewIfNeeded();
+    const button = await page.locator('#clearHistory').boundingBox();
+    assert.ok(button.y >= menu.y && button.y + button.height <= menu.y + menu.height);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  }
+});
+
+test('CLEAR requires an open cover, closes it on press and clears every history view', async t => {
+  const {page, data, poll} = await open(t);
+  await page.fill('#message', 'keep this draft');
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const requests = [];
+  await page.route('**/_admin/api/clear', async route => {
+    requests.push({method: route.request().method(), body: route.request().postDataJSON()});
+    await gate;
+    data.events = [];
+    data.admin_messages = [];
+    await route.fulfill({json: {cleared_events: 11, cleared_admin_messages: 1}});
+  });
+  await page.locator('#menuToggle').click();
+  assert.equal(await page.locator('#clearHistory').isDisabled(), true);
+  await page.evaluate(async () => { await clearHistory(); });
+  assert.equal(requests.length, 0);
+  await page.locator('#clearCover').click();
+  await poll();
+  assert.equal(await page.locator('#clearCover').getAttribute('aria-expanded'), 'true');
+  await page.locator('#clearHistory').click();
+  await page.waitForFunction(() => state.clearing);
+  assert.equal(await page.locator('#clearCover').getAttribute('aria-expanded'), 'false');
+  assert.equal(await page.locator('#clearCover').isDisabled(), true);
+  assert.equal(await page.locator('#clearHistory').isDisabled(), true);
+  await page.evaluate(async () => { await clearHistory(); await refresh(); });
+  assert.deepEqual(requests, [{method: 'POST', body: {}}]);
+  release();
+  await page.waitForFunction(() => !state.clearing && document.querySelector('#clearHint').textContent === 'History cleared.');
+  assert.equal(await page.locator('#events [data-key]').count(), 0);
+  assert.equal(await page.locator('#inbox .message').count(), 0);
+  await page.locator('#menuClose').click();
+  assert.equal(await page.inputValue('#message'), 'keep this draft');
+  assert.equal(await page.locator('#pools .agent').count(), 3);
+  await page.selectOption('#activityFilter', 'messages');
+  assert.equal(await page.locator('#events .event').count(), 0);
+  await page.locator('[data-view="logs"]').click();
+  assert.equal(await page.locator('#events .logline').count(), 0);
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector('#status').textContent.includes('vtest'));
+  assert.equal(await page.locator('#events [data-key]').count(), 0);
+  assert.equal(await page.locator('#inbox .message').count(), 0);
+  data.events.push({id: 12, kind: 'tool.start', level: 'info', timestamp_ms: Date.now(), agents: [], detail: {}});
+  await poll();
+  assert.equal(await page.locator('#events [data-key]').count(), 1);
+});
+
+test('a failed clear preserves history, closes the cover and allows retry', async t => {
+  const {page, data} = await open(t);
+  await page.route('**/_admin/api/clear', route => route.fulfill({status: 500, body: 'Clear failed'}));
+  await page.locator('#menuToggle').click();
+  await page.locator('#clearCover').click();
+  await page.locator('#clearHistory').click();
+  await page.waitForFunction(() => !state.clearing && document.querySelector('#toast').classList.contains('bad'));
+  assert.equal(await page.locator('#events [data-key]').count(), 11);
+  assert.equal(await page.locator('#inbox .message').count(), 1);
+  assert.equal(await page.locator('#clearCover').getAttribute('aria-expanded'), 'false');
+  assert.equal(await page.locator('#clearCover').isEnabled(), true);
+  await page.route('**/_admin/api/clear', route => {
+    data.events = [];
+    data.admin_messages = [];
+    return route.fulfill({json: {cleared_events: 11, cleared_admin_messages: 1}});
+  });
+  await page.locator('#clearCover').click();
+  await page.locator('#clearHistory').click();
+  await page.waitForFunction(() => !state.clearing && document.querySelector('#clearHint').textContent === 'History cleared.');
+  assert.equal(await page.locator('#events [data-key]').count(), 0);
+});
+
+test('a snapshot requested before CLEAR cannot restore erased history', async t => {
+  const {page, data} = await open(t);
+  await page.locator('#menuToggle').click();
+  await page.locator('#clearCover').click();
+  let release, started;
+  const gate = new Promise(resolve => { release = resolve; });
+  const requested = new Promise(resolve => { started = resolve; });
+  const stale = structuredClone(data);
+  await page.route('**/_admin/api/snapshot', async route => {
+    started();
+    await gate;
+    await route.fulfill({json: stale});
+  });
+  await page.evaluate(() => { window.pendingRefresh = refresh(); });
+  await requested;
+  await page.route('**/_admin/api/clear', route => {
+    data.events = [];
+    data.admin_messages = [];
+    return route.fulfill({json: {cleared_events: 11, cleared_admin_messages: 1}});
+  });
+  await page.locator('#clearHistory').click();
+  await page.waitForFunction(() => !state.clearing);
+  assert.equal(await page.locator('#events [data-key]').count(), 0);
+  release();
+  await page.evaluate(async () => { await window.pendingRefresh; });
+  assert.equal(await page.locator('#events [data-key]').count(), 0);
+  assert.equal(await page.locator('#inbox .message').count(), 0);
+  await page.route('**/_admin/api/snapshot', route => route.fulfill({json: data}));
+});

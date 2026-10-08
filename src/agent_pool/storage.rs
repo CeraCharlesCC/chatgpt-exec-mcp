@@ -451,6 +451,13 @@ impl PoolStorage {
         Ok(updated != 0)
     }
 
+    pub(super) fn admin_clear_messages(&self, principal: &str) -> Result<usize, McpError> {
+        validate_name(principal, "principal")?;
+        self.connection()?
+            .execute("DELETE FROM admin_messages WHERE principal=?1", [principal])
+            .map_err(|_| storage_error())
+    }
+
     pub(super) fn admin_send(
         &self,
         principal: &str,

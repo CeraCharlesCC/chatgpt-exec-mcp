@@ -292,6 +292,11 @@ impl AgentPoolStore {
         self.storage.admin_ack(principal, message_id)
     }
 
+    /// Remove all admin inbox messages for this account, including unread ones.
+    pub fn admin_clear_messages(&self, principal: &str) -> Result<usize, McpError> {
+        self.storage.admin_clear_messages(principal)
+    }
+
     pub fn admin_send(
         &self,
         principal: &str,
