@@ -140,6 +140,7 @@ pub struct AdminMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
     pub created_ms: i64,
+    pub acknowledged: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -284,6 +285,11 @@ impl AgentPoolStore {
         limit: usize,
     ) -> Result<Vec<AdminMessage>, McpError> {
         self.storage.admin_messages(principal, limit)
+    }
+
+    /// Keep acknowledged admin messages visible until the store is reopened.
+    pub fn admin_ack(&self, principal: &str, message_id: &str) -> Result<bool, McpError> {
+        self.storage.admin_ack(principal, message_id)
     }
 
     pub fn admin_send(
@@ -1203,6 +1209,89 @@ mod tests {
                 .agents
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn admin_messages_are_removed_only_on_restart_after_ack() {
+        let (directory, store) = store();
+        let path = directory.path().join("agent-pool.sqlite3");
+        let acknowledged_id = store
+            .send("owner", send("p", ADMIN_AGENT, "read"), Some("a"))
+            .unwrap()
+            .message_id
+            .unwrap();
+        assert!(store.admin_ack("owner", &acknowledged_id).unwrap());
+        store
+            .send("owner", send("p", ADMIN_AGENT, "unread"), Some("a"))
+            .unwrap();
+        store
+            .send("other", send("p", ADMIN_AGENT, "other unread"), Some("a"))
+            .unwrap();
+        // Normal pool cleanup and repeated snapshots must retain ACKed rows.
+        store.admin_members("owner").unwrap();
+        for _ in 0..2 {
+            let messages = store.admin_messages("owner", 10).unwrap();
+            assert_eq!(messages.len(), 2);
+            assert!(
+                messages
+                    .iter()
+                    .find(|m| m.message_id == acknowledged_id)
+                    .unwrap()
+                    .acknowledged
+            );
+            assert!(
+                !messages
+                    .iter()
+                    .find(|m| m.message == "unread")
+                    .unwrap()
+                    .acknowledged
+            );
+        }
+        drop(store);
+
+        let restarted = AgentPoolStore::open(&path).unwrap();
+        let messages = restarted.admin_messages("owner", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message, "unread");
+        assert!(!messages[0].acknowledged);
+        let other = restarted.admin_messages("other", 10).unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].message, "other unread");
+        assert!(!other[0].acknowledged);
+    }
+
+    #[test]
+    fn legacy_admin_messages_gain_ack_state_without_losing_messages() {
+        let (directory, store) = store();
+        let path = directory.path().join("agent-pool.sqlite3");
+        let mut args = send("p", ADMIN_AGENT, "legacy message");
+        args.in_reply_to = Some("earlier".into());
+        let message_id = store
+            .send("owner", args, Some("a"))
+            .unwrap()
+            .message_id
+            .unwrap();
+        // Recreate the schema used before admin ACKs existed.
+        store
+            .storage
+            .connection()
+            .unwrap()
+            .execute_batch("ALTER TABLE admin_messages DROP COLUMN acknowledged")
+            .unwrap();
+        drop(store);
+
+        let migrated = AgentPoolStore::open(&path).unwrap();
+        let messages = migrated.admin_messages("owner", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, message_id);
+        assert_eq!(messages[0].message, "legacy message");
+        assert_eq!(messages[0].in_reply_to.as_deref(), Some("earlier"));
+        assert!(!messages[0].acknowledged);
+        assert!(migrated.admin_ack("owner", &message_id).unwrap());
+        drop(migrated);
+
+        let restarted = AgentPoolStore::open(&path).unwrap();
+        assert!(restarted.admin_messages("owner", 10).unwrap().is_empty());
     }
 
     #[test]

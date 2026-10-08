@@ -109,6 +109,17 @@ struct SendRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AckRequest {
+    message_id: String,
+}
+
+#[derive(Serialize)]
+struct AckResponse {
+    acknowledged: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TerminateRequest {
     pool: String,
     agent: String,
@@ -124,6 +135,7 @@ pub fn router(state: WebUiState) -> Router {
         .route("/", get(index))
         .route("/_admin/api/snapshot", get(snapshot))
         .route("/_admin/api/send", post(send))
+        .route("/_admin/api/ack", post(ack))
         .route("/_admin/api/terminate", post(terminate))
         .with_state(state)
 }
@@ -206,6 +218,17 @@ async fn send(State(state): State<WebUiState>, body: Bytes) -> Result<Response, 
         }),
     );
     json_response(StatusCode::OK, &result)
+}
+
+async fn ack(State(state): State<WebUiState>, body: Bytes) -> Result<Response, WebError> {
+    let request: AckRequest = serde_json::from_slice(&body)
+        .map_err(|error| WebError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let context = state.pool_context()?;
+    let acknowledged = context
+        .store()
+        .admin_ack(context.principal(), &request.message_id)
+        .map_err(pool_error)?;
+    json_response(StatusCode::OK, &AckResponse { acknowledged })
 }
 
 async fn terminate(State(state): State<WebUiState>, body: Bytes) -> Result<Response, WebError> {

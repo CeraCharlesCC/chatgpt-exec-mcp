@@ -36,7 +36,7 @@ function fixture() {
     version: 'test', uptime_seconds: 0,
     pools: [{name: 'alpha', agents: [agent('alpha', 'Alice', 'chat-alpha')]},
       {name: 'beta', agents: [agent('beta', 'Alice', 'chat-beta'), agent('beta', 'Bob', 'chat-bob')]}],
-    admin_messages: [{pool: 'old-pool', message_id: 'inbox-1', from: 'Former agent', message: '<script>unsafe()</script>\ninbox message', created_ms: now}],
+    admin_messages: [{pool: 'old-pool', message_id: 'inbox-1', from: 'Former agent', message: '<script>unsafe()</script>\ninbox message', created_ms: now, acknowledged: false}],
     events: [
       event(1, 'tool.start', {tool: 'exec_command', arguments: {cmd: lines}}, [identity('alpha', 'Alice')]),
       event(2, 'tool.finish', {tool: 'exec_command', start_event_id: 1, result: {output: lines}}, [identity('alpha', 'Alice')]),
@@ -107,6 +107,62 @@ test('polls preserve nested scroll, focus and working pool/send interactions', a
   assert.equal(await page.locator('.pool-filter[data-pool="alpha"]').getAttribute('aria-pressed'), 'true');
   await page.selectOption('#poolSelect', 'alpha');
   assert.deepEqual(await page.locator('#targetSelect option').evaluateAll(nodes => nodes.map(node => node.value)), ['global', 'Alice']);
+});
+
+test('admin ACK keeps the message visible across polls and browser reloads', async t => {
+  const {page, data, poll} = await open(t);
+  data.admin_messages.push({...data.admin_messages[0], message_id: 'inbox-2', message: 'still unread'});
+  await poll();
+  const card = page.locator('#inbox [data-key="inbox-1"]'), button = card.locator('.ack');
+  await card.evaluate(node => { window.inboxBody = node.children[1]; });
+  let complete;
+  const requests = [];
+  await page.route('**/_admin/api/ack', async route => {
+    assert.equal(route.request().method(), 'POST');
+    requests.push(route.request().postDataJSON());
+    await new Promise(resolve => { complete = resolve; });
+    data.admin_messages[0].acknowledged = true;
+    await route.fulfill({json: {acknowledged: true}});
+  });
+  await button.click();
+  await page.waitForFunction(() => document.querySelector('#inbox .ack').textContent === 'ACKing…');
+  assert.equal(await button.isDisabled(), true);
+  await poll();
+  assert.equal(await button.isDisabled(), true, 'polls keep an in-flight ACK disabled');
+  complete();
+  await page.waitForFunction(() => document.querySelector('#inbox .ack').textContent === 'ACKed');
+  assert.deepEqual(requests, [{message_id: 'inbox-1'}]);
+  assert.equal(await button.isDisabled(), true);
+  assert.match(await card.innerText(), /<script>unsafe\(\)<\/script>\ninbox message/);
+  assert.equal(await card.evaluate(node => node.children[1] === window.inboxBody), true, 'ACK preserves the message body');
+  assert.equal(await page.locator('#inbox .message').count(), 2);
+  assert.equal(await page.locator('#inbox [data-key="inbox-2"] .ack').isEnabled(), true);
+  await poll();
+  assert.equal(await button.innerText(), 'ACKed');
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector('#inbox .ack')?.textContent === 'ACKed');
+  assert.equal(await page.locator('#inbox .message').count(), 2);
+  assert.equal(await button.isDisabled(), true);
+});
+
+test('failed admin ACKs leave messages unread and allow a retry', async t => {
+  const {page, data, poll} = await open(t);
+  const button = page.locator('#inbox .ack');
+  for (const response of [
+    {status: 500, body: 'ACK failed'},
+    {json: {acknowledged: false}},
+  ]) {
+    await page.route('**/_admin/api/ack', route => route.fulfill(response));
+    await button.click();
+    await page.waitForFunction(() => document.querySelector('#toast').classList.contains('bad'));
+    assert.equal(await button.isEnabled(), true);
+    assert.equal(await button.innerText(), 'ACK');
+    assert.equal(data.admin_messages[0].acknowledged, false);
+    assert.match(await page.locator('#inbox').innerText(), /inbox message/);
+    await poll();
+    await page.unroute('**/_admin/api/ack');
+    await page.evaluate(() => { document.querySelector('#toast').className = 'toast'; });
+  }
 });
 
 test('dragging tool.start/tool.finish headers across polls preserves only the selected text', async t => {

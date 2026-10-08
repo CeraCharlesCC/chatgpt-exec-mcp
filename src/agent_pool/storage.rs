@@ -103,7 +103,7 @@ impl PoolStorage {
             "agent pool database permissions must be restricted to its owner"
         );
 
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -151,18 +151,34 @@ impl PoolStorage {
                sender TEXT NOT NULL,
                body TEXT NOT NULL,
                in_reply_to TEXT,
-               created INTEGER NOT NULL
+               created INTEGER NOT NULL,
+               acknowledged INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS admin_messages_principal_created
                ON admin_messages(principal,created);",
         )?;
+        let transaction = connection.transaction()?;
+        let has_acknowledged: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('admin_messages')
+             WHERE name='acknowledged')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_acknowledged {
+            transaction.execute_batch(
+                "ALTER TABLE admin_messages ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        // ACK only marks a message during this run; discard it on restart.
+        transaction.execute("DELETE FROM admin_messages WHERE acknowledged=1", [])?;
         // A process restart cannot know whether an offered response reached its
         // caller. Keep the inbox rows and re-offer them rather than risking
         // at-most-once loss across a crash.
-        connection.execute(
+        transaction.execute(
             "UPDATE members SET offered_cursor=NULL WHERE offered_cursor IS NOT NULL",
             [],
         )?;
+        transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
             lease_ttl_ms,
@@ -401,7 +417,7 @@ impl PoolStorage {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT id,pool,sender,body,in_reply_to,created FROM admin_messages
+                "SELECT id,pool,sender,body,in_reply_to,created,acknowledged FROM admin_messages
                  WHERE principal=?1 ORDER BY created DESC,id DESC LIMIT ?2",
             )
             .map_err(|_| storage_error())?;
@@ -414,11 +430,25 @@ impl PoolStorage {
                     message: row.get(3)?,
                     in_reply_to: row.get(4)?,
                     created_ms: row.get(5)?,
+                    acknowledged: row.get(6)?,
                 })
             })
             .map_err(|_| storage_error())?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| storage_error())
+    }
+
+    pub(super) fn admin_ack(&self, principal: &str, message_id: &str) -> Result<bool, McpError> {
+        validate_name(principal, "principal")?;
+        validate_name(message_id, "message_id")?;
+        let connection = self.connection()?;
+        let updated = connection
+            .execute(
+                "UPDATE admin_messages SET acknowledged=1 WHERE principal=?1 AND id=?2",
+                params![principal, message_id],
+            )
+            .map_err(|_| storage_error())?;
+        Ok(updated != 0)
     }
 
     pub(super) fn admin_send(

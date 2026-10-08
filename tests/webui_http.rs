@@ -111,6 +111,7 @@ async fn disabled_pool_snapshot_keeps_activity_and_rejects_controls() {
             json!({"pool":"team", "target":"Alice", "message":"hello"}),
         ),
         ("terminate", json!({"pool":"team", "agent":"Alice"})),
+        ("ack", json!({"message_id":"msg_example"})),
     ] {
         assert_eq!(
             server
@@ -122,7 +123,7 @@ async fn disabled_pool_snapshot_keeps_activity_and_rejects_controls() {
 }
 
 #[tokio::test]
-async fn handlers_scope_snapshot_send_and_termination_to_principal() {
+async fn handlers_scope_snapshot_send_ack_and_termination_to_principal() {
     let workspace = TempDir::new().unwrap();
     let store = Arc::new(
         AgentPoolStore::open_with_names(
@@ -157,6 +158,43 @@ async fn handlers_scope_snapshot_send_and_termination_to_principal() {
     assert_eq!(snapshot["pools"][0]["agents"][0]["agent"], "Alice");
     assert_eq!(snapshot["admin_messages"].as_array().unwrap().len(), 1);
     assert_eq!(snapshot["admin_messages"][0]["message"], "account-a");
+    assert_eq!(snapshot["admin_messages"][0]["acknowledged"], false);
+
+    let message_id = snapshot["admin_messages"][0]["message_id"].clone();
+    let other_message = store.admin_messages("account-b", 10).unwrap().remove(0);
+    for body in [
+        json!({"message_id":message_id, "principal":"account-b"}),
+        json!({"message_id":""}),
+        json!({}),
+    ] {
+        server.post("ack", body, StatusCode::BAD_REQUEST).await;
+    }
+    for id in [&other_message.message_id, "msg_missing"] {
+        assert_eq!(
+            server
+                .post("ack", json!({"message_id":id}), StatusCode::OK)
+                .await,
+            json!({"acknowledged":false})
+        );
+    }
+    // Retrying an ACK is safe, and snapshots retain the message and its status.
+    for _ in 0..2 {
+        assert_eq!(
+            server
+                .post("ack", json!({"message_id":message_id}), StatusCode::OK)
+                .await,
+            json!({"acknowledged":true})
+        );
+        let messages = server.snapshot().await["admin_messages"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["message_id"], message_id);
+        assert_eq!(messages[0]["message"], "account-a");
+        assert_eq!(messages[0]["acknowledged"], true);
+        assert!(!store.admin_messages("account-b", 10).unwrap()[0].acknowledged);
+    }
 
     server
         .post(
