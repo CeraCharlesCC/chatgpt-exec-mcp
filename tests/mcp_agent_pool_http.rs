@@ -20,6 +20,10 @@ struct Server {
 
 impl Server {
     async fn new() -> Self {
+        Self::with_name_allocation(None).await
+    }
+
+    async fn with_name_allocation(allocation: Option<&str>) -> Self {
         let workspace = tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir()
@@ -29,23 +33,22 @@ impl Server {
         let webui_probe = TcpListener::bind("127.0.0.1:0").unwrap();
         let webui_address = webui_probe.local_addr().unwrap();
         drop(webui_probe);
-        std::fs::write(
-            workspace.path().join("config.json"),
-            json!({
-                "version": 1,
-                "workspace": ".",
-                "shell": "/bin/bash",
-                "output_store_dir": "outputs",
-                "child_env": {"inherit": [], "rules": []},
-                "agent_pool": {
-                    "database_path": database,
-                    "principal": PRINCIPAL,
-                    "agent_name_dictionary": ["Augustus", "Tiberius", "Livia", "Debug"]
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
+        let mut config = json!({
+            "version": 1,
+            "workspace": ".",
+            "shell": "/bin/bash",
+            "output_store_dir": "outputs",
+            "child_env": {"inherit": [], "rules": []},
+            "agent_pool": {
+                "database_path": database,
+                "principal": PRINCIPAL,
+                "agent_name_dictionary": ["Augustus", "Tiberius", "Livia", "Debug"]
+            }
+        });
+        if let Some(allocation) = allocation {
+            config["agent_pool"]["agent_name_allocation"] = json!(allocation);
+        }
+        std::fs::write(workspace.path().join("config.json"), config.to_string()).unwrap();
         let mut server = Self {
             child: None,
             workspace,
@@ -211,7 +214,21 @@ fn structured(value: &Value) -> &Value {
 
 #[tokio::test]
 async fn piggyback_agent_pool_acceptance_path() {
-    let mut server = Server::new().await;
+    agent_pool_acceptance_path(None).await;
+}
+
+#[tokio::test]
+async fn piggyback_agent_pool_round_robin_acceptance_path() {
+    agent_pool_acceptance_path(Some("round_robin")).await;
+}
+
+async fn agent_pool_acceptance_path(allocation: Option<&str>) {
+    let mut server = Server::with_name_allocation(allocation).await;
+    let rejoined_agent = if allocation == Some("round_robin") {
+        "Livia"
+    } else {
+        "Augustus"
+    };
 
     let empty = server.exec("unjoined").await;
     assert_eq!(structured(&empty), &json!({"exit_code": 0}));
@@ -505,11 +522,19 @@ async fn piggyback_agent_pool_acceptance_path() {
     assert_eq!(mixed_leave["result"]["isError"], true);
 
     let rejoined = server.send("session-a", "global", "back").await;
-    assert_eq!(structured(&rejoined)["assigned_agent"], "Augustus");
+    assert_eq!(structured(&rejoined)["assigned_agent"], rejoined_agent);
+    let resumed = server
+        .tool(
+            "pool_members",
+            json!({"pool":"Imperator"}),
+            Some("session-a"),
+        )
+        .await;
+    assert_eq!(structured(&resumed)["self_agent"], rejoined_agent);
     let _ = server.exec("session-b").await; // acknowledge the rejoin broadcast
 
     // Error results still surface unread peer messages.
-    server.send("session-b", "Augustus", "error-path").await;
+    server.send("session-b", rejoined_agent, "error-path").await;
     let errored = server
         .tool("exec_command", json!({"cmd":""}), Some("session-a"))
         .await;
@@ -522,7 +547,7 @@ async fn piggyback_agent_pool_acceptance_path() {
     // Pending inbox rows remain durable across a core restart.
     let _ = server.exec("session-a").await;
     server
-        .send("session-b", "Augustus", "survives restart")
+        .send("session-b", rejoined_agent, "survives restart")
         .await;
     server.stop();
     server.start().await;
@@ -531,6 +556,15 @@ async fn piggyback_agent_pool_acceptance_path() {
         structured(&durable)["peer_messages"][0]["message"],
         "survives restart"
     );
+    // A resumed session keeps its membership under either allocation policy.
+    for (session, agent) in [("session-a", rejoined_agent), ("session-b", "Tiberius")] {
+        let members = server
+            .tool("pool_members", json!({"pool":"Imperator"}), Some(session))
+            .await;
+        assert_eq!(structured(&members)["self_agent"], agent);
+        let continued = server.send(session, "global", "resumed").await;
+        assert!(structured(&continued).get("assigned_agent").is_none());
+    }
 }
 
 #[tokio::test]

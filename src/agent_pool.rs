@@ -15,6 +15,8 @@ use rmcp::ErrorData as McpError;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::config::AgentNameAllocation;
+
 mod coordinator;
 mod storage;
 
@@ -238,8 +240,22 @@ impl AgentPoolStore {
         lease_ttl: Duration,
         agent_names: Vec<String>,
     ) -> anyhow::Result<Self> {
+        Self::open_with_name_allocation(
+            path,
+            lease_ttl,
+            agent_names,
+            AgentNameAllocation::default(),
+        )
+    }
+
+    pub fn open_with_name_allocation(
+        path: &Path,
+        lease_ttl: Duration,
+        agent_names: Vec<String>,
+        allocation: AgentNameAllocation,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            storage: PoolStorage::open(path, lease_ttl, agent_names)?,
+            storage: PoolStorage::open(path, lease_ttl, agent_names, allocation)?,
             coordinator: PoolCoordinator::new(),
         })
     }
@@ -403,18 +419,25 @@ mod tests {
     use std::sync::Arc;
 
     fn store() -> (tempfile::TempDir, AgentPoolStore) {
+        store_with_allocation(AgentNameAllocation::default())
+    }
+
+    fn store_with_allocation(
+        allocation: AgentNameAllocation,
+    ) -> (tempfile::TempDir, AgentPoolStore) {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir()
             .unwrap();
-        let store = AgentPoolStore::open_with_names(
+        let store = AgentPoolStore::open_with_name_allocation(
             &directory.path().join("agent-pool.sqlite3"),
             Duration::from_millis(DEFAULT_TTL_MS as u64),
             ["alice", "bob", "carol", "dave"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            allocation,
         )
         .unwrap();
         (directory, store)
@@ -860,6 +883,186 @@ mod tests {
                 .assigned_agent
                 .as_deref(),
             Some("one")
+        );
+    }
+
+    #[test]
+    fn default_name_allocation_reuses_first_available_gap() {
+        let (_directory, store) = store();
+        for (session, expected) in [("a", "alice"), ("b", "bob")] {
+            assert_eq!(
+                store
+                    .send("owner", send("p", "global", "join"), Some(session))
+                    .unwrap()
+                    .assigned_agent
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+        store.send("owner", leave("p"), Some("a")).unwrap();
+        assert_eq!(
+            store
+                .send("owner", send("p", "global", "join"), Some("c"))
+                .unwrap()
+                .assigned_agent
+                .as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[test]
+    fn name_rotation_skips_earlier_gaps_and_wraps() {
+        let (_directory, store) = store_with_allocation(AgentNameAllocation::RoundRobin);
+        let assigned = |session: &str| {
+            store
+                .send("owner", send("p", "global", "join"), Some(session))
+                .unwrap()
+                .assigned_agent
+                .unwrap()
+        };
+
+        assert_eq!(assigned("a"), "alice");
+        assert_eq!(assigned("b"), "bob");
+        store.send("owner", leave("p"), Some("a")).unwrap();
+
+        // Sending from a known session must neither rebind it nor move the cursor.
+        assert!(
+            store
+                .send("owner", send("p", "global", "again"), Some("b"))
+                .unwrap()
+                .assigned_agent
+                .is_none()
+        );
+        assert_eq!(assigned("c"), "carol"); // Skips free alice.
+        assert_eq!(assigned("d"), "dave");
+        assert_eq!(assigned("e"), "alice"); // Wraps around.
+        store.send("owner", leave("p"), Some("b")).unwrap();
+        assert_eq!(assigned("f"), "bob");
+    }
+
+    #[test]
+    fn name_rotation_is_scoped_to_principal_and_pool_including_admin_sends() {
+        let (_directory, store) = store_with_allocation(AgentNameAllocation::RoundRobin);
+        let assigned = |owner: &str, pool: &str, session: &str, target: &str| {
+            store
+                .send(owner, send(pool, target, "join"), Some(session))
+                .unwrap()
+                .assigned_agent
+                .unwrap()
+        };
+        assert_eq!(assigned("owner", "p", "a", "global"), "alice");
+        assert_eq!(assigned("owner", "q", "b", "admin"), "alice");
+        assert_eq!(assigned("other", "p", "c", "global"), "alice");
+        assert_eq!(assigned("owner", "q", "d", "global"), "bob");
+        assert_eq!(assigned("owner", "p", "e", "global"), "bob");
+        assert_eq!(assigned("other", "p", "f", "global"), "bob");
+    }
+
+    #[test]
+    fn failed_first_send_does_not_advance_name_rotation() {
+        let (_directory, store) = store_with_allocation(AgentNameAllocation::RoundRobin);
+        assert_eq!(
+            store
+                .send("owner", send("p", "global", "join"), Some("a"))
+                .unwrap()
+                .assigned_agent
+                .as_deref(),
+            Some("alice")
+        );
+        store.send("owner", leave("p"), Some("a")).unwrap();
+        // This send would select bob, but the target is missing, so it rolls back.
+        assert!(
+            store
+                .send("owner", send("p", "missing", "fail"), Some("bad"))
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .send("owner", send("p", "global", "join"), Some("good"))
+                .unwrap()
+                .assigned_agent
+                .as_deref(),
+            Some("bob")
+        );
+    }
+
+    #[test]
+    fn restart_resets_rotation_without_rebinding_resumed_chat_sessions() {
+        let (directory, store) = store_with_allocation(AgentNameAllocation::RoundRobin);
+        let path = directory.path().join("agent-pool.sqlite3");
+        for (session, name) in [("chat-a", "alice"), ("chat-b", "bob")] {
+            assert_eq!(
+                store
+                    .send("owner", send("p", "global", "join"), Some(session))
+                    .unwrap()
+                    .assigned_agent
+                    .as_deref(),
+                Some(name)
+            );
+        }
+        store.send("owner", leave("p"), Some("chat-a")).unwrap();
+        assert_eq!(
+            store
+                .send("owner", send("p", "global", "join"), Some("chat-c"))
+                .unwrap()
+                .assigned_agent
+                .as_deref(),
+            Some("carol")
+        );
+        drop(store);
+
+        let resumed = AgentPoolStore::open_with_name_allocation(
+            &path,
+            Duration::from_millis(DEFAULT_TTL_MS as u64),
+            ["alice", "bob", "carol", "dave"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            AgentNameAllocation::RoundRobin,
+        )
+        .unwrap();
+        for (session, name) in [("chat-b", "bob"), ("chat-c", "carol")] {
+            // A resumed ChatGPT session keeps the SQLite membership, not a new name.
+            assert_eq!(
+                resumed
+                    .members(
+                        "owner",
+                        PoolMembersArgs {
+                            pool: "p".into(),
+                            wait_seconds: None,
+                        },
+                        Some(session),
+                    )
+                    .unwrap()
+                    .self_agent
+                    .as_deref(),
+                Some(name)
+            );
+            assert!(
+                resumed
+                    .send("owner", send("p", "global", "resume"), Some(session))
+                    .unwrap()
+                    .assigned_agent
+                    .is_none()
+            );
+        }
+        // Memory resets on restart; the first free slot wins without rebinding
+        // the two still-active sessions.
+        assert_eq!(
+            resumed
+                .send("owner", send("p", "global", "join"), Some("chat-d"))
+                .unwrap()
+                .assigned_agent
+                .as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            resumed
+                .send("owner", send("p", "global", "join"), Some("chat-e"))
+                .unwrap()
+                .assigned_agent
+                .as_deref(),
+            Some("dave")
         );
     }
 

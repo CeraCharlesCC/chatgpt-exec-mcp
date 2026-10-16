@@ -12,6 +12,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::config::AgentNameAllocation;
+
 use super::{
     ADMIN_AGENT, AdminMember, AdminMessage, AgentIdentity, MAX_NAME_CHARS, PeerMessage, PoolAction,
     PoolMembersArgs, PoolMembersResult, PoolSendArgs, PoolSendResult, invalid, now_ms,
@@ -28,6 +30,10 @@ pub(super) struct PoolStorage {
     connection: Mutex<Connection>,
     lease_ttl_ms: i64,
     agent_names: Arc<[String]>,
+    name_allocation: AgentNameAllocation,
+    // Last successfully assigned dictionary index for each account/pool.
+    // Memberships are durable, but the rotation itself resets on core restart.
+    name_cursors: Mutex<HashMap<(String, String), usize>>,
 }
 
 pub(super) struct MembersState {
@@ -52,6 +58,7 @@ impl PoolStorage {
         path: &Path,
         lease_ttl: Duration,
         agent_names: Vec<String>,
+        name_allocation: AgentNameAllocation,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !agent_names.is_empty(),
@@ -183,6 +190,8 @@ impl PoolStorage {
             connection: Mutex::new(connection),
             lease_ttl_ms,
             agent_names: agent_names.into(),
+            name_allocation,
+            name_cursors: Mutex::new(HashMap::new()),
         })
     }
 
@@ -794,10 +803,22 @@ impl PoolStorage {
             .optional()
             .map_err(|_| storage_error())?;
 
-        let (sender_id, sender, assigned_agent) = match bound {
-            Some((member_id, agent)) => (member_id, agent, None),
+        let cursor_key = (principal.to_owned(), pool.to_owned());
+        // Advance rotation only after a successful first send commits.
+        let mut name_cursors =
+            if bound.is_none() && self.name_allocation == AgentNameAllocation::RoundRobin {
+                Some(self.name_cursors.lock().map_err(|_| storage_error())?)
+            } else {
+                None
+            };
+        let (sender_id, sender, assigned_agent, allocated_index) = match bound {
+            Some((member_id, agent)) => (member_id, agent, None, None),
             None => {
-                let agent = self.allocate_agent_name(&transaction, principal, pool)?;
+                let last_index = name_cursors
+                    .as_ref()
+                    .and_then(|cursors| cursors.get(&cursor_key).copied());
+                let (index, agent) =
+                    self.allocate_agent_name(&transaction, principal, pool, last_index)?;
                 transaction
                     .execute(
                         "INSERT INTO members(principal,pool,agent,session,expires,last_seen,generation)
@@ -813,7 +834,12 @@ impl PoolStorage {
                         ],
                     )
                     .map_err(|_| agent_conflict())?;
-                (transaction.last_insert_rowid(), agent.clone(), Some(agent))
+                (
+                    transaction.last_insert_rowid(),
+                    agent.clone(),
+                    Some(agent),
+                    Some(index),
+                )
             }
         };
 
@@ -851,6 +877,9 @@ impl PoolStorage {
                 )
                 .map_err(|_| storage_error())?;
             transaction.commit().map_err(|_| storage_error())?;
+            if let (Some(cursors), Some(index)) = (name_cursors.as_mut(), allocated_index) {
+                cursors.insert(cursor_key, index);
+            }
             return Ok(PoolSendResult {
                 assigned_agent,
                 message_id: Some(message_id),
@@ -881,6 +910,9 @@ impl PoolStorage {
             &targets,
         )?;
         transaction.commit().map_err(|_| storage_error())?;
+        if let (Some(cursors), Some(index)) = (name_cursors.as_mut(), allocated_index) {
+            cursors.insert(cursor_key, index);
+        }
         Ok(PoolSendResult {
             assigned_agent,
             message_id,
@@ -894,8 +926,12 @@ impl PoolStorage {
         transaction: &rusqlite::Transaction<'_>,
         principal: &str,
         pool: &str,
-    ) -> Result<String, McpError> {
-        for candidate in self.agent_names.iter() {
+        last_index: Option<usize>,
+    ) -> Result<(usize, String), McpError> {
+        let start = last_index.map_or(0, |index| (index + 1) % self.agent_names.len());
+        for offset in 0..self.agent_names.len() {
+            let index = (start + offset) % self.agent_names.len();
+            let candidate = &self.agent_names[index];
             let occupied = transaction
                 .query_row(
                     "SELECT 1 FROM members WHERE principal=?1 AND pool=?2 AND agent=?3",
@@ -906,7 +942,7 @@ impl PoolStorage {
                 .map_err(|_| storage_error())?
                 .is_some();
             if !occupied {
-                return Ok(candidate.clone());
+                return Ok((index, candidate.clone()));
             }
         }
         Err(invalid("agent name dictionary is exhausted for this pool"))

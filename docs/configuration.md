@@ -82,7 +82,8 @@ It requires `database_path` and `principal`.
     "database_path": "/private/state/chatgpt-exec-mcp/agent-pool.sqlite3",
     "principal": "chatgpt-owner",
     "membership_ttl_seconds": 86400,
-    "agent_name_dictionary": ["Caesar", "Augustus", "Tiberius", "Caligula"]
+    "agent_name_dictionary": ["Caesar", "Augustus", "Tiberius", "Caligula"],
+    "agent_name_allocation": "first_available"
   }
 }
 ```
@@ -101,13 +102,19 @@ use a separate instance for each account and do not share its connector.
 Tool activity renews membership. Inactive memberships and their pending messages
 are removed after this interval.
 
-`agent_name_dictionary` is optional. It is an ordered, nonempty list of unique
-agent names; the first currently unused name in that pool is assigned on a
-chat's first `pool_send`. Names must contain 1–128 characters, have no control
-characters or surrounding whitespace, and cannot be the reserved names
-`global` or `admin`. If omitted, the built-in dictionary uses a sequence of
-Roman rulers beginning with `Caesar`, `Augustus`, and `Tiberius`. Exhausting the
-dictionary rejects a new membership until a name is freed by expiry or
+`agent_name_dictionary` is an ordered, nonempty list of unique names. Names must
+contain 1–128 characters, without control characters or surrounding whitespace;
+`global` and `admin` are reserved. The default dictionary lists Roman rulers,
+starting with `Caesar`, `Augustus`, and `Tiberius`.
+
+`agent_name_allocation` controls name assignment on a chat's first `pool_send`:
+
+- `first_available` (default): use the first unused name in dictionary order.
+- `round_robin`: start after the last assigned name in the same account/pool,
+  wrapping around and skipping occupied names. Rotation resets on core restart.
+
+Existing memberships keep their names under either policy. When all names are
+in use, new memberships are rejected until a member expires or leaves with
 `pool_send(pool=..., action="leave")`.
 
 ## Unix Streamable HTTP

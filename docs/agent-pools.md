@@ -23,10 +23,11 @@ pool_send(pool="project", target="global", message="Ready for review")
 pool_send(pool="project", action="leave")
 ```
 
-The first send from a chat joins the pool and assigns an agent name. Later calls
-identify that membership through `_meta["openai/session"]`.
-The first send returns `assigned_agent`; after joining, `pool_members` returns
-the caller's name as `self_agent`.
+The first send from a chat joins the pool and returns its name as `assigned_agent`.
+By default, names are assigned in dictionary order, reusing the first available
+name. Set `agent_name_allocation` to `round_robin` to rotate through the dictionary.
+Later calls identify the membership through `_meta["openai/session"]`, and
+`pool_members` returns the caller's name as `self_agent`.
 
 ## Message delivery
 

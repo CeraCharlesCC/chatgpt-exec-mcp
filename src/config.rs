@@ -34,6 +34,15 @@ pub struct AgentPoolConfig {
     pub principal: String,
     pub membership_ttl: Duration,
     pub agent_name_dictionary: Vec<String>,
+    pub agent_name_allocation: AgentNameAllocation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentNameAllocation {
+    #[default]
+    FirstAvailable,
+    RoundRobin,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +54,8 @@ struct FileAgentPoolConfig {
     membership_ttl_seconds: u64,
     #[serde(default = "default_agent_name_dictionary")]
     agent_name_dictionary: Vec<String>,
+    #[serde(default)]
+    agent_name_allocation: AgentNameAllocation,
 }
 
 fn present_agent_pool<'de, D: serde::Deserializer<'de>>(
@@ -331,6 +342,7 @@ impl Config {
                 principal: agent_pool.principal,
                 membership_ttl: Duration::from_secs(agent_pool.membership_ttl_seconds),
                 agent_name_dictionary: agent_pool.agent_name_dictionary,
+                agent_name_allocation: agent_pool.agent_name_allocation,
             })
         }).transpose()?;
         let config = Self {

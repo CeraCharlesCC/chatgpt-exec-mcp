@@ -137,6 +137,9 @@ fn agent_pool_requires_an_explicit_principal_and_database_path() {
         json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":604801}),
         json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":null}),
         json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":null}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_allocation":null}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_allocation":"unknown"}),
+        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_allocation":true}),
         json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":[]}),
         json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["Caesar", "Caesar"]}),
         json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["global"]}),
@@ -168,6 +171,10 @@ fn agent_pool_requires_an_explicit_principal_and_database_path() {
         dir.path().join("agent_pool.sqlite3")
     );
     assert_eq!(agent_pool.agent_name_dictionary.first().unwrap(), "Caesar");
+    assert_eq!(
+        agent_pool.agent_name_allocation,
+        chatgpt_exec_mcp::config::AgentNameAllocation::FirstAvailable
+    );
     assert!(
         !agent_pool.database_path.exists(),
         "validation must not create the database"
@@ -198,6 +205,22 @@ fn agent_pool_requires_an_explicit_principal_and_database_path() {
         settings.agent_pool.unwrap().agent_name_dictionary,
         ["Ada", "Grace", "Linus"]
     );
+
+    for (value, expected) in [
+        (
+            "first_available",
+            chatgpt_exec_mcp::config::AgentNameAllocation::FirstAvailable,
+        ),
+        (
+            "round_robin",
+            chatgpt_exec_mcp::config::AgentNameAllocation::RoundRobin,
+        ),
+    ] {
+        custom_names["agent_pool"]["agent_name_allocation"] = json!(value);
+        std::fs::write(&path, custom_names.to_string()).unwrap();
+        let settings = chatgpt_exec_mcp::Config::load(&path).unwrap();
+        assert_eq!(settings.agent_pool.unwrap().agent_name_allocation, expected);
+    }
 }
 
 #[test]
