@@ -15,6 +15,8 @@
 .clear-button{position:absolute;top:34px;left:48px;width:92px;height:92px;border:5px solid #161b23;border-radius:50%;padding:0;background:linear-gradient(145deg,#ec665e,#c33530 65%,#9c2423);color:#fff0ec;font-size:14px;font-weight:750;letter-spacing:.1em;text-shadow:0 -1px 1px #7c2421;box-shadow:0 5px 0 #691b19,0 7px 0 4px #0e1218,0 10px 12px rgba(0,0,0,.5),inset 0 2px 2px rgba(255,255,255,.4);transition:transform .1s,box-shadow .1s}.clear-button:hover{background:linear-gradient(145deg,#f4776e,#d03b34 65%,#a42825);border-color:#161b23}.clear-button:disabled{color:#fff0ec;opacity:1}.clear-button:active,.clear-control.pressing .clear-button{transform:translateY(4px);box-shadow:0 1px 0 #691b19,0 3px 0 4px #0e1218,0 4px 6px rgba(0,0,0,.5),inset 0 2px 3px rgba(0,0,0,.2)}
 .clear-cover{position:absolute;top:18px;left:18px;width:152px;height:120px;padding:0;border:1px solid #c48754;border-radius:6px 6px 10px 10px;background:linear-gradient(145deg,rgba(223,147,83,.45),rgba(92,47,26,.88));box-shadow:inset 0 0 0 3px rgba(227,166,109,.15),inset 0 1px 0 rgba(255,220,179,.5),0 6px 8px rgba(0,0,0,.45);transform-origin:50% 0;transition:transform .35s cubic-bezier(.2,.7,.2,1),box-shadow .35s;transform-style:preserve-3d}.clear-cover:hover{border-color:#e4ab74;background:linear-gradient(145deg,rgba(235,164,97,.5),rgba(107,57,31,.88))}.cover-open .clear-cover{transform:rotateX(112deg);box-shadow:inset 0 0 0 3px rgba(227,166,109,.15),0 3px 5px rgba(0,0,0,.3)}.cover-label{position:absolute;left:0;right:0;bottom:35px;color:#ffe2bc;font-size:10px;font-weight:700;letter-spacing:.12em;text-shadow:0 1px 2px #382115;transition:opacity .2s}.cover-open .cover-label{opacity:0}.cover-grip{position:absolute;width:46px;height:7px;bottom:16px;left:52px;border-top:2px solid rgba(255,221,184,.5);border-bottom:2px solid rgba(255,221,184,.5);border-radius:1px}.menu-history .clear-hint{min-height:18px;text-align:center;font-size:11px}.toast{z-index:40}
 @media(prefers-reduced-motion:reduce){.console-menu,.menu-backdrop,.menu-toggle span,.clear-cover,.cover-label,.clear-button,.toast{transition:none}}
+.viewer-controls{display:flex;align-items:center;flex-wrap:wrap;gap:14px;padding:8px 10px;border-bottom:1px solid var(--border);background:var(--panel2)}.viewer-controls label{display:flex;align-items:center;gap:5px;cursor:pointer}.viewer-controls input{width:auto;margin:0;accent-color:var(--accent)}.viewer-controls label:has(input:disabled){opacity:.5;cursor:default}
+.code-block{min-width:0;border-top:1px solid rgba(48,54,61,.5)}.code-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;color:var(--muted);font-size:11px}.code-actions{display:flex;gap:5px}.code-actions button{padding:2px 6px;font-size:11px}.events .code-block pre{white-space:pre;word-break:normal;overflow-wrap:normal;tab-size:4}.events.wrap .code-block pre{white-space:pre-wrap;overflow-wrap:anywhere}.events .code-block.expanded pre{max-height:none}.code-block code{font:inherit}.tool-meta{display:flex;flex-wrap:wrap;gap:6px;padding:8px 10px;font-size:11px}.tool-meta .failed,.tool-error .code-head{color:#ffb4b4}.tool-error{border-left:3px solid var(--bad);background:rgba(248,81,73,.05)}.tool-name{padding:8px 10px;font:600 12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.token.property{color:#79c0ff}.token.string{color:#a5d6ff}.token.number{color:#d2a8ff}.token.keyword,.token.boolean,.token.null{color:#ff7b72}.token.comment{color:#8b949e}.token.variable,.token.function,.token.builtin{color:#ffa657}.tool-group>summary{padding:8px 10px;cursor:pointer;overflow-wrap:anywhere}.tool-group>summary .chip{margin-left:6px}.logmeta{overflow-wrap:anywhere}
 </style>
 </head>
 <body>
@@ -22,7 +24,7 @@
   <header class="top"><div class="brand">Exec MCP <span id="connectionStatus" class="status connection-status" data-connection="connecting" role="status" aria-label="Connecting" title="Connecting"><span class="dot" aria-hidden="true"></span></span></div><button id="menuToggle" class="menu-toggle" aria-label="Open console menu" aria-expanded="false" aria-controls="consoleMenu"><span></span><span></span><span></span></button></header>
   <main class="grid">
     <aside class="panel"><h2>Agent pools</h2><div class="section" id="pools"><div class="empty">No active agents</div></div></aside>
-    <section class="panel activity-panel"><div class="tabs"><button class="tab active" data-view="activity">Activity</button><button class="tab" data-view="logs">MCP log</button></div><div class="filters"><div class="filter-field"><label for="activityFilter">Show</label><select id="activityFilter"><option value="all">All activity</option><option value="messages">Messages only</option></select></div><div class="filter-field"><label for="activityPool">Agent pool</label><select id="activityPool"><option value="">All pools</option></select></div><div class="filter-field"><label for="activityAgent">Agent</label><select id="activityAgent"><option value="">All agents</option></select></div><div class="filter-field"><label for="activitySession">Chat session (openai/session)</label><select id="activitySession"><option value="">All sessions</option></select></div><span class="filter-count" id="filterCount" aria-live="polite"></span></div><div class="events" id="events"></div></section>
+    <section class="panel activity-panel"><div class="tabs"><button class="tab active" data-view="activity">Activity</button><button class="tab" data-view="logs">MCP log</button></div><div class="filters"><div class="filter-field"><label for="activityFilter">Show</label><select id="activityFilter"><option value="all">All activity</option><option value="messages">Messages only</option></select></div><div class="filter-field"><label for="activityPool">Agent pool</label><select id="activityPool"><option value="">All pools</option></select></div><div class="filter-field"><label for="activityAgent">Agent</label><select id="activityAgent"><option value="">All agents</option></select></div><div class="filter-field"><label for="activitySession">Chat session (openai/session)</label><select id="activitySession"><option value="">All sessions</option></select></div><span class="filter-count" id="filterCount" aria-live="polite"></span></div><div class="viewer-controls" aria-label="Log display"><label><input type="checkbox" id="formatLogs" checked>Format</label><label><input type="checkbox" id="wrapLogs">Wrap</label><label><input type="checkbox" id="groupTools">Group tools</label></div><div class="events" id="events"></div></section>
     <aside class="panel right"><div><h2>Send as admin</h2><div class="section"><div class="form-row"><label>Pool</label><select id="poolSelect"></select></div><div class="form-row"><label>Target</label><select id="targetSelect"></select></div><div class="form-row"><label>Message</label><textarea id="message" placeholder="Message delivered on the agent's next tool call"></textarea></div><button id="send" class="send-btn">Send message</button></div></div><div><h2>Admin inbox</h2><div class="section inbox" id="inbox"><div class="empty">No messages</div></div></div></aside>
   </main>
 </div>
@@ -46,7 +48,39 @@
 </div>
 <div id="toast" class="toast" role="status"></div>
 <script>
-const state = {data: null, view: 'activity', filter: 'all', pool: '', agent: '', session: '', refreshing: false, refreshEpoch: 0, clearing: false, acking: new Set()};
+/* Prism.js 1.30.0 — core, JSON and Bash.
+MIT LICENSE
+
+Copyright (c) 2012 Lea Verou
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+*/
+window.Prism = {manual: true};
+/* prism-core.min.js */
+var _self="undefined"!=typeof window?window:"undefined"!=typeof WorkerGlobalScope&&self instanceof WorkerGlobalScope?self:{},Prism=function(e){var n=/(?:^|\s)lang(?:uage)?-([\w-]+)(?=\s|$)/i,t=0,r={},a={manual:e.Prism&&e.Prism.manual,disableWorkerMessageHandler:e.Prism&&e.Prism.disableWorkerMessageHandler,util:{encode:function e(n){return n instanceof i?new i(n.type,e(n.content),n.alias):Array.isArray(n)?n.map(e):n.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/\u00a0/g," ")},type:function(e){return Object.prototype.toString.call(e).slice(8,-1)},objId:function(e){return e.__id||Object.defineProperty(e,"__id",{value:++t}),e.__id},clone:function e(n,t){var r,i;switch(t=t||{},a.util.type(n)){case"Object":if(i=a.util.objId(n),t[i])return t[i];for(var l in r={},t[i]=r,n)n.hasOwnProperty(l)&&(r[l]=e(n[l],t));return r;case"Array":return i=a.util.objId(n),t[i]?t[i]:(r=[],t[i]=r,n.forEach((function(n,a){r[a]=e(n,t)})),r);default:return n}},getLanguage:function(e){for(;e;){var t=n.exec(e.className);if(t)return t[1].toLowerCase();e=e.parentElement}return"none"},setLanguage:function(e,t){e.className=e.className.replace(RegExp(n,"gi"),""),e.classList.add("language-"+t)},currentScript:function(){if("undefined"==typeof document)return null;if(document.currentScript&&"SCRIPT"===document.currentScript.tagName)return document.currentScript;try{throw new Error}catch(r){var e=(/at [^(\r\n]*\((.*):[^:]+:[^:]+\)$/i.exec(r.stack)||[])[1];if(e){var n=document.getElementsByTagName("script");for(var t in n)if(n[t].src==e)return n[t]}return null}},isActive:function(e,n,t){for(var r="no-"+n;e;){var a=e.classList;if(a.contains(n))return!0;if(a.contains(r))return!1;e=e.parentElement}return!!t}},languages:{plain:r,plaintext:r,text:r,txt:r,extend:function(e,n){var t=a.util.clone(a.languages[e]);for(var r in n)t[r]=n[r];return t},insertBefore:function(e,n,t,r){var i=(r=r||a.languages)[e],l={};for(var o in i)if(i.hasOwnProperty(o)){if(o==n)for(var s in t)t.hasOwnProperty(s)&&(l[s]=t[s]);t.hasOwnProperty(o)||(l[o]=i[o])}var u=r[e];return r[e]=l,a.languages.DFS(a.languages,(function(n,t){t===u&&n!=e&&(this[n]=l)})),l},DFS:function e(n,t,r,i){i=i||{};var l=a.util.objId;for(var o in n)if(n.hasOwnProperty(o)){t.call(n,o,n[o],r||o);var s=n[o],u=a.util.type(s);"Object"!==u||i[l(s)]?"Array"!==u||i[l(s)]||(i[l(s)]=!0,e(s,t,o,i)):(i[l(s)]=!0,e(s,t,null,i))}}},plugins:{},highlightAll:function(e,n){a.highlightAllUnder(document,e,n)},highlightAllUnder:function(e,n,t){var r={callback:t,container:e,selector:'code[class*="language-"], [class*="language-"] code, code[class*="lang-"], [class*="lang-"] code'};a.hooks.run("before-highlightall",r),r.elements=Array.prototype.slice.apply(r.container.querySelectorAll(r.selector)),a.hooks.run("before-all-elements-highlight",r);for(var i,l=0;i=r.elements[l++];)a.highlightElement(i,!0===n,r.callback)},highlightElement:function(n,t,r){var i=a.util.getLanguage(n),l=a.languages[i];a.util.setLanguage(n,i);var o=n.parentElement;o&&"pre"===o.nodeName.toLowerCase()&&a.util.setLanguage(o,i);var s={element:n,language:i,grammar:l,code:n.textContent};function u(e){s.highlightedCode=e,a.hooks.run("before-insert",s),s.element.innerHTML=s.highlightedCode,a.hooks.run("after-highlight",s),a.hooks.run("complete",s),r&&r.call(s.element)}if(a.hooks.run("before-sanity-check",s),(o=s.element.parentElement)&&"pre"===o.nodeName.toLowerCase()&&!o.hasAttribute("tabindex")&&o.setAttribute("tabindex","0"),!s.code)return a.hooks.run("complete",s),void(r&&r.call(s.element));if(a.hooks.run("before-highlight",s),s.grammar)if(t&&e.Worker){var c=new Worker(a.filename);c.onmessage=function(e){u(e.data)},c.postMessage(JSON.stringify({language:s.language,code:s.code,immediateClose:!0}))}else u(a.highlight(s.code,s.grammar,s.language));else u(a.util.encode(s.code))},highlight:function(e,n,t){var r={code:e,grammar:n,language:t};if(a.hooks.run("before-tokenize",r),!r.grammar)throw new Error('The language "'+r.language+'" has no grammar.');return r.tokens=a.tokenize(r.code,r.grammar),a.hooks.run("after-tokenize",r),i.stringify(a.util.encode(r.tokens),r.language)},tokenize:function(e,n){var t=n.rest;if(t){for(var r in t)n[r]=t[r];delete n.rest}var a=new s;return u(a,a.head,e),o(e,a,n,a.head,0),function(e){for(var n=[],t=e.head.next;t!==e.tail;)n.push(t.value),t=t.next;return n}(a)},hooks:{all:{},add:function(e,n){var t=a.hooks.all;t[e]=t[e]||[],t[e].push(n)},run:function(e,n){var t=a.hooks.all[e];if(t&&t.length)for(var r,i=0;r=t[i++];)r(n)}},Token:i};function i(e,n,t,r){this.type=e,this.content=n,this.alias=t,this.length=0|(r||"").length}function l(e,n,t,r){e.lastIndex=n;var a=e.exec(t);if(a&&r&&a[1]){var i=a[1].length;a.index+=i,a[0]=a[0].slice(i)}return a}function o(e,n,t,r,s,g){for(var f in t)if(t.hasOwnProperty(f)&&t[f]){var h=t[f];h=Array.isArray(h)?h:[h];for(var d=0;d<h.length;++d){if(g&&g.cause==f+","+d)return;var v=h[d],p=v.inside,m=!!v.lookbehind,y=!!v.greedy,k=v.alias;if(y&&!v.pattern.global){var x=v.pattern.toString().match(/[imsuy]*$/)[0];v.pattern=RegExp(v.pattern.source,x+"g")}for(var b=v.pattern||v,w=r.next,A=s;w!==n.tail&&!(g&&A>=g.reach);A+=w.value.length,w=w.next){var P=w.value;if(n.length>e.length)return;if(!(P instanceof i)){var E,S=1;if(y){if(!(E=l(b,A,e,m))||E.index>=e.length)break;var L=E.index,O=E.index+E[0].length,C=A;for(C+=w.value.length;L>=C;)C+=(w=w.next).value.length;if(A=C-=w.value.length,w.value instanceof i)continue;for(var j=w;j!==n.tail&&(C<O||"string"==typeof j.value);j=j.next)S++,C+=j.value.length;S--,P=e.slice(A,C),E.index-=A}else if(!(E=l(b,0,P,m)))continue;L=E.index;var N=E[0],_=P.slice(0,L),M=P.slice(L+N.length),W=A+P.length;g&&W>g.reach&&(g.reach=W);var I=w.prev;if(_&&(I=u(n,I,_),A+=_.length),c(n,I,S),w=u(n,I,new i(f,p?a.tokenize(N,p):N,k,N)),M&&u(n,w,M),S>1){var T={cause:f+","+d,reach:W};o(e,n,t,w.prev,A,T),g&&T.reach>g.reach&&(g.reach=T.reach)}}}}}}function s(){var e={value:null,prev:null,next:null},n={value:null,prev:e,next:null};e.next=n,this.head=e,this.tail=n,this.length=0}function u(e,n,t){var r=n.next,a={value:t,prev:n,next:r};return n.next=a,r.prev=a,e.length++,a}function c(e,n,t){for(var r=n.next,a=0;a<t&&r!==e.tail;a++)r=r.next;n.next=r,r.prev=n,e.length-=a}if(e.Prism=a,i.stringify=function e(n,t){if("string"==typeof n)return n;if(Array.isArray(n)){var r="";return n.forEach((function(n){r+=e(n,t)})),r}var i={type:n.type,content:e(n.content,t),tag:"span",classes:["token",n.type],attributes:{},language:t},l=n.alias;l&&(Array.isArray(l)?Array.prototype.push.apply(i.classes,l):i.classes.push(l)),a.hooks.run("wrap",i);var o="";for(var s in i.attributes)o+=" "+s+'="'+(i.attributes[s]||"").replace(/"/g,"&quot;")+'"';return"<"+i.tag+' class="'+i.classes.join(" ")+'"'+o+">"+i.content+"</"+i.tag+">"},!e.document)return e.addEventListener?(a.disableWorkerMessageHandler||e.addEventListener("message",(function(n){var t=JSON.parse(n.data),r=t.language,i=t.code,l=t.immediateClose;e.postMessage(a.highlight(i,a.languages[r],r)),l&&e.close()}),!1),a):a;var g=a.util.currentScript();function f(){a.manual||a.highlightAll()}if(g&&(a.filename=g.src,g.hasAttribute("data-manual")&&(a.manual=!0)),!a.manual){var h=document.readyState;"loading"===h||"interactive"===h&&g&&g.defer?document.addEventListener("DOMContentLoaded",f):window.requestAnimationFrame?window.requestAnimationFrame(f):window.setTimeout(f,16)}return a}(_self);"undefined"!=typeof module&&module.exports&&(module.exports=Prism),"undefined"!=typeof global&&(global.Prism=Prism);
+/* prism-json.min.js */
+Prism.languages.json={property:{pattern:/(^|[^\\])"(?:\\.|[^\\"\r\n])*"(?=\s*:)/,lookbehind:!0,greedy:!0},string:{pattern:/(^|[^\\])"(?:\\.|[^\\"\r\n])*"(?!\s*:)/,lookbehind:!0,greedy:!0},comment:{pattern:/\/\/.*|\/\*[\s\S]*?(?:\*\/|$)/,greedy:!0},number:/-?\b\d+(?:\.\d+)?(?:e[+-]?\d+)?\b/i,punctuation:/[{}[\],]/,operator:/:/,boolean:/\b(?:false|true)\b/,null:{pattern:/\bnull\b/,alias:"keyword"}},Prism.languages.webmanifest=Prism.languages.json;
+/* prism-bash.min.js */
+!function(e){var t="\\b(?:BASH|BASHOPTS|BASH_ALIASES|BASH_ARGC|BASH_ARGV|BASH_CMDS|BASH_COMPLETION_COMPAT_DIR|BASH_LINENO|BASH_REMATCH|BASH_SOURCE|BASH_VERSINFO|BASH_VERSION|COLORTERM|COLUMNS|COMP_WORDBREAKS|DBUS_SESSION_BUS_ADDRESS|DEFAULTS_PATH|DESKTOP_SESSION|DIRSTACK|DISPLAY|EUID|GDMSESSION|GDM_LANG|GNOME_KEYRING_CONTROL|GNOME_KEYRING_PID|GPG_AGENT_INFO|GROUPS|HISTCONTROL|HISTFILE|HISTFILESIZE|HISTSIZE|HOME|HOSTNAME|HOSTTYPE|IFS|INSTANCE|JOB|LANG|LANGUAGE|LC_ADDRESS|LC_ALL|LC_IDENTIFICATION|LC_MEASUREMENT|LC_MONETARY|LC_NAME|LC_NUMERIC|LC_PAPER|LC_TELEPHONE|LC_TIME|LESSCLOSE|LESSOPEN|LINES|LOGNAME|LS_COLORS|MACHTYPE|MAILCHECK|MANDATORY_PATH|NO_AT_BRIDGE|OLDPWD|OPTERR|OPTIND|ORBIT_SOCKETDIR|OSTYPE|PAPERSIZE|PATH|PIPESTATUS|PPID|PS1|PS2|PS3|PS4|PWD|RANDOM|REPLY|SECONDS|SELINUX_INIT|SESSION|SESSIONTYPE|SESSION_MANAGER|SHELL|SHELLOPTS|SHLVL|SSH_AUTH_SOCK|TERM|UID|UPSTART_EVENTS|UPSTART_INSTANCE|UPSTART_JOB|UPSTART_SESSION|USER|WINDOWID|XAUTHORITY|XDG_CONFIG_DIRS|XDG_CURRENT_DESKTOP|XDG_DATA_DIRS|XDG_GREETER_DATA_DIR|XDG_MENU_PREFIX|XDG_RUNTIME_DIR|XDG_SEAT|XDG_SEAT_PATH|XDG_SESSION_DESKTOP|XDG_SESSION_ID|XDG_SESSION_PATH|XDG_SESSION_TYPE|XDG_VTNR|XMODIFIERS)\\b",a={pattern:/(^(["']?)\w+\2)[ \t]+\S.*/,lookbehind:!0,alias:"punctuation",inside:null},n={bash:a,environment:{pattern:RegExp("\\$"+t),alias:"constant"},variable:[{pattern:/\$?\(\([\s\S]+?\)\)/,greedy:!0,inside:{variable:[{pattern:/(^\$\(\([\s\S]+)\)\)/,lookbehind:!0},/^\$\(\(/],number:/\b0x[\dA-Fa-f]+\b|(?:\b\d+(?:\.\d*)?|\B\.\d+)(?:[Ee]-?\d+)?/,operator:/--|\+\+|\*\*=?|<<=?|>>=?|&&|\|\||[=!+\-*/%<>^&|]=?|[?~:]/,punctuation:/\(\(?|\)\)?|,|;/}},{pattern:/\$\((?:\([^)]+\)|[^()])+\)|`[^`]+`/,greedy:!0,inside:{variable:/^\$\(|^`|\)$|`$/}},{pattern:/\$\{[^}]+\}/,greedy:!0,inside:{operator:/:[-=?+]?|[!\/]|##?|%%?|\^\^?|,,?/,punctuation:/[\[\]]/,environment:{pattern:RegExp("(\\{)"+t),lookbehind:!0,alias:"constant"}}},/\$(?:\w+|[#?*!@$])/],entity:/\\(?:[abceEfnrtv\\"]|O?[0-7]{1,3}|U[0-9a-fA-F]{8}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{1,2})/};e.languages.bash={shebang:{pattern:/^#!\s*\/.*/,alias:"important"},comment:{pattern:/(^|[^"{\\$])#.*/,lookbehind:!0},"function-name":[{pattern:/(\bfunction\s+)[\w-]+(?=(?:\s*\(?:\s*\))?\s*\{)/,lookbehind:!0,alias:"function"},{pattern:/\b[\w-]+(?=\s*\(\s*\)\s*\{)/,alias:"function"}],"for-or-select":{pattern:/(\b(?:for|select)\s+)\w+(?=\s+in\s)/,alias:"variable",lookbehind:!0},"assign-left":{pattern:/(^|[\s;|&]|[<>]\()\w+(?:\.\w+)*(?=\+?=)/,inside:{environment:{pattern:RegExp("(^|[\\s;|&]|[<>]\\()"+t),lookbehind:!0,alias:"constant"}},alias:"variable",lookbehind:!0},parameter:{pattern:/(^|\s)-{1,2}(?:\w+:[+-]?)?\w+(?:\.\w+)*(?=[=\s]|$)/,alias:"variable",lookbehind:!0},string:[{pattern:/((?:^|[^<])<<-?\s*)(\w+)\s[\s\S]*?(?:\r?\n|\r)\2/,lookbehind:!0,greedy:!0,inside:n},{pattern:/((?:^|[^<])<<-?\s*)(["'])(\w+)\2\s[\s\S]*?(?:\r?\n|\r)\3/,lookbehind:!0,greedy:!0,inside:{bash:a}},{pattern:/(^|[^\\](?:\\\\)*)"(?:\\[\s\S]|\$\([^)]+\)|\$(?!\()|`[^`]+`|[^"\\`$])*"/,lookbehind:!0,greedy:!0,inside:n},{pattern:/(^|[^$\\])'[^']*'/,lookbehind:!0,greedy:!0},{pattern:/\$'(?:[^'\\]|\\[\s\S])*'/,greedy:!0,inside:{entity:n.entity}}],environment:{pattern:RegExp("\\$?"+t),alias:"constant"},variable:n.variable,function:{pattern:/(^|[\s;|&]|[<>]\()(?:add|apropos|apt|apt-cache|apt-get|aptitude|aspell|automysqlbackup|awk|basename|bash|bc|bconsole|bg|bzip2|cal|cargo|cat|cfdisk|chgrp|chkconfig|chmod|chown|chroot|cksum|clear|cmp|column|comm|composer|cp|cron|crontab|csplit|curl|cut|date|dc|dd|ddrescue|debootstrap|df|diff|diff3|dig|dir|dircolors|dirname|dirs|dmesg|docker|docker-compose|du|egrep|eject|env|ethtool|expand|expect|expr|fdformat|fdisk|fg|fgrep|file|find|fmt|fold|format|free|fsck|ftp|fuser|gawk|git|gparted|grep|groupadd|groupdel|groupmod|groups|grub-mkconfig|gzip|halt|head|hg|history|host|hostname|htop|iconv|id|ifconfig|ifdown|ifup|import|install|ip|java|jobs|join|kill|killall|less|link|ln|locate|logname|logrotate|look|lpc|lpr|lprint|lprintd|lprintq|lprm|ls|lsof|lynx|make|man|mc|mdadm|mkconfig|mkdir|mke2fs|mkfifo|mkfs|mkisofs|mknod|mkswap|mmv|more|most|mount|mtools|mtr|mutt|mv|nano|nc|netstat|nice|nl|node|nohup|notify-send|npm|nslookup|op|open|parted|passwd|paste|pathchk|ping|pkill|pnpm|podman|podman-compose|popd|pr|printcap|printenv|ps|pushd|pv|quota|quotacheck|quotactl|ram|rar|rcp|reboot|remsync|rename|renice|rev|rm|rmdir|rpm|rsync|scp|screen|sdiff|sed|sendmail|seq|service|sftp|sh|shellcheck|shuf|shutdown|sleep|slocate|sort|split|ssh|stat|strace|su|sudo|sum|suspend|swapon|sync|sysctl|tac|tail|tar|tee|time|timeout|top|touch|tr|traceroute|tsort|tty|umount|uname|unexpand|uniq|units|unrar|unshar|unzip|update-grub|uptime|useradd|userdel|usermod|users|uudecode|uuencode|v|vcpkg|vdir|vi|vim|virsh|vmstat|wait|watch|wc|wget|whereis|which|who|whoami|write|xargs|xdg-open|yarn|yes|zenity|zip|zsh|zypper)(?=$|[)\s;|&])/,lookbehind:!0},keyword:{pattern:/(^|[\s;|&]|[<>]\()(?:case|do|done|elif|else|esac|fi|for|function|if|in|select|then|until|while)(?=$|[)\s;|&])/,lookbehind:!0},builtin:{pattern:/(^|[\s;|&]|[<>]\()(?:\.|:|alias|bind|break|builtin|caller|cd|command|continue|declare|echo|enable|eval|exec|exit|export|getopts|hash|help|let|local|logout|mapfile|printf|pwd|read|readarray|readonly|return|set|shift|shopt|source|test|times|trap|type|typeset|ulimit|umask|unalias|unset)(?=$|[)\s;|&])/,lookbehind:!0,alias:"class-name"},boolean:{pattern:/(^|[\s;|&]|[<>]\()(?:false|true)(?=$|[)\s;|&])/,lookbehind:!0},"file-descriptor":{pattern:/\B&\d\b/,alias:"important"},operator:{pattern:/\d?<>|>\||\+=|=[=~]?|!=?|<<[<-]?|[&\d]?>>|\d[<>]&?|[<>][&=]?|&[>&]?|\|[&|]?/,inside:{"file-descriptor":{pattern:/^\d/,alias:"important"}}},punctuation:/\$?\(\(?|\)\)?|\.\.|[{}[\];\\]/,number:{pattern:/(^|\s)(?:[1-9]\d*|0)(?:[.,]\d+)?\b/,lookbehind:!0}},a.inside=e.languages.bash;for(var s=["comment","function-name","for-or-select","assign-left","parameter","string","environment","function","keyword","builtin","boolean","file-descriptor","operator","punctuation","number"],o=n.variable[1].inside,i=0;i<s.length;i++)o[s[i]]=e.languages.bash[s[i]];e.languages.sh=e.languages.bash,e.languages.shell=e.languages.bash}(Prism);
+</script>
+<script>
+const state = {data: null, view: 'activity', filter: 'all', pool: '', agent: '', session: '', format: true, group: false, refreshing: false, refreshEpoch: 0, clearing: false, acking: new Set()};
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 function ago(ms) {
@@ -389,11 +423,111 @@ function renderFilters(events, starts, finishes, conversation) {
   syncOptions($('#activityAgent'), options(agents, 'All agents'), state.agent);
   syncOptions($('#activitySession'), options(sessions, 'All sessions'), state.session);
 }
-function eventMarkup(e) {
-  if (state.view === 'logs') {
-    return `<div class="logmeta">${new Date(e.timestamp_ms).toLocaleTimeString()} [${esc(e.level)}] ${esc(e.kind)}${e.session ? ' session=' + esc(e.session) : ''}</div><pre>${esc(JSON.stringify(e.detail, null, 2))}</pre>`;
+const jsonText = value => JSON.stringify(value, null, 2) ?? 'null';
+const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const highlightCache = new Map();
+function highlight(text, language) {
+  // Large previews remain complete, but avoid expensive tokenization on every poll.
+  if (!language || text.length > 65536) return esc(text);
+  const key = language + ':' + text;
+  if (highlightCache.has(key)) return highlightCache.get(key);
+  try {
+    const html = Prism.highlight(text, Prism.languages[language], language);
+    if (highlightCache.size >= 128) highlightCache.delete(highlightCache.keys().next().value);
+    highlightCache.set(key, html);
+    return html;
   }
-  return `<article class="event lvl-${esc(e.level)}"><div class="event-head"><span class="event-kind">${esc(e.kind)}</span>${time(e.timestamp_ms)}</div>${e.agents?.length ? `<div class="chips">${e.agents.map(a => `<span class="chip">${esc(a.pool)}/${esc(a.agent)}</span>`).join('')}</div>` : ''}<pre>${esc(JSON.stringify(e.detail, null, 2))}</pre></article>`;
+  catch { return esc(text); }
+}
+function codeBlock(label, text, language = '', error = false, original = null) {
+  return `<section class="code-block${error ? ' tool-error' : ''}" data-copy-text="${esc(JSON.stringify(original ?? text))}"><div class="code-head"><span>${esc(label)}</span><span class="code-actions"><button type="button" data-code-action="expand" aria-expanded="false" aria-label="Expand ${esc(label)}">Expand</button><button type="button" data-code-action="copy" aria-label="Copy ${esc(label)}">Copy</button></span></div><pre><code${language ? ` class="language-${language}"` : ''}>${highlight(text, language)}</code></pre></section>`;
+}
+function outputBlock(output) {
+  // Copy retains the exact output, including original JSON whitespace.
+  let text = output, language = '';
+  if (output.trim() && output.length <= 65536) {
+    try { text = jsonText(JSON.parse(output)); language = 'json'; } catch {}
+  }
+  return codeBlock('Output', text, language, false, language ? output : null);
+}
+function toolDetail(e) {
+  const d = e.detail;
+  if (!state.format) return codeBlock('Raw JSON', jsonText(d));
+  if (!record(d) || !['tool.start', 'tool.finish', 'tool.error'].includes(e.kind)) {
+    return codeBlock('Details', jsonText(d), 'json');
+  }
+  let html = `<div class="tool-name">${esc(d.tool || e.kind)}${d.start_event_id !== undefined ? ` <span class="chip">Start event: ${esc(d.start_event_id)}</span>` : ''}</div>`;
+  const rest = {...d};
+  delete rest.tool;
+  delete rest.start_event_id;
+  if (e.kind === 'tool.start' && record(d.arguments)) {
+    const args = {...d.arguments};
+    if (typeof args.cmd === 'string') {
+      html += codeBlock('Command', args.cmd, 'bash');
+      delete args.cmd;
+    }
+    if (Object.keys(args).length) html += codeBlock('Arguments', jsonText(args), 'json');
+    delete rest.arguments;
+  } else if (e.kind !== 'tool.start' && record(d.result)) {
+    const result = {...d.result}, meta = [];
+    if (result.exit_code !== undefined && result.exit_code !== null) {
+      meta.push(`<span class="chip${result.exit_code !== 0 ? ' failed' : ''}">Exit code: ${esc(result.exit_code)}</span>`);
+      delete result.exit_code;
+    }
+    if (typeof result.call_wall_time_seconds === 'number') {
+      meta.push(`<span class="chip">Execution time: ${esc(result.call_wall_time_seconds)} s</span>`);
+      delete result.call_wall_time_seconds;
+    }
+    if (result.session_id !== undefined && result.session_id !== null) {
+      meta.push(`<span class="chip">Process session: ${esc(result.session_id)}</span>`);
+      delete result.session_id;
+    }
+    if (meta.length) html += `<div class="tool-meta">${meta.join('')}</div>`;
+    if (result.error !== undefined) {
+      html += codeBlock('Error', typeof result.error === 'string' ? result.error : jsonText(result.error), '', true);
+      delete result.error;
+    }
+    if (typeof result.output === 'string') {
+      html += outputBlock(result.output);
+      delete result.output;
+    }
+    if (Object.keys(result).length) html += codeBlock('Result details', jsonText(result), 'json', e.kind === 'tool.error');
+    delete rest.result;
+  }
+  // Keep unfamiliar fields and correlation IDs available without duplicating output.
+  if (Object.keys(rest).length) html += codeBlock('Event details', jsonText(rest), 'json', e.kind === 'tool.error');
+  return html;
+}
+function eventMarkup(e) {
+  const body = toolDetail(e);
+  if (state.view === 'logs') {
+    return `<div class="logmeta${e.kind === 'tool.error' ? ' lvl-error' : ''}">${new Date(e.timestamp_ms).toLocaleTimeString()} [${esc(e.level)}] ${esc(e.kind)}${e.session ? ' session=' + esc(e.session) : ''}</div>${body}`;
+  }
+  return `<article class="event lvl-${esc(e.level)}"><div class="event-head"><span class="event-kind">${esc(e.kind)}</span>${time(e.timestamp_ms)}</div>${e.agents?.length ? `<div class="chips">${e.agents.map(a => `<span class="chip">${esc(a.pool)}/${esc(a.agent)}</span>`).join('')}</div>` : ''}${body}</article>`;
+}
+function groupMarkup(item) {
+  if (!item.start) return eventMarkup(item);
+  const finish = item.finish;
+  return `<article class="event${finish?.kind === 'tool.error' ? ' lvl-error' : ''}"><details class="tool-group" open><summary>${esc(item.start.detail?.tool || 'Tool call')}<span class="chip">${finish ? esc(finish.kind) : 'In progress'}</span></summary><div data-group-part="start">${eventMarkup(item.start)}</div><div data-group-part="finish">${finish ? eventMarkup(finish) : ''}</div></details></article>`;
+}
+function updateEvent(node, html) {
+  const group = node.querySelector('.tool-group');
+  if (!group) {
+    node.innerHTML = html;
+    node.querySelectorAll('.tool-group summary, [data-group-part]').forEach(part => { part._markup = part.innerHTML; });
+    return;
+  }
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  node.firstElementChild.className = template.content.firstElementChild.className;
+  // Completing a group must preserve its open state and the command's DOM/scroll.
+  for (const selector of ['summary', '[data-group-part="start"]', '[data-group-part="finish"]']) {
+    const current = group.querySelector(selector), next = template.content.querySelector(selector);
+    if (current._markup !== next.innerHTML) {
+      current.innerHTML = next.innerHTML;
+      current._markup = next.innerHTML;
+    }
+  }
 }
 function messageMarkup(m) {
   return `<article class="event lvl-${esc(m.level || 'info')}"><div class="event-head"><span class="event-kind">${esc(m.from)} → ${esc(m.to)}</span>${time(m.timestamp_ms)}</div><div class="chips"><span class="chip">${esc(m.pool)}</span><span class="chip">${esc(m.kind)}</span>${m.message_id ? `<span class="chip">${esc(m.message_id)}</span>` : ''}${m.in_reply_to ? `<span class="chip">reply to ${esc(m.in_reply_to)}</span>` : ''}</div><div class="message-body">${esc(m.message)}</div><div class="message-status">${esc(m.status)}</div></article>`;
@@ -414,12 +548,14 @@ function updateMessage(node, html) {
 }
 function renderEvents() {
   const root = $('#events'), events = state.data?.events || [];
+  const grouping = state.group && state.format && state.view === 'activity' && state.filter === 'all';
+  $('#groupTools').disabled = !state.format || state.view !== 'activity' || state.filter !== 'all';
   const starts = new Map(events.filter(e => e.kind === 'tool.start').map(e => [e.id, e]));
   const finishes = new Map(events.filter(e => e.detail?.start_event_id).map(e => [e.detail.start_event_id, e]));
   const conversationRows = messages(events, finishes);
   renderFilters(events, starts, finishes, conversationRows);
   if (interacting(root)) return;
-  const viewKey = JSON.stringify([state.view, state.filter, state.pool, state.agent, state.session]);
+  const viewKey = JSON.stringify([state.view, state.filter, state.pool, state.agent, state.session, state.format, grouping]);
   if (root._viewKey !== viewKey) root.scrollTop = 0;
   root._viewKey = viewKey;
   const conversation = state.view === 'activity' && state.filter === 'messages';
@@ -434,11 +570,23 @@ function renderEvents() {
       (!state.session || item.session === state.session) &&
       (state.filter !== 'messages' || isMessageEvent(item, starts));
   });
-  syncList(root, shown, item => `${state.view}:${conversation ? 'message:' : 'event:'}${item.key || item.id}`,
-    conversation ? messageMarkup : eventMarkup,
+  let rows = shown;
+  if (grouping) {
+    const visible = new Set(shown.map(e => e.id));
+    const paired = new Map(shown.filter(e => ['tool.finish', 'tool.error'].includes(e.kind) && visible.has(e.detail?.start_event_id))
+      .map(e => [e.detail.start_event_id, e]));
+    rows = shown.filter(e => !paired.has(e.id)).map(e => {
+      const start = starts.get(e.detail?.start_event_id);
+      if (start && paired.get(start.id) === e) return {key: `group:${start.id}`, start, finish: e};
+      if (e.kind === 'tool.start') return {key: `group:${e.id}`, start: e};
+      return e;
+    });
+  }
+  syncList(root, rows, item => `${state.view}:${conversation ? 'message:' : 'event:'}${item.key || item.id}`,
+    conversation ? messageMarkup : grouping ? groupMarkup : eventMarkup,
     state.pool || state.agent || state.session || state.filter !== 'all' ? 'No entries match these filters' : 'No activity yet',
-    state.view === 'logs' ? 'logline' : '', conversation ? updateMessage : undefined);
-  $('#filterCount').textContent = `${shown.length} / ${all.length} ${conversation ? 'messages' : 'events'}`;
+    state.view === 'logs' ? 'logline' : '', conversation ? updateMessage : updateEvent);
+  $('#filterCount').textContent = `${shown.length} / ${all.length} ${conversation ? 'messages' : 'events'}${grouping ? ` · ${rows.length} cards` : ''}`;
 }
 function render() {
   renderPools();
@@ -540,6 +688,26 @@ function selectPool(pool) {
 $('#activityPool').onchange = event => selectPool(event.target.value);
 $('#activityAgent').onchange = event => { state.agent = event.target.value; clearSelection(); renderEvents(); };
 $('#activitySession').onchange = event => { state.session = event.target.value; clearSelection(); renderEvents(); };
+$('#formatLogs').onchange = event => { state.format = event.target.checked; clearSelection(); renderEvents(); };
+$('#wrapLogs').onchange = event => $('#events').classList.toggle('wrap', event.target.checked);
+$('#groupTools').onchange = event => { state.group = event.target.checked; clearSelection(); renderEvents(); };
+$('#events').onclick = async event => {
+  const button = event.target.closest('button[data-code-action]');
+  if (!button) return;
+  const block = button.closest('.code-block');
+  if (button.dataset.codeAction === 'expand') {
+    const expanded = block.classList.toggle('expanded');
+    button.setAttribute('aria-expanded', String(expanded));
+    const label = block.querySelector('.code-head > span').textContent;
+    button.setAttribute('aria-label', `${expanded ? 'Collapse' : 'Expand'} ${label}`);
+    button.textContent = expanded ? 'Collapse' : 'Expand';
+  } else {
+    try {
+      await navigator.clipboard.writeText(JSON.parse(block.dataset.copyText));
+      toast('Copied');
+    } catch { toast('Copy failed. Select the text and copy it manually.', true); }
+  }
+};
 document.querySelectorAll('.tab').forEach(button => button.onclick = () => {
   document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x === button));
   state.view = button.dataset.view;

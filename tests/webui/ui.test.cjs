@@ -606,3 +606,171 @@ test('a snapshot requested before CLEAR cannot restore erased history', async t 
   assert.equal(await page.locator('#inbox .message').count(), 0);
   await page.route('**/_admin/api/snapshot', route => route.fulfill({json: data}));
 });
+
+test('formatted tools separate commands, arguments, results and errors safely in both views', async t => {
+  const data = fixture();
+  const command = 'printf "%s\\n" "$HOME" "<img src=x onerror=unsafe()>"';
+  const output = '<script>unsafe()</script>\nsecond line & <b>literal</b>';
+  data.events[0].detail.arguments = {cmd: command, workdir: '/tmp', tty: false};
+  data.events[1].detail.result = {exit_code: 7, call_wall_time_seconds: 0.125, output, output_truncated: true};
+  data.events.push({...data.events[10], id: 12, kind: 'custom.event', detail: {unfamiliar: '<svg onload=unsafe()>', count: 3}});
+  const {page, poll} = await open(t, data);
+  for (const view of ['activity', 'logs']) {
+    await page.click(`[data-view="${view}"]`);
+    const start = page.locator(`[data-key="${view}:event:1"]`);
+    const finish = page.locator(`[data-key="${view}:event:2"]`);
+    assert.equal(await start.locator('code.language-bash').textContent(), command);
+    assert.ok(await start.locator('.token').count() > 0, 'Bash is highlighted');
+    assert.deepEqual(JSON.parse(await start.locator('code.language-json').textContent()), {workdir: '/tmp', tty: false});
+    assert.match(await finish.locator('.tool-meta').innerText(), /Exit code: 7.*Execution time: 0.125 s/s);
+    assert.equal(await finish.locator('code').first().textContent(), output);
+    assert.equal(await finish.locator('code').first().locator('.token').count(), 0, 'terminal output stays plain');
+    assert.match(await finish.locator('code.language-json').first().textContent(), /"output_truncated": true/);
+    assert.equal(await page.locator(`[data-key="${view}:event:11"] .tool-error code`).textContent(), 'unknown target');
+    assert.ok(await page.locator(`[data-key="${view}:event:12"] .token.property`).count() > 0, 'unknown events use highlighted JSON');
+    assert.equal(await page.locator('#events script, #events img, #events b, #events svg').count(), 0);
+    await page.uncheck('#formatLogs');
+    assert.deepEqual(JSON.parse(await finish.locator('code').textContent()), data.events[1].detail);
+    assert.equal(await finish.locator('.token, .tool-meta').count(), 0);
+    await poll();
+    assert.equal(await page.isChecked('#formatLogs'), false);
+    await page.check('#formatLogs');
+  }
+});
+
+test('JSON output is pretty printed while copying preserves the original data', async t => {
+  const data = fixture();
+  const output = ' {"html":"<img src=x>","items":[true,null,42]}\r\n';
+  data.events[1].detail.result = {output};
+  data.events[0].detail.arguments.cmd = 'echo "<&>"\r\n';
+  const {page} = await open(t, data);
+  await page.evaluate(() => Object.defineProperty(navigator, 'clipboard', {configurable: true, value: {
+    writeText: async text => { window.copied = text; },
+  }}));
+  const finish = page.locator('[data-key="activity:event:2"]');
+  assert.equal(await finish.locator('code').first().textContent(), JSON.stringify(JSON.parse(output), null, 2));
+  assert.ok(await finish.locator('.token.boolean').count() > 0);
+  await finish.getByRole('button', {name: 'Copy Output', exact: true}).click();
+  assert.equal(await page.evaluate(() => window.copied), output);
+  await page.locator('[data-key="activity:event:1"]').getByRole('button', {name: 'Copy Command', exact: true}).click();
+  assert.equal(await page.evaluate(() => window.copied), data.events[0].detail.arguments.cmd);
+  await page.uncheck('#formatLogs');
+  await finish.getByRole('button', {name: 'Copy Raw JSON', exact: true}).click();
+  assert.equal(await page.evaluate(() => window.copied), JSON.stringify(data.events[1].detail, null, 2));
+});
+
+test('plain, empty, invalid and large outputs retain their text without tokenization', async t => {
+  const data = fixture();
+  const outputs = ['', 'not JSON\n  indented\ttext', '{invalid JSON}', 'x'.repeat(65537)];
+  data.events = outputs.map((output, i) => ({...data.events[1], id: i + 20, detail: {tool: 'exec_command', result: {output}}}));
+  const {page} = await open(t, data);
+  for (const [i, output] of outputs.entries()) {
+    const code = page.locator(`[data-key="activity:event:${i + 20}"] code`);
+    assert.equal(await code.textContent(), output);
+    assert.equal(await code.locator('.token').count(), 0);
+  }
+});
+
+test('wrap, expansion, nested scroll, focus and highlighted selection survive polls', async t => {
+  const {page, data, poll} = await open(t);
+  const start = page.locator('[data-key="activity:event:1"]');
+  const pre = start.locator('pre');
+  assert.equal(await pre.evaluate(node => getComputedStyle(node).whiteSpace), 'pre');
+  await pre.evaluate(node => { window.commandPre = node; node.scrollTop = 180; });
+  await page.check('#wrapLogs');
+  assert.equal(await pre.evaluate(node => node === window.commandPre && node.scrollTop === 180), true);
+  assert.equal(await pre.evaluate(node => getComputedStyle(node).whiteSpace), 'pre-wrap');
+  const expand = start.getByRole('button', {name: 'Expand Command', exact: true});
+  await expand.click();
+  assert.equal(await pre.evaluate(node => getComputedStyle(node).maxHeight), 'none');
+  await poll();
+  assert.equal(await start.getByRole('button', {name: 'Collapse Command', exact: true}).getAttribute('aria-expanded'), 'true');
+  assert.equal(await pre.evaluate(node => node === window.commandPre), true);
+  await start.getByRole('button', {name: 'Collapse Command', exact: true}).click();
+  await pre.evaluate(node => { node.scrollTop = 160; });
+  await start.getByRole('button', {name: 'Expand Command', exact: true}).focus();
+  await poll();
+  assert.equal(await pre.evaluate(node => node.scrollTop), 160);
+  assert.equal(await page.evaluate(() => document.activeElement.getAttribute('aria-label')), 'Expand Command');
+  await pre.locator('code').evaluate(node => {
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+    window.selectedCommand = getSelection().toString();
+  });
+  data.events.push({...data.events[10], id: 12});
+  await poll();
+  assert.equal(await page.evaluate(() => getSelection().toString() === window.selectedCommand), true);
+  assert.equal(await page.locator('[data-key="activity:event:12"]').count(), 0, 'insertion waits for selection');
+  await page.evaluate(() => getSelection().removeAllRanges());
+  await page.waitForFunction(() => document.querySelector('[data-key="activity:event:12"]'));
+  await page.click('[data-view="logs"]');
+  assert.equal(await page.isChecked('#wrapLogs'), true);
+});
+
+test('groups update on completion without replacing the command or reopening a collapsed card', async t => {
+  const data = fixture();
+  data.events = [data.events[0]];
+  const {page, poll} = await open(t, data);
+  await page.check('#groupTools');
+  const card = page.locator('[data-key="activity:event:group:1"]');
+  assert.match(await card.locator('summary').innerText(), /In progress/);
+  await card.getByRole('button', {name: 'Expand Command', exact: true}).click();
+  await card.locator('code').evaluate(node => { window.groupCommand = node; });
+  await card.locator('summary').click();
+  data.events.push({...fixture().events[1], timestamp_ms: data.events[0].timestamp_ms + 100});
+  await poll();
+  assert.equal(await card.locator('.tool-group').getAttribute('open'), null);
+  assert.equal(await card.locator('[data-group-part="start"] code').evaluate(node => node === window.groupCommand), true);
+  await card.locator('summary').click();
+  assert.match(await card.locator('summary').innerText(), /tool.finish/);
+  assert.equal(await card.getByRole('button', {name: 'Collapse Command', exact: true}).getAttribute('aria-expanded'), 'true');
+  assert.equal(await card.locator('[data-group-part="finish"] code').first().textContent(), data.events[1].detail.result.output);
+  assert.match(await page.locator('#filterCount').innerText(), /2 \/ 2 events · 1 cards/);
+  await page.click('[data-view="logs"]');
+  assert.equal(await page.locator('#events .logline').count(), 2);
+  assert.equal(await page.locator('#groupTools').isDisabled(), true);
+  await page.click('[data-view="activity"]');
+  assert.equal(await card.count(), 1);
+  data.events.shift(); // Retention may evict the start before its finish.
+  await poll();
+  assert.equal(await page.locator('[data-key="activity:event:2"]').count(), 1);
+});
+
+test('grouping keeps failed calls, orphan finishes and session filters accessible', async t => {
+  const data = fixture();
+  // Deliberately differing sessions must not pull a filtered event into a group.
+  data.events[1].session = 'other-session';
+  const {page} = await open(t, data);
+  await page.check('#groupTools');
+  assert.match(await page.locator('[data-key="activity:event:group:10"] summary').innerText(), /tool.error/);
+  assert.match(await page.locator('[data-key="activity:event:group:10"] .tool-error').innerText(), /unknown target/);
+  assert.equal(await page.locator('[data-key="activity:event:5"]').count(), 1, 'orphan result is visible');
+  await page.selectOption('#activitySession', 'other-session');
+  assert.equal(await page.locator('#events [data-key]').count(), 1);
+  assert.equal(await page.locator('[data-key="activity:event:2"]').count(), 1);
+  await page.selectOption('#activitySession', 'chat-alpha');
+  assert.equal(await page.locator('[data-key="activity:event:group:1"] [data-group-part="finish"]').textContent(), '');
+  await page.selectOption('#activityFilter', 'messages');
+  assert.equal(await page.locator('#groupTools').isDisabled(), true);
+  assert.equal(await page.locator('#events .tool-group').count(), 0);
+});
+
+test('copy failures are visible and long lines stay inside the viewer on mobile', async t => {
+  const data = fixture();
+  data.events[0].detail.arguments.cmd = 'echo ' + 'longargument'.repeat(100);
+  const {page, poll} = await open(t, data, {width: 320, height: 568});
+  await page.evaluate(() => Object.defineProperty(navigator, 'clipboard', {configurable: true, value: {
+    writeText: async () => { throw new Error('denied'); },
+  }}));
+  const start = page.locator('[data-key="activity:event:1"]');
+  await start.getByRole('button', {name: 'Copy Command', exact: true}).click();
+  assert.match(await page.locator('#toast.bad').innerText(), /Copy failed/);
+  const pre = start.locator('pre');
+  await pre.evaluate(node => { node.scrollLeft = 120; });
+  await poll();
+  assert.equal(await pre.evaluate(node => node.scrollLeft), 120);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  await page.check('#wrapLogs');
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+});
