@@ -1,20 +1,12 @@
 import { Prism } from './vendor/prism.js';
+import {
+  $, esc, interacting, syncList, updateTimes, time, syncOptions,
+  clearSelection, setPointerTarget, clearPointerTarget, hasPointerTarget
+} from './dom.js';
+import { eventPools, isMessageEvent, eventIdentities } from './model/events.js';
+import { messages } from './model/messages.js';
 
 const state = {data: null, view: 'activity', filter: 'all', pool: '', agent: '', session: '', format: true, group: false, refreshing: false, refreshEpoch: 0, clearing: false, acking: new Set()};
-const $ = s => document.querySelector(s);
-const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
-function ago(ms) {
-  const s = Math.floor(Math.max(0, Date.now() - ms) / 1000);
-  if (s < 60) return s + 's ago';
-  if (s < 3600) return Math.floor(s / 60) + 'm ago';
-  return Math.floor(s / 3600) + 'h ago';
-}
-function left(ms) {
-  const s = Math.max(0, Math.floor((ms - Date.now()) / 1000));
-  if (s < 60) return s + 's remaining';
-  if (s < 3600) return Math.floor(s / 60) + 'm remaining';
-  return Math.floor(s / 3600) + 'h remaining';
-}
 function toast(msg, bad = false) {
   const t = $('#toast');
   t.textContent = msg;
@@ -81,65 +73,6 @@ async function clearHistory() {
   }
 }
 
-// Keep immutable rows in the DOM. Replacing the list on every poll destroys
-// nested scroll positions, focus and the browser's text-selection anchors.
-let pointerTarget = null;
-function interacting(root) {
-  const selection = window.getSelection();
-  return (pointerTarget && root.contains(pointerTarget)) ||
-    (selection && !selection.isCollapsed &&
-      (root.contains(selection.anchorNode) || root.contains(selection.focusNode)));
-}
-function syncList(root, items, key, markup, emptyText, className = '', update = (node, html) => { node.innerHTML = html; }) {
-  if (interacting(root)) return;
-  const bounds = root.getBoundingClientRect();
-  const anchor = root.scrollTop > 0 && [...root.children].find(node =>
-    node.dataset.key && node.getBoundingClientRect().bottom > bounds.top);
-  const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
-  const nodes = new Map([...root.children].map(node => [node.dataset.key, node]));
-  const keep = new Set();
-  let cursor = root.firstElementChild;
-  for (const item of items) {
-    const id = String(key(item));
-    keep.add(id);
-    let node = nodes.get(id);
-    if (!node) {
-      node = document.createElement('div');
-      node.dataset.key = id;
-    }
-    const html = markup(item);
-    if (node._markup !== html) {
-      node.className = className;
-      update(node, html);
-      node._markup = html;
-    }
-    if (node !== cursor) root.insertBefore(node, cursor);
-    cursor = node.nextElementSibling;
-  }
-  for (const node of [...root.children]) {
-    if (!keep.has(node.dataset.key)) node.remove();
-  }
-  if (!items.length && !root.firstElementChild) {
-    const empty = document.createElement('div');
-    empty.className = 'empty';
-    empty.textContent = emptyText;
-    root.appendChild(empty);
-  }
-  updateTimes(root);
-  if (anchor && root.contains(anchor)) {
-    root.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
-  }
-}
-function updateTimes(root) {
-  if (interacting(root)) return;
-  root.querySelectorAll('[data-time]').forEach(node => {
-    const value = (node.dataset.clock === 'left' ? left : ago)(Number(node.dataset.time));
-    if (node.textContent !== value) node.textContent = value;
-  });
-}
-function time(ms, className = 'event-time', clock = 'ago') {
-  return `<span class="${className}" data-time="${Number(ms)}" data-clock="${clock}"></span>`;
-}
 function renderPools() {
   const root = $('#pools'), pools = state.data?.pools || [];
   if (!interacting(root)) {
@@ -164,15 +97,6 @@ function renderPools() {
   }
   renderTargets();
 }
-function syncOptions(select, values, selected) {
-  // Native selects must also survive polling while their menu is open.
-  const signature = JSON.stringify(values);
-  if (select._options !== signature) {
-    select.replaceChildren(...values.map(({value, label}) => new Option(label, value)));
-    select._options = signature;
-  }
-  if (values.some(x => x.value === selected)) select.value = selected;
-}
 function renderTargets() {
   const pools = state.data?.pools || [], ps = $('#poolSelect'), ts = $('#targetSelect');
   syncOptions(ps, pools.map(p => ({value: p.name, label: p.name})), ps.value);
@@ -191,125 +115,6 @@ function renderInbox() {
     if (button.textContent !== label) button.textContent = label;
     button.disabled = !!message.acknowledged || pending;
   }
-}
-function eventPools(e, starts) {
-  const pools = new Set((e.agents || []).map(a => a.pool));
-  for (const name of [e.detail?.pool, e.detail?.arguments?.pool,
-    starts.get(e.detail?.start_event_id)?.detail?.arguments?.pool]) {
-    if (name) pools.add(name);
-  }
-  for (const m of e.detail?.result?.peer_messages || []) pools.add(m.pool);
-  return pools;
-}
-function isMessageEvent(e, starts) {
-  const start = e.kind === 'tool.start' ? e : starts.get(e.detail?.start_event_id);
-  return e.kind === 'admin.message.send' ||
-    (start?.detail?.tool === 'pool_send' && typeof start.detail.arguments?.message === 'string' && !start.detail.arguments.action) ||
-    (e.detail?.result?.peer_messages || []).length > 0;
-}
-function eventIdentities(e, starts, finishes) {
-  const start = e.kind === 'tool.start' ? e : starts.get(e.detail?.start_event_id);
-  const finish = e.kind === 'tool.start' ? finishes.get(e.id) : e;
-  const agents = [...(e.agents || []), ...(start?.agents || []), ...(finish?.agents || [])];
-  const a = start?.detail?.arguments, value = finish?.detail?.result?.value;
-  if (a?.pool && value?.assigned_agent) agents.push({pool: a.pool, agent: value.assigned_agent});
-  if (a?.pool && a.target && a.target !== 'global') agents.push({pool: a.pool, agent: a.target});
-  if (a?.pool) for (const agent of value?.recipients || []) agents.push({pool: a.pool, agent});
-  if (e.kind === 'admin.message.send') {
-    agents.push({pool: e.detail.pool, agent: 'admin'});
-    if (e.detail.target !== 'global') agents.push({pool: e.detail.pool, agent: e.detail.target});
-  }
-  for (const m of e.detail?.result?.peer_messages || []) {
-    agents.push({pool: m.pool, agent: m.from}, {pool: m.pool, agent: m.to});
-  }
-  return agents;
-}
-function messages(events, finishes) {
-  const rows = [], received = new Set();
-  const identities = (state.data?.pools || []).flatMap(p => p.agents);
-  function receive(m, timestamp_ms, session, recipient) {
-    const to = recipient || m.to;
-    const key = JSON.stringify([m.pool, m.message_id, session || to]);
-    if (received.has(key)) return;
-    received.add(key);
-    rows.push({...m, to, key: 'receive:' + key, timestamp_ms, kind: 'message.receive',
-      status: to === 'admin' ? 'Received' : 'Offered in tool response',
-      agents: [m.from, to], sessions: session ? [session] : []});
-  }
-  for (const e of events) {
-    const d = e.detail || {};
-    if (e.kind === 'tool.start' && d.tool === 'pool_send' && typeof d.arguments?.message === 'string' && !d.arguments.action) {
-      const a = d.arguments, finish = finishes.get(e.id), result = finish?.detail?.result;
-      const from = result?.value?.assigned_agent ||
-        [...(finish?.agents || []), ...(e.agents || [])].find(x => x.pool === a.pool)?.agent ||
-        identities.find(x => x.pool === a.pool && x.session === e.session)?.agent || 'Agent';
-      const failed = finish?.kind === 'tool.error';
-      const agents = [from, a.target, ...(result?.value?.recipients || [])];
-      rows.push({...a, key: 'send:' + e.id, from, to: a.target, timestamp_ms: e.timestamp_ms,
-        kind: 'message.send', level: failed ? 'error' : 'info', message_id: result?.value?.message_id,
-        agents, sessions: e.session ? [e.session] : [], recipient_count: (result?.value?.recipients || []).length,
-        status: !finish ? 'Sending…' : failed ? `Failed: ${result?.error || 'Send failed'}` :
-          `Queued for ${(result?.value?.recipients || []).length} recipient(s)`});
-    }
-    if (e.kind === 'admin.message.send') {
-      const agents = ['admin', d.target, ...(e.agents || []).filter(a => a.pool === d.pool).map(a => a.agent)];
-      rows.push({...d, key: 'admin:' + e.id, from: 'admin', to: d.target,
-        timestamp_ms: e.timestamp_ms, kind: 'message.send', agents, sessions: [], recipient_count: d.delivery_count,
-        status: `Queued for ${d.delivery_count} recipient(s)`});
-    }
-    for (const m of d.result?.peer_messages || []) {
-      // Older snapshots use to=global. Event identities retain the recipient
-      // even after that member has left or its name has been reused.
-      const recipient = m.to === 'global' ? (e.agents || []).find(a => a.pool === m.pool)?.agent : m.to;
-      receive(m, e.timestamp_ms, e.session, recipient);
-    }
-  }
-  for (const m of state.data?.admin_messages || []) receive({...m, to: 'admin'}, m.created_ms);
-  // Keep sends before receipts at the same timestamp in chronological order.
-  return coalesceMessages(rows.sort((a, b) => a.timestamp_ms - b.timestamp_ms ||
-    Number(a.kind === 'message.receive') - Number(b.kind === 'message.receive'))).reverse();
-}
-function coalesceMessages(rows) {
-  const result = [], merged = new Map();
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    let send;
-    if (row.kind === 'message.receive' && row.message_id) {
-      // Measure the gap before folding rows, so repeated deliveries cannot
-      // keep an old send eligible indefinitely. Five intervening rows stay separate.
-      for (let j = i - 1; j >= Math.max(0, i - 5); j--) {
-        const candidate = rows[j];
-        if (candidate.kind === 'message.send' && candidate.level !== 'error' &&
-          candidate.pool === row.pool && candidate.message_id === row.message_id && candidate.from === row.from) {
-          send = candidate;
-          break;
-        }
-      }
-    }
-    if (!send) {
-      result.push({...row});
-      continue;
-    }
-    let message = merged.get(send.key);
-    if (!message) {
-      message = result.find(m => m.key === send.key);
-      message.kind = 'message.receive';
-      message.deliveries = [];
-      merged.set(send.key, message);
-    }
-    message.deliveries.push(row);
-    message.agents = [...new Set([...message.agents, ...row.agents])];
-    message.sessions = [...new Set([...message.sessions, ...row.sessions])];
-    const notes = message.deliveries.map(m => {
-      const sameName = message.deliveries.filter(d => d.to === m.to).length > 1;
-      const recipient = m.to + (sameName && m.sessions.length ? ` (${m.sessions.join(', ')})` : '');
-      return m.to === 'admin' ? 'Received' : `${m.status} to ${recipient}`;
-    });
-    const pending = send.recipient_count - new Set(message.deliveries.map(m => m.to)).size;
-    if (pending > 0) notes.push(`Queued for ${pending} recipient(s)`);
-    message.status = notes.join(' · ');
-  }
-  return result;
 }
 function renderFilters(events, starts, finishes, conversation) {
   const names = new Set((state.data?.pools || []).map(p => p.name));
@@ -472,7 +277,7 @@ function renderEvents() {
   $('#groupTools').disabled = !state.format || state.view !== 'activity' || state.filter !== 'all';
   const starts = new Map(events.filter(e => e.kind === 'tool.start').map(e => [e.id, e]));
   const finishes = new Map(events.filter(e => e.detail?.start_event_id).map(e => [e.detail.start_event_id, e]));
-  const conversationRows = messages(events, finishes);
+  const conversationRows = messages(events, finishes, state.data?.pools || [], state.data?.admin_messages || []);
   renderFilters(events, starts, finishes, conversationRows);
   if (interacting(root)) return;
   const viewKey = JSON.stringify([state.view, state.filter, state.pool, state.agent, state.session, state.format, grouping]);
@@ -597,7 +402,6 @@ $('#pools').onclick = event => {
   }
 };
 $('#activityFilter').onchange = event => { state.filter = event.target.value; clearSelection(); renderEvents(); };
-function clearSelection() { window.getSelection()?.removeAllRanges(); }
 function selectPool(pool) {
   clearSelection();
   state.pool = pool;
@@ -634,14 +438,14 @@ document.querySelectorAll('.tab').forEach(button => button.onclick = () => {
   clearSelection();
   renderEvents();
 });
-document.addEventListener('pointerdown', event => { pointerTarget = event.target; });
-function endPointer() { pointerTarget = null; render(); }
+document.addEventListener('pointerdown', event => { setPointerTarget(event.target); });
+function endPointer() { clearPointerTarget(); render(); }
 document.addEventListener('pointerup', endPointer);
 document.addEventListener('pointercancel', endPointer);
-window.addEventListener('blur', () => { pointerTarget = null; });
+window.addEventListener('blur', () => { clearPointerTarget(); });
 // Apply deferred rows as soon as a selection is cleared, without waiting for a poll.
 document.addEventListener('selectionchange', () => {
-  if (window.getSelection()?.isCollapsed && !pointerTarget) render();
+  if (window.getSelection()?.isCollapsed && !hasPointerTarget()) render();
 });
 refresh();
 setInterval(refresh, 1500);

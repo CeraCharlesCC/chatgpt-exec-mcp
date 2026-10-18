@@ -2,7 +2,8 @@
   "name": "exec-mcp-webui-tests",
   "private": true,
   "scripts": {
-    "test": "node --test ui.test.cjs"
+    "test": "node --test ui.test.cjs model.test.cjs",
+    "test:model": "node --test model.test.cjs"
   },
   "devDependencies": {
     "playwright": "1.63.0"
