@@ -11,6 +11,28 @@ const event = (id, kind, detail = {}, other = {}) => ({
   id, kind, detail, timestamp_ms: id, agents: [], session: null, ...other,
 });
 
+test('pool_wait messages appear in conversations and offered receipts retain filter identities', () => {
+  const peer = {pool: 'alpha', message_id: 'msg-wait', from: 'Alice', to: 'Bob', message: 'done'};
+  const received = event(1, 'tool.finish', {
+    tool: 'pool_wait', result: {reason: 'message', messages: [peer], membership_changed: true},
+  }, {session: 'bob-session'});
+  assert.equal(isMessageEvent(received, new Map()), true);
+  assert.deepEqual([...eventPools(received, new Map())], ['alpha']);
+  assert.deepEqual(messages([received], new Map(), [], []).map(m => m.message), ['done']);
+  assert.deepEqual(eventIdentities(received, new Map(), new Map()), [
+    {pool: 'alpha', agent: 'Alice'}, {pool: 'alpha', agent: 'Bob'},
+  ]);
+  const receipt = event(2, 'tool.finish', {tool: 'exec_command', result: {
+    delivery_receipts: [{pool: 'archived', to: 'Cara', message_id: 'old', status: 'offered'}],
+  }});
+  assert.deepEqual([...eventPools(receipt, new Map())], ['archived']);
+  assert.deepEqual(eventIdentities(receipt, new Map(), new Map()), [{pool: 'archived', agent: 'Cara'}]);
+  // Receipt-only calls stay in tool activity, with their structured details;
+  // they are not fabricated peer messages or hidden from both views.
+  assert.equal(isMessageEvent(receipt, new Map()), false);
+  assert.deepEqual(messages([receipt], new Map(), [], []), []);
+});
+
 test('four intervening rows can merge but five or more cannot', () => {
   const send = {
     key: 'send:1', kind: 'message.send', pool: 'alpha', message_id: 'msg-1', from: 'Alice',

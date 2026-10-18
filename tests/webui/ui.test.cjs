@@ -281,7 +281,7 @@ test('a nearby delivery updates the queued card in place and preserves body scro
   data.events.push({
     id: 12, kind: 'tool.finish', level: 'info', timestamp_ms: data.events[10].timestamp_ms + 1,
     session: 'chat-bob', agents: [{pool: 'beta', agent: 'Bob'}],
-    detail: {tool: 'pool_members', result: {peer_messages: [{
+    detail: {tool: 'pool_wait', result: {reason: 'message', membership_changed: false, messages: [{
       pool: 'beta', message_id: 'sent-1', from: 'Alice', to: 'Bob', target: 'Bob', message: text,
     }]}},
   });

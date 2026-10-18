@@ -5,17 +5,13 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use serde::Deserialize;
 
-use crate::session::SessionOrigin;
-
 /// Validated startup settings. Environment values are deliberately redacted.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub workspace: PathBuf,
     pub shell: PathBuf,
-    pub max_explicit_sessions: usize,
-    pub max_exec_continuations: usize,
-    pub explicit_session_idle_timeout: Duration,
-    pub exec_continuation_idle_timeout: Duration,
+    pub max_sessions: usize,
+    pub session_idle_timeout: Duration,
     pub reaper_interval: Duration,
     pub output_cap_bytes: usize,
     pub output_store_dir: PathBuf,
@@ -76,14 +72,19 @@ struct FileConfig {
     agent_pool: Option<FileAgentPoolConfig>,
     #[serde(default, deserialize_with = "present_path")]
     instructions_file: Option<PathBuf>,
-    #[serde(default = "three")]
-    max_explicit_sessions: usize,
-    #[serde(default = "three")]
-    max_exec_continuations: usize,
-    #[serde(default = "hour")]
-    explicit_session_idle_timeout: u64,
-    #[serde(default = "quarter_hour")]
-    exec_continuation_idle_timeout: u64,
+    #[serde(default, deserialize_with = "present_limit")]
+    max_sessions: Option<usize>,
+    #[serde(default, deserialize_with = "present_limit")]
+    session_idle_timeout: Option<u64>,
+    // Version-1 migration aliases. Never merge legacy environment rules.
+    #[serde(default, deserialize_with = "present_limit")]
+    max_explicit_sessions: Option<usize>,
+    #[serde(default, deserialize_with = "present_limit")]
+    max_exec_continuations: Option<usize>,
+    #[serde(default, deserialize_with = "present_limit")]
+    explicit_session_idle_timeout: Option<u64>,
+    #[serde(default, deserialize_with = "present_limit")]
+    exec_continuation_idle_timeout: Option<u64>,
     #[serde(default = "thirty")]
     reaper_interval: u64,
     #[serde(default = "megabyte")]
@@ -96,14 +97,12 @@ struct FileConfig {
 fn present_path<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
     PathBuf::deserialize(d).map(Some)
 }
-fn three() -> usize {
-    3
-}
-fn hour() -> u64 {
-    3600
-}
-fn quarter_hour() -> u64 {
-    900
+fn present_limit<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
 }
 fn thirty() -> u64 {
     30
@@ -210,7 +209,6 @@ pub(crate) struct ChildEnv {
 }
 #[derive(Clone)]
 struct ResolvedRule {
-    tool: Tool,
     root: PathBuf,
     values: HashMap<String, String>,
 }
@@ -220,15 +218,10 @@ impl std::fmt::Debug for ChildEnv {
     }
 }
 impl ChildEnv {
-    pub(crate) fn for_spawn(&self, origin: SessionOrigin, cwd: &Path) -> HashMap<String, String> {
+    pub(crate) fn for_spawn(&self, cwd: &Path) -> HashMap<String, String> {
         let mut env = self.inherited.clone();
         for rule in &self.rules {
-            let matches = matches!(
-                (rule.tool, origin),
-                (Tool::ExecCommand, SessionOrigin::ExecContinuation)
-                    | (Tool::StartSession, SessionOrigin::ExplicitSession)
-            );
-            if matches && cwd.starts_with(&rule.root) {
+            if cwd.starts_with(&rule.root) {
                 env.extend(rule.values.clone());
             }
         }
@@ -345,16 +338,58 @@ impl Config {
                 agent_name_allocation: agent_pool.agent_name_allocation,
             })
         }).transpose()?;
+        let legacy_quota =
+            raw.max_explicit_sessions.is_some() || raw.max_exec_continuations.is_some();
+        let legacy_timeout = raw.explicit_session_idle_timeout.is_some()
+            || raw.exec_continuation_idle_timeout.is_some();
+        if raw.max_sessions.is_some() && legacy_quota {
+            bail!("max_sessions cannot be combined with legacy session quotas");
+        }
+        if raw.session_idle_timeout.is_some() && legacy_timeout {
+            bail!("session_idle_timeout cannot be combined with legacy idle timeouts");
+        }
+        for (name, value, maximum) in [
+            (
+                "max_explicit_sessions",
+                raw.max_explicit_sessions.map(|n| n as u64),
+                1024,
+            ),
+            (
+                "max_exec_continuations",
+                raw.max_exec_continuations.map(|n| n as u64),
+                1024,
+            ),
+            (
+                "explicit_session_idle_timeout",
+                raw.explicit_session_idle_timeout,
+                31_536_000,
+            ),
+            (
+                "exec_continuation_idle_timeout",
+                raw.exec_continuation_idle_timeout,
+                31_536_000,
+            ),
+        ] {
+            if value.is_some_and(|n| !(1..=maximum).contains(&n)) {
+                bail!("{name} must be in 1..={maximum}");
+            }
+        }
         let config = Self {
             workspace,
             shell,
             output_store_dir,
             child_env,
             additional_instructions,
-            max_explicit_sessions: raw.max_explicit_sessions,
-            max_exec_continuations: raw.max_exec_continuations,
-            explicit_session_idle_timeout: Duration::from_secs(raw.explicit_session_idle_timeout),
-            exec_continuation_idle_timeout: Duration::from_secs(raw.exec_continuation_idle_timeout),
+            max_sessions: raw.max_sessions.unwrap_or_else(|| {
+                raw.max_explicit_sessions.unwrap_or(3) + raw.max_exec_continuations.unwrap_or(3)
+            }),
+            session_idle_timeout: Duration::from_secs(raw.session_idle_timeout.unwrap_or_else(
+                || {
+                    raw.explicit_session_idle_timeout
+                        .unwrap_or(3600)
+                        .max(raw.exec_continuation_idle_timeout.unwrap_or(900))
+                },
+            )),
             reaper_interval: Duration::from_secs(raw.reaper_interval),
             output_cap_bytes: raw.output_cap_bytes,
             output_store_retention: Duration::from_secs(raw.output_store_retention),
@@ -367,24 +402,10 @@ impl Config {
 
     pub(crate) fn validate_limits(&self) -> anyhow::Result<()> {
         for (name, n, max) in [
+            ("max_sessions", self.max_sessions as u64, 2048),
             (
-                "max_explicit_sessions",
-                self.max_explicit_sessions as u64,
-                1024,
-            ),
-            (
-                "max_exec_continuations",
-                self.max_exec_continuations as u64,
-                1024,
-            ),
-            (
-                "explicit_session_idle_timeout",
-                self.explicit_session_idle_timeout.as_secs(),
-                31_536_000,
-            ),
-            (
-                "exec_continuation_idle_timeout",
-                self.exec_continuation_idle_timeout.as_secs(),
+                "session_idle_timeout",
+                self.session_idle_timeout.as_secs(),
                 31_536_000,
             ),
             ("reaper_interval", self.reaper_interval.as_secs(), 86400),
@@ -467,6 +488,11 @@ fn resolve_env(
         }
     }
     for rule in &raw.rules {
+        if matches!(rule.tool, Tool::StartSession) {
+            bail!(
+                "child_env rule tool=start_session was removed; explicitly migrate it to exec_command or remove the rule"
+            );
+        }
         if rule.set_from_env.is_empty() {
             bail!("child_env rule set_from_env must not be empty");
         }
@@ -503,7 +529,6 @@ fn resolve_env(
     let mut rules = Vec::new();
     for rule in raw.rules {
         rules.push(ResolvedRule {
-            tool: rule.tool,
             root: canonical_directory(base, &rule.workdir_under, "child_env.workdir_under")?,
             values: rule
                 .set_from_env
@@ -574,7 +599,54 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn environment_is_snapshotted_redacted_and_start_session_rule_is_distinct() {
+    fn unified_session_limits_migrate_legacy_values_and_reject_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let base = json!({
+            "version":1, "workspace":".", "shell":"/bin/bash", "output_store_dir":"outputs",
+            "child_env":{"inherit":[], "rules":[]}
+        });
+        let load = |extra: serde_json::Value| {
+            let mut raw = base.clone();
+            raw.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            std::fs::write(&path, raw.to_string()).unwrap();
+            Config::load_with_env(&path, &HashMap::new())
+        };
+        let defaults = load(json!({})).unwrap();
+        assert_eq!(defaults.max_sessions, 6);
+        assert_eq!(defaults.session_idle_timeout.as_secs(), 3600);
+        let legacy = load(json!({
+            "max_explicit_sessions":2, "max_exec_continuations":4,
+            "explicit_session_idle_timeout":60, "exec_continuation_idle_timeout":90
+        }))
+        .unwrap();
+        assert_eq!(legacy.max_sessions, 6);
+        assert_eq!(legacy.session_idle_timeout.as_secs(), 90);
+        let unified = load(json!({"max_sessions":9, "session_idle_timeout":120})).unwrap();
+        assert_eq!(unified.max_sessions, 9);
+        assert_eq!(unified.session_idle_timeout.as_secs(), 120);
+        for invalid in [
+            json!({"max_sessions":6,"max_explicit_sessions":3}),
+            json!({"session_idle_timeout":60,"exec_continuation_idle_timeout":60}),
+            json!({"max_sessions":null}),
+            json!({"session_idle_timeout":null}),
+            json!({"max_explicit_sessions":0}),
+            json!({"exec_continuation_idle_timeout":0}),
+        ] {
+            assert!(load(invalid).is_err());
+        }
+        let error = load(json!({"child_env":{"inherit":[], "rules":[{
+            "tool":"start_session", "workdir_under":".", "set_from_env":{"TOKEN":"SOURCE"}
+        }]}}))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("explicitly migrate"), "{error}");
+    }
+
+    #[test]
+    fn environment_is_snapshotted_redacted_and_applies_to_all_exec_processes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(
@@ -582,7 +654,7 @@ mod tests {
             json!({
                 "version":1, "workspace":".", "shell":"/bin/bash", "output_store_dir":"outputs",
                 "child_env":{"inherit":["ALLOWED"], "rules":[{
-                    "tool":"start_session", "workdir_under":".", "set_from_env":{"TARGET":"SOURCE"}
+                    "tool":"exec_command", "workdir_under":".", "set_from_env":{"TARGET":"SOURCE"}
                 }]}
             })
             .to_string(),
@@ -599,15 +671,7 @@ mod tests {
         env.insert("ALLOWED".into(), "changed".into());
         let cwd = dir.path().canonicalize().unwrap();
         assert_eq!(
-            config
-                .child_env
-                .for_spawn(SessionOrigin::ExecContinuation, &cwd),
-            HashMap::from([("ALLOWED".into(), "allowed-original".into())])
-        );
-        assert_eq!(
-            config
-                .child_env
-                .for_spawn(SessionOrigin::ExplicitSession, &cwd),
+            config.child_env.for_spawn(&cwd),
             HashMap::from([
                 ("ALLOWED".into(), "allowed-original".into()),
                 ("TARGET".into(), "SECRET_SENTINEL".into())

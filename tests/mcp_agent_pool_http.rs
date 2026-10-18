@@ -245,7 +245,7 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
     let tools = tools["result"]["tools"].as_array().unwrap();
     for name in [
         "exec_command",
-        "start_session",
+        "pool_wait",
         "write_stdin",
         "wait_for_exit",
         "pool_members",
@@ -334,14 +334,44 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
         .unwrap();
     assert_eq!(members_schema["annotations"]["readOnlyHint"], true);
     assert_eq!(members_schema["inputSchema"]["required"], json!(["pool"]));
+    assert!(
+        members_schema["inputSchema"]["properties"]
+            .get("wait_seconds")
+            .is_none()
+    );
+    assert!(!tools.iter().any(|tool| tool["name"] == "start_session"));
+    let wait_schema = tools
+        .iter()
+        .find(|tool| tool["name"] == "pool_wait")
+        .unwrap();
+    assert_eq!(wait_schema["inputSchema"]["required"], json!(["pool"]));
     assert_eq!(
-        members_schema["inputSchema"]["properties"]["wait_seconds"]["minimum"],
+        wait_schema["inputSchema"]["properties"]["wait_seconds"]["minimum"],
         5
     );
     assert_eq!(
-        members_schema["inputSchema"]["properties"]["wait_seconds"]["maximum"],
+        wait_schema["inputSchema"]["properties"]["wait_seconds"]["maximum"],
         45
     );
+    assert_eq!(
+        wait_schema["inputSchema"]["properties"]["wait_seconds"]["default"],
+        35
+    );
+    for required in ["reason", "messages", "membership_changed"] {
+        assert!(
+            wait_schema["outputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(required))
+        );
+    }
+    for tool in tools {
+        assert!(
+            tool["outputSchema"]["properties"]
+                .get("delivery_receipts")
+                .is_some()
+        );
+    }
     assert!(
         members_schema["outputSchema"]["properties"]
             .get("self_agent")
@@ -485,6 +515,20 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
     let acknowledged = server.exec("session-a").await;
     assert!(structured(&acknowledged).get("peer_messages").is_none());
 
+    let receipt = server
+        .tool("pool_wait", json!({"pool":"Imperator"}), Some("session-b"))
+        .await;
+    assert_eq!(structured(&receipt)["reason"], "receipt");
+    assert_eq!(structured(&receipt)["messages"], json!([]));
+    assert_eq!(
+        structured(&receipt)["delivery_receipts"][0]["status"],
+        "offered"
+    );
+    assert_eq!(
+        structured(&receipt)["delivery_receipts"][0]["message_id"],
+        structured(&targeted)["message_id"]
+    );
+
     let members = server
         .tool(
             "pool_members",
@@ -568,14 +612,14 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
 }
 
 #[tokio::test]
-async fn blocking_members_wakes_and_pool_text_contains_each_body_once() {
+async fn pool_wait_wakes_and_pool_text_contains_each_body_once() {
     let server = Server::new().await;
     server.send("session-a", "global", "join-a").await;
     server.send("session-b", "global", "join-b").await;
     server.exec("session-a").await;
-    // A new pool_members call ACKs join-b exactly once before waiting.
+    // A new non-overlapping wait retires the previous join offer.
     let wait = server.tool(
-        "pool_members",
+        "pool_wait",
         json!({"pool":"Imperator", "wait_seconds":35}),
         Some("session-a"),
     );
@@ -590,7 +634,10 @@ async fn blocking_members_wakes_and_pool_text_contains_each_body_once() {
             .await
             .unwrap();
     assert_eq!(structured(&sent)["recipients"], json!(["Augustus"]));
-    let peers = structured(&received)["peer_messages"].as_array().unwrap();
+    assert_eq!(structured(&received)["reason"], "message");
+    assert_eq!(structured(&received)["membership_changed"], false);
+    assert!(structured(&received).get("peer_messages").is_none());
+    let peers = structured(&received)["messages"].as_array().unwrap();
     assert_eq!(peers.len(), 1);
     assert_eq!(peers[0]["to"], "Augustus");
     assert_eq!(peers[0]["target"], "Augustus");
@@ -608,11 +655,55 @@ async fn blocking_members_wakes_and_pool_text_contains_each_body_once() {
     for value in [json!(0), json!(4), json!(46), json!(null), json!(10.5)] {
         let invalid = server
             .tool(
-                "pool_members",
+                "pool_wait",
                 json!({"pool":"Imperator", "wait_seconds":value}),
                 Some("session-a"),
             )
             .await;
         assert_eq!(invalid["result"]["isError"], true, "{invalid}");
     }
+    let removed_wait = server
+        .tool(
+            "pool_members",
+            json!({"pool":"Imperator", "wait_seconds":35}),
+            Some("session-a"),
+        )
+        .await;
+    assert_eq!(removed_wait["result"]["isError"], true);
+    // The offered receipt survives both structured and text error-result paths.
+    let error_receipt = server
+        .tool("exec_command", json!({"cmd":""}), Some("session-b"))
+        .await;
+    assert_eq!(error_receipt["result"]["isError"], true);
+    assert_eq!(
+        structured(&error_receipt)["delivery_receipts"][0]["status"],
+        "offered"
+    );
+    assert_eq!(
+        structured(&error_receipt)["delivery_receipts"][0]["message_id"],
+        structured(&sent)["message_id"]
+    );
+    assert!(
+        error_receipt["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("offered to Augustus")
+    );
+
+    let wait = server.tool("pool_wait", json!({"pool":"Imperator"}), Some("session-a"));
+    let leave = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.leave("session-b").await
+    };
+    let (changed, _) =
+        tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(wait, leave) })
+            .await
+            .unwrap();
+    assert_eq!(structured(&changed)["reason"], "membership_changed");
+    assert_eq!(structured(&changed)["messages"], json!([]));
+    assert_eq!(structured(&changed)["membership_changed"], true);
+    let no_session = server
+        .tool("pool_wait", json!({"pool":"Imperator"}), None)
+        .await;
+    assert_eq!(no_session["result"]["isError"], true);
 }

@@ -55,28 +55,29 @@ See [Configuration](docs/configuration.md) for all settings.
 | Tool | Purpose |
 | --- | --- |
 | `exec_command` | Run a shell command. Long-running commands can continue through a session ID. |
-| `start_session` | Start a stateful shell, REPL, or long-running process. Uses a PTY by default. |
 | `write_stdin` | Send input, interrupt a process, or poll pending output. |
 | `wait_for_exit` | Wait for a running process to finish without polling ordinary output. |
 
-Use `exec_command` for ordinary stateless commands and `start_session` when
-shell state or the working directory must persist across calls.
+`exec_command` also starts interactive shells and REPLs. Set `tty=true` when
+a terminal is needed. If a process is still running, use its returned
+`session_id` with `write_stdin` to continue it across calls.
 
 Large outputs are bounded in MCP responses. When the complete capture is stored
 separately, the result includes an `output_ref` that points to the retained log.
 
 ## Agent pools
 
-Optional agent pools add two tools for coordination between MCP clients:
+When enabled, agent pools support coordination between MCP clients:
 
 ```text
 pool_members(pool="project")
 pool_send(pool="project", target="global", message="Tests passed")
+pool_wait(pool="project", wait_seconds=35)
 ```
 
-Messages are queued and delivered with later MCP tool calls; they do not wake an
-idle client. See [Agent pools](docs/agent-pools.md) for delivery semantics,
-membership behavior, and deployment notes.
+Messages arrive in subsequent tool responses or a pending `pool_wait`; they
+do not wake an idle client on their own. See [Agent pools](docs/agent-pools.md)
+for delivery, membership, and deployment details.
 
 ## Streamable HTTP
 

@@ -1,17 +1,22 @@
+export function peerMessages(e) {
+  const result = e.detail?.result;
+  return result?.peer_messages || (e.detail?.tool === 'pool_wait' ? result?.messages : null) || [];
+}
 export function eventPools(e, starts) {
   const pools = new Set((e.agents || []).map(a => a.pool));
   for (const name of [e.detail?.pool, e.detail?.arguments?.pool,
     starts.get(e.detail?.start_event_id)?.detail?.arguments?.pool]) {
     if (name) pools.add(name);
   }
-  for (const m of e.detail?.result?.peer_messages || []) pools.add(m.pool);
+  for (const m of peerMessages(e)) pools.add(m.pool);
+  for (const receipt of e.detail?.result?.delivery_receipts || []) pools.add(receipt.pool);
   return pools;
 }
 export function isMessageEvent(e, starts) {
   const start = e.kind === 'tool.start' ? e : starts.get(e.detail?.start_event_id);
   return e.kind === 'admin.message.send' ||
     (start?.detail?.tool === 'pool_send' && typeof start.detail.arguments?.message === 'string' && !start.detail.arguments.action) ||
-    (e.detail?.result?.peer_messages || []).length > 0;
+    peerMessages(e).length > 0;
 }
 export function eventIdentities(e, starts, finishes) {
   const start = e.kind === 'tool.start' ? e : starts.get(e.detail?.start_event_id);
@@ -25,8 +30,11 @@ export function eventIdentities(e, starts, finishes) {
     agents.push({pool: e.detail.pool, agent: 'admin'});
     if (e.detail.target !== 'global') agents.push({pool: e.detail.pool, agent: e.detail.target});
   }
-  for (const m of e.detail?.result?.peer_messages || []) {
+  for (const m of peerMessages(e)) {
     agents.push({pool: m.pool, agent: m.from}, {pool: m.pool, agent: m.to});
+  }
+  for (const receipt of e.detail?.result?.delivery_receipts || []) {
+    agents.push({pool: receipt.pool, agent: receipt.to});
   }
   return agents;
 }

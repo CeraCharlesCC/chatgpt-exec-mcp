@@ -1,3 +1,5 @@
+import { peerMessages } from './events.js';
+
 export function messages(events, finishes, pools, adminMessages) {
   const rows = [], received = new Set();
   const identities = (pools || []).flatMap(p => p.agents);
@@ -31,7 +33,7 @@ export function messages(events, finishes, pools, adminMessages) {
         timestamp_ms: e.timestamp_ms, kind: 'message.send', agents, sessions: [], recipient_count: d.delivery_count,
         status: `Queued for ${d.delivery_count} recipient(s)`});
     }
-    for (const m of d.result?.peer_messages || []) {
+    for (const m of peerMessages(e)) {
       // Older snapshots use to=global. Event identities retain the recipient
       // even after that member has left or its name has been reused.
       const recipient = m.to === 'global' ? (e.agents || []).find(a => a.pool === m.pool)?.agent : m.to;

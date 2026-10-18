@@ -1,7 +1,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 
-use crate::agent_pool::PeerMessage;
+use crate::agent_pool::{DeliveryReceipt, PeerMessage};
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
@@ -10,7 +10,6 @@ use serde::de::Error as _;
 use serde::de::Visitor;
 
 pub const DEFAULT_EXEC_YIELD_MS: u64 = 10_000;
-pub const DEFAULT_SESSION_YIELD_MS: u64 = 250;
 pub const DEFAULT_WRITE_YIELD_MS: u64 = 250;
 pub const DEFAULT_POLL_YIELD_MS: u64 = 5_000;
 pub const DEFAULT_WAIT_SECONDS: u64 = 35;
@@ -57,45 +56,11 @@ impl ExecCommandArgs {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(crate = "rmcp::schemars")]
-pub struct StartSessionArgs {
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    /// Command; omit for the configured shell.
-    #[schemars(
-        with = "String",
-        length(min = 1),
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub cmd: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    /// Workspace-relative or absolute directory; not a sandbox boundary.
-    #[schemars(
-        with = "String",
-        length(min = 1),
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub workdir: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    /// Use a PTY.
-    #[schemars(with = "bool", extend("default" = true))]
-    pub tty: Option<bool>,
-    #[serde(default, deserialize_with = "deserialize_optional_positive_usize")]
-    /// Display budget (~4 bytes per token).
-    #[schemars(
-        with = "usize",
-        range(min = 1),
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub max_output_tokens: Option<usize>,
-}
-
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct WriteStdinArgs {
-    /// Process handle from exec_command or start_session.
+    /// Process handle from exec_command.
     #[schemars(regex(pattern = "^[a-z]+-[a-z]+$"))]
     pub session_id: String,
     #[serde(default)]
@@ -115,7 +80,7 @@ pub struct WriteStdinArgs {
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct WaitForExitArgs {
-    /// Process handle from exec_command or start_session.
+    /// Process handle from exec_command.
     #[schemars(regex(pattern = "^[a-z]+-[a-z]+$"))]
     pub session_id: String,
     #[serde(
@@ -254,6 +219,9 @@ pub struct ExecResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<PeerMessage>", default)]
     pub peer_messages: Option<Vec<PeerMessage>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<DeliveryReceipt>", default)]
+    pub delivery_receipts: Option<Vec<DeliveryReceipt>>,
 }
 
 fn exec_response_schema(schema: &mut rmcp::schemars::Schema) {
@@ -368,7 +336,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            serde_json::from_value::<StartSessionArgs>(serde_json::json!({
+            serde_json::from_value::<ExecCommandArgs>(serde_json::json!({
                 "cmd": null
             }))
             .is_err()

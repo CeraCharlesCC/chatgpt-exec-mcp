@@ -15,9 +15,9 @@ use uuid::Uuid;
 use crate::config::AgentNameAllocation;
 
 use super::{
-    ADMIN_AGENT, AdminMember, AdminMessage, AgentIdentity, MAX_NAME_CHARS, PeerMessage, PoolAction,
-    PoolMembersArgs, PoolMembersResult, PoolSendArgs, PoolSendResult, invalid, now_ms,
-    storage_error, validate_name, validate_session,
+    ADMIN_AGENT, AdminMember, AdminMessage, AgentIdentity, Communications, DeliveryReceipt,
+    MAX_NAME_CHARS, PeerMessage, PoolAction, PoolMembersArgs, PoolMembersResult, PoolSendArgs,
+    PoolSendResult, ReceiptStatus, invalid, now_ms, storage_error, validate_name, validate_session,
 };
 
 const MAX_PENDING: i64 = 10_000;
@@ -38,7 +38,7 @@ pub(super) struct PoolStorage {
 
 pub(super) struct MembersState {
     pub(super) result: PoolMembersResult,
-    pub(super) member_ids: Vec<i64>,
+    pub(super) membership_revision: i64,
     pub(super) next_expiry_ms: Option<i64>,
     pub(super) pending: bool,
 }
@@ -47,6 +47,7 @@ struct MemberMessage<'a> {
     principal: &'a str,
     pool: &'a str,
     sender: &'a str,
+    sender_member_id: Option<i64>,
     target: &'a str,
     body: &'a str,
     in_reply_to: Option<&'a str>,
@@ -176,7 +177,62 @@ impl PoolStorage {
                 "ALTER TABLE admin_messages ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0",
             )?;
         }
-        // ACK only marks a message during this run; discard it on restart.
+        // Additive migration: legacy queued messages have no trustworthy sender
+        // membership identity. Leave it NULL rather than notifying a reused name.
+        for (table, column, definition) in [
+            ("members", "receipt_offered_cursor", "INTEGER"),
+            (
+                "messages",
+                "sender_member_id",
+                "INTEGER REFERENCES members(id) ON DELETE SET NULL",
+            ),
+            ("inbox", "offered_at", "INTEGER"),
+            (
+                "admin_messages",
+                "sender_member_id",
+                "INTEGER REFERENCES members(id) ON DELETE SET NULL",
+            ),
+            ("admin_messages", "offered_at", "INTEGER"),
+        ] {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+                params![table, column],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                transaction.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                ))?;
+            }
+        }
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS delivery_receipts (
+               cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+               member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+               message_id TEXT NOT NULL,
+               pool TEXT NOT NULL,
+               recipient TEXT NOT NULL,
+               recipient_member_id INTEGER NOT NULL,
+               offered_at INTEGER NOT NULL,
+               UNIQUE(member_id,message_id,recipient_member_id)
+             );
+             CREATE INDEX IF NOT EXISTS receipt_member_cursor
+               ON delivery_receipts(member_id,cursor);
+             CREATE TABLE IF NOT EXISTS pool_revisions (
+               principal TEXT NOT NULL, pool TEXT NOT NULL, revision INTEGER NOT NULL,
+               PRIMARY KEY(principal,pool)
+             );
+             CREATE TRIGGER IF NOT EXISTS member_join_revision AFTER INSERT ON members BEGIN
+               INSERT INTO pool_revisions(principal,pool,revision) VALUES(NEW.principal,NEW.pool,1)
+               ON CONFLICT(principal,pool) DO UPDATE SET revision=revision+1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS member_leave_revision AFTER DELETE ON members BEGIN
+               INSERT INTO pool_revisions(principal,pool,revision) VALUES(OLD.principal,OLD.pool,1)
+               ON CONFLICT(principal,pool) DO UPDATE SET revision=revision+1;
+             END;",
+        )?;
+        transaction.execute("UPDATE members SET receipt_offered_cursor=NULL", [])?;
+        // ACK only marks an admin message during this run; discard it on restart.
         transaction.execute("DELETE FROM admin_messages WHERE acknowledged=1", [])?;
         // A process restart cannot know whether an offered response reached its
         // caller. Keep the inbox rows and re-offer them rather than risking
@@ -199,12 +255,29 @@ impl PoolStorage {
         self.connection.lock().map_err(|_| storage_error())
     }
 
-    /// A new tool call acknowledges the previous offer and refreshes all leases
+    /// A non-overlapping tool call retires previous offers and refreshes leases
     /// correlated with this session.
     pub(super) fn begin_tool_state(
         &self,
         principal: &str,
         session: Option<&str>,
+    ) -> Result<(), McpError> {
+        self.tool_state(principal, session, true)
+    }
+
+    pub(super) fn refresh_tool_state(
+        &self,
+        principal: &str,
+        session: Option<&str>,
+    ) -> Result<(), McpError> {
+        self.tool_state(principal, session, false)
+    }
+
+    fn tool_state(
+        &self,
+        principal: &str,
+        session: Option<&str>,
+        retire: bool,
     ) -> Result<(), McpError> {
         validate_name(principal, "principal")?;
         let Some(session) = session else {
@@ -216,36 +289,51 @@ impl PoolStorage {
         let transaction = connection.transaction().map_err(|_| storage_error())?;
         cleanup(&transaction, now)?;
 
-        let offered: Vec<(i64, i64)> = {
-            let mut statement = transaction
-                .prepare(
-                    "SELECT id,offered_cursor FROM members
+        if retire {
+            let offered: Vec<(i64, i64)> = {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT id,offered_cursor FROM members
                      WHERE principal=?1 AND session=?2 AND offered_cursor IS NOT NULL",
-                )
-                .map_err(|_| storage_error())?;
-            statement
-                .query_map(params![principal, session], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })
-                .map_err(|_| storage_error())?
-                .collect::<rusqlite::Result<_>>()
-                .map_err(|_| storage_error())?
-        };
-        for (member_id, cursor) in offered {
-            transaction
-                .execute(
-                    "DELETE FROM inbox WHERE member_id=?1 AND cursor<=?2",
-                    params![member_id, cursor],
-                )
-                .map_err(|_| storage_error())?;
-            transaction
-                .execute(
-                    "UPDATE members
+                    )
+                    .map_err(|_| storage_error())?;
+                statement
+                    .query_map(params![principal, session], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .map_err(|_| storage_error())?
+                    .collect::<rusqlite::Result<_>>()
+                    .map_err(|_| storage_error())?
+            };
+            for (member_id, cursor) in offered {
+                transaction
+                    .execute(
+                        "DELETE FROM inbox WHERE member_id=?1 AND cursor<=?2",
+                        params![member_id, cursor],
+                    )
+                    .map_err(|_| storage_error())?;
+                transaction
+                    .execute(
+                        "UPDATE members
                      SET ack_cursor=MAX(ack_cursor,?2),offered_cursor=NULL
                      WHERE id=?1",
-                    params![member_id, cursor],
+                        params![member_id, cursor],
+                    )
+                    .map_err(|_| storage_error())?;
+            }
+            transaction
+                .execute(
+                    "DELETE FROM delivery_receipts WHERE EXISTS (
+                   SELECT 1 FROM members m WHERE m.id=delivery_receipts.member_id
+                   AND m.principal=?1 AND m.session=?2
+                   AND delivery_receipts.cursor<=m.receipt_offered_cursor)",
+                    params![principal, session],
                 )
                 .map_err(|_| storage_error())?;
+            transaction.execute(
+                "UPDATE members SET receipt_offered_cursor=NULL WHERE principal=?1 AND session=?2",
+                params![principal, session],
+            ).map_err(|_| storage_error())?;
         }
         transaction
             .execute(
@@ -261,14 +349,24 @@ impl PoolStorage {
 
     /// Collect a bounded batch for this session and persist the highest cursor
     /// offered per member. Rows are retained until the session's next tool call.
+    #[cfg(test)]
     pub(super) fn collect_tool_messages(
         &self,
         principal: &str,
         session: Option<&str>,
     ) -> Result<Vec<PeerMessage>, McpError> {
+        Ok(self.collect_tool_comms(principal, session, None)?.messages)
+    }
+
+    pub(super) fn collect_tool_comms(
+        &self,
+        principal: &str,
+        session: Option<&str>,
+        pool: Option<&str>,
+    ) -> Result<Communications, McpError> {
         validate_name(principal, "principal")?;
         let Some(session) = session else {
-            return Ok(Vec::new());
+            return Ok(Communications::default());
         };
         validate_session(session)?;
         let now = now_ms();
@@ -284,12 +382,13 @@ impl PoolStorage {
                      JOIN members m ON m.id=i.member_id
                      JOIN messages msg ON msg.id=i.message_id
                      WHERE m.principal=?1 AND m.session=?2 AND m.expires>?3
-                     ORDER BY i.cursor LIMIT ?4",
+                        AND (?4 IS NULL OR msg.pool=?4)
+                      ORDER BY i.cursor LIMIT ?5",
                 )
                 .map_err(|_| storage_error())?;
             statement
                 .query_map(
-                    params![principal, session, now, MAX_BATCH_COUNT as i64],
+                    params![principal, session, now, pool, MAX_BATCH_COUNT as i64],
                     |row| {
                         Ok((
                             row.get(0)?,
@@ -332,6 +431,27 @@ impl PoolStorage {
                 .entry(member_id)
                 .and_modify(|highest| *highest = (*highest).max(cursor))
                 .or_insert(cursor);
+            // A receipt describes a first offer, never a read or acceptance.
+            // Capture the original sender membership at enqueue time.
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO delivery_receipts
+                   (member_id,message_id,pool,recipient,recipient_member_id,offered_at)
+                 SELECT sender.id,msg.id,msg.pool,?3,?4,?5
+                 FROM inbox i JOIN messages msg ON msg.id=i.message_id
+                 JOIN members sender ON sender.id=msg.sender_member_id
+                 WHERE i.cursor=?1 AND i.member_id=?4 AND i.offered_at IS NULL
+                   AND msg.target<>'global' AND sender.expires>?5
+                   AND sender.principal=?2",
+                    params![cursor, principal, message.to, member_id, now],
+                )
+                .map_err(|_| storage_error())?;
+            transaction
+                .execute(
+                    "UPDATE inbox SET offered_at=COALESCE(offered_at,?2) WHERE cursor=?1",
+                    params![cursor, now],
+                )
+                .map_err(|_| storage_error())?;
             messages.push(message);
         }
         for (member_id, cursor) in offered {
@@ -345,8 +465,51 @@ impl PoolStorage {
                 )
                 .map_err(|_| storage_error())?;
         }
+        let receipts = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT r.cursor,r.member_id,r.message_id,r.pool,r.recipient,r.offered_at
+                 FROM delivery_receipts r JOIN members m ON m.id=r.member_id
+                 WHERE m.principal=?1 AND m.session=?2 AND m.expires>?3
+                   AND (?4 IS NULL OR r.pool=?4)
+                 ORDER BY r.cursor LIMIT ?5",
+                )
+                .map_err(|_| storage_error())?;
+            statement
+                .query_map(
+                    params![principal, session, now, pool, MAX_BATCH_COUNT as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            DeliveryReceipt {
+                                message_id: row.get(2)?,
+                                pool: row.get(3)?,
+                                to: row.get(4)?,
+                                status: ReceiptStatus::Offered,
+                                offered_at_ms: row.get(5)?,
+                            },
+                        ))
+                    },
+                )
+                .map_err(|_| storage_error())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|_| storage_error())?
+        };
+        for (cursor, member_id, _) in &receipts {
+            transaction.execute(
+                "UPDATE members SET receipt_offered_cursor=MAX(COALESCE(receipt_offered_cursor,0),?2)
+                 WHERE id=?1", params![member_id, cursor],
+            ).map_err(|_| storage_error())?;
+        }
         transaction.commit().map_err(|_| storage_error())?;
-        Ok(messages)
+        Ok(Communications {
+            messages,
+            delivery_receipts: receipts
+                .into_iter()
+                .map(|(_, _, receipt)| receipt)
+                .collect(),
+        })
     }
 
     pub(super) fn identities_for_session(
@@ -421,30 +584,56 @@ impl PoolStorage {
         &self,
         principal: &str,
         limit: usize,
-    ) -> Result<Vec<AdminMessage>, McpError> {
+    ) -> Result<(Vec<AdminMessage>, bool), McpError> {
         validate_name(principal, "principal")?;
-        let connection = self.connection()?;
-        let mut statement = connection
-            .prepare(
+        let now = now_ms();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(|_| storage_error())?;
+        cleanup(&transaction, now)?;
+        let messages = {
+            let mut statement = transaction.prepare(
                 "SELECT id,pool,sender,body,in_reply_to,created,acknowledged FROM admin_messages
                  WHERE principal=?1 ORDER BY created DESC,id DESC LIMIT ?2",
-            )
-            .map_err(|_| storage_error())?;
-        statement
-            .query_map(params![principal, limit.min(500) as i64], |row| {
-                Ok(AdminMessage {
-                    message_id: row.get(0)?,
-                    pool: row.get(1)?,
-                    from: row.get(2)?,
-                    message: row.get(3)?,
-                    in_reply_to: row.get(4)?,
-                    created_ms: row.get(5)?,
-                    acknowledged: row.get(6)?,
+            ).map_err(|_| storage_error())?;
+            statement
+                .query_map(params![principal, limit.min(500) as i64], |row| {
+                    Ok(AdminMessage {
+                        message_id: row.get(0)?,
+                        pool: row.get(1)?,
+                        from: row.get(2)?,
+                        message: row.get(3)?,
+                        in_reply_to: row.get(4)?,
+                        created_ms: row.get(5)?,
+                        acknowledged: row.get(6)?,
+                    })
                 })
-            })
-            .map_err(|_| storage_error())?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|_| storage_error())
+                .map_err(|_| storage_error())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|_| storage_error())?
+        };
+        let mut changed = false;
+        for message in &messages {
+            changed |= transaction
+                .execute(
+                    "INSERT OR IGNORE INTO delivery_receipts
+                   (member_id,message_id,pool,recipient,recipient_member_id,offered_at)
+                 SELECT sender.id,msg.id,msg.pool,'admin',0,?3
+                 FROM admin_messages msg JOIN members sender ON sender.id=msg.sender_member_id
+                 WHERE msg.id=?1 AND msg.principal=?2 AND msg.offered_at IS NULL
+                   AND sender.principal=?2 AND sender.expires>?3",
+                    params![message.message_id, principal, now],
+                )
+                .map_err(|_| storage_error())?
+                != 0;
+            transaction
+                .execute(
+                    "UPDATE admin_messages SET offered_at=COALESCE(offered_at,?2) WHERE id=?1",
+                    params![message.message_id, now],
+                )
+                .map_err(|_| storage_error())?;
+        }
+        transaction.commit().map_err(|_| storage_error())?;
+        Ok((messages, changed))
     }
 
     pub(super) fn admin_ack(&self, principal: &str, message_id: &str) -> Result<bool, McpError> {
@@ -499,6 +688,7 @@ impl PoolStorage {
                 principal,
                 pool,
                 sender: ADMIN_AGENT,
+                sender_member_id: None,
                 target,
                 body: message,
                 in_reply_to,
@@ -512,6 +702,7 @@ impl PoolStorage {
             message_id,
             recipients,
             peer_messages: None,
+            delivery_receipts: None,
         })
     }
 
@@ -568,7 +759,12 @@ impl PoolStorage {
         targets: &[(i64, String)],
     ) -> Result<(Option<String>, Vec<String>), McpError> {
         let pending: i64 = transaction
-            .query_row("SELECT COUNT(*) FROM inbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM inbox) + (SELECT COUNT(*) FROM delivery_receipts)
+                     + (SELECT COUNT(*) FROM admin_messages WHERE acknowledged=0)",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|_| storage_error())?;
         if pending + targets.len() as i64 > MAX_PENDING {
             return Err(invalid("agent pool inbox is full; retry later"));
@@ -583,8 +779,8 @@ impl PoolStorage {
             let message_id = format!("msg_{}", Uuid::new_v4());
             transaction
                 .execute(
-                    "INSERT INTO messages(id,principal,pool,sender,target,body,in_reply_to,created)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    "INSERT INTO messages(id,principal,pool,sender,target,body,in_reply_to,created,sender_member_id)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                     params![
                         message_id,
                         message.principal,
@@ -593,7 +789,8 @@ impl PoolStorage {
                         message.target,
                         message.body,
                         message.in_reply_to,
-                        message.created_ms
+                        message.created_ms,
+                        message.sender_member_id
                     ],
                 )
                 .map_err(|_| storage_error())?;
@@ -687,21 +884,28 @@ impl PoolStorage {
             Some(session) => transaction
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM inbox i JOIN members m ON m.id=i.member_id
-                 WHERE m.principal=?1 AND m.session=?2 AND m.expires>?3)",
-                    params![principal, session, now],
+                 WHERE m.principal=?1 AND m.session=?2 AND m.expires>?3 AND m.pool=?4)
+                     OR EXISTS(SELECT 1 FROM delivery_receipts r JOIN members m ON m.id=r.member_id
+                       WHERE m.principal=?1 AND m.session=?2 AND m.expires>?3 AND r.pool=?4)",
+                    params![principal, session, now, args.pool],
                     |row| row.get(0),
                 )
                 .map_err(|_| storage_error())?,
             None => false,
         };
+        let membership_revision = transaction.query_row(
+            "SELECT COALESCE((SELECT revision FROM pool_revisions WHERE principal=?1 AND pool=?2),0)",
+            params![principal, args.pool], |row| row.get(0),
+        ).map_err(|_| storage_error())?;
         transaction.commit().map_err(|_| storage_error())?;
         Ok(MembersState {
             result: PoolMembersResult {
                 agents: members.iter().map(|(_, agent, _)| agent.clone()).collect(),
                 self_agent,
                 peer_messages: None,
+                delivery_receipts: None,
             },
-            member_ids: members.iter().map(|(id, _, _)| *id).collect(),
+            membership_revision,
             next_expiry_ms: members.iter().map(|(_, _, expires)| *expires).min(),
             pending,
         })
@@ -851,11 +1055,22 @@ impl PoolStorage {
             .map_err(|_| storage_error())?;
 
         if target == ADMIN_AGENT {
+            let pending: i64 = transaction
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM inbox) + (SELECT COUNT(*) FROM delivery_receipts)
+                        + (SELECT COUNT(*) FROM admin_messages WHERE acknowledged=0)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| storage_error())?;
+            if pending >= MAX_PENDING {
+                return Err(invalid("agent pool inbox is full; retry later"));
+            }
             let message_id = format!("msg_{}", Uuid::new_v4());
             transaction
                 .execute(
-                    "INSERT INTO admin_messages(id,principal,pool,sender,body,in_reply_to,created)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    "INSERT INTO admin_messages(id,principal,pool,sender,body,in_reply_to,created,sender_member_id)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
                         message_id,
                         principal,
@@ -863,7 +1078,8 @@ impl PoolStorage {
                         sender,
                         message,
                         in_reply_to,
-                        now
+                        now,
+                        sender_id
                     ],
                 )
                 .map_err(|_| storage_error())?;
@@ -885,6 +1101,7 @@ impl PoolStorage {
                 message_id: Some(message_id),
                 recipients: vec![ADMIN_AGENT.to_owned()],
                 peer_messages: None,
+                delivery_receipts: None,
             });
         }
 
@@ -902,6 +1119,7 @@ impl PoolStorage {
                 principal,
                 pool,
                 sender: &sender,
+                sender_member_id: Some(sender_id),
                 target: &target,
                 body: &message,
                 in_reply_to: in_reply_to.as_deref(),
@@ -918,6 +1136,7 @@ impl PoolStorage {
             message_id,
             recipients,
             peer_messages: None,
+            delivery_receipts: None,
         })
     }
 

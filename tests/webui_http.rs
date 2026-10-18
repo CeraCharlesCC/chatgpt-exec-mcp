@@ -451,8 +451,8 @@ async fn clear_removes_all_history_and_only_the_current_accounts_admin_inbox() {
         .finish_tool_turn("account-a", Some("session"), turn.as_ref())
         .await
         .unwrap();
-    assert_eq!(offered.len(), 1);
-    assert_eq!(offered[0].message, "pending delivery");
+    assert_eq!(offered.messages.len(), 1);
+    assert_eq!(offered.messages[0].message, "pending delivery");
     let id = activity.emit("tool.start", "info", None, vec![], json!({}));
     assert_eq!(id, 451);
     assert_eq!(server.snapshot().await["events"][0]["id"], id);
@@ -583,9 +583,17 @@ async fn handlers_scope_snapshot_send_ack_and_termination_to_principal() {
         .finish_tool_turn("account-b", Some("session"), b_turn.as_ref())
         .await
         .unwrap();
-    assert_eq!(a_messages.len(), 1);
-    assert_eq!(a_messages[0].message, "hello");
-    assert!(b_messages.is_empty());
+    assert_eq!(a_messages.messages.len(), 1);
+    assert_eq!(a_messages.messages[0].message, "hello");
+    assert!(b_messages.messages.is_empty());
+    assert_eq!(a_messages.delivery_receipts.len(), 1);
+    assert_eq!(a_messages.delivery_receipts[0].message_id, message_id);
+    assert_eq!(b_messages.delivery_receipts.len(), 1);
+    assert_eq!(
+        b_messages.delivery_receipts[0].message_id,
+        other_message.message_id
+    );
+    assert_eq!(b_messages.delivery_receipts[0].to, "admin");
 
     assert_eq!(
         server

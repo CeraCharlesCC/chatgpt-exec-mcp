@@ -14,14 +14,12 @@ use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router
 
 use crate::activity::ActivityHub;
 use crate::agent_pool::{
-    AgentIdentity, AgentPoolStore, PeerMessage, PoolMembersArgs, PoolMembersResult, PoolSendArgs,
-    PoolSendResult, SessionTurn,
+    AgentIdentity, AgentPoolStore, Communications, PoolMembersArgs, PoolMembersResult,
+    PoolSendArgs, PoolSendResult, PoolWaitArgs, PoolWaitResult, SessionTurn,
 };
 use crate::agent_pool_context::AgentPoolContext;
 use crate::process_manager::ProcessManager;
-use crate::tools::{
-    ExecCommandArgs, ExecResponse, StartSessionArgs, WaitForExitArgs, WriteStdinArgs,
-};
+use crate::tools::{ExecCommandArgs, ExecResponse, WaitForExitArgs, WriteStdinArgs};
 
 #[derive(Clone)]
 pub struct ExecMcpServer {
@@ -38,6 +36,7 @@ impl ExecMcpServer {
         let mut tool_router = Self::tool_router();
         tool_router.disable_route("pool_members");
         tool_router.disable_route("pool_send");
+        tool_router.disable_route("pool_wait");
         Self {
             manager,
             tool_router,
@@ -53,6 +52,7 @@ impl ExecMcpServer {
         self.agent_pool = Some(AgentPoolContext::new(store, principal));
         self.tool_router.enable_route("pool_members");
         self.tool_router.enable_route("pool_send");
+        self.tool_router.enable_route("pool_wait");
         self
     }
 
@@ -114,34 +114,34 @@ impl ExecMcpServer {
 
     fn pool_activity_detail<T: serde::Serialize>(
         result: &Result<T, McpError>,
-        peers: &[PeerMessage],
+        comms: &Communications,
     ) -> (bool, Value) {
         match result {
             Ok(value) => (
                 true,
-                Self::activity_with_peers(json!({"value": value}), peers),
+                Self::activity_with_comms(json!({"value": value}), comms),
             ),
             Err(error) => (
                 false,
-                Self::activity_with_peers(json!({"error": error.message.to_string()}), peers),
+                Self::activity_with_comms(json!({"error": error.message.to_string()}), comms),
             ),
         }
     }
 
     fn exec_activity_detail(
         result: &anyhow::Result<ExecResponse>,
-        peers: &[PeerMessage],
+        comms: &Communications,
     ) -> (bool, Value) {
         match result {
-            Ok(response) => (true, Self::exec_response_detail(response, peers)),
+            Ok(response) => (true, Self::exec_response_detail(response, comms)),
             Err(error) => (
                 false,
-                Self::activity_with_peers(json!({"error": error.to_string()}), peers),
+                Self::activity_with_comms(json!({"error": error.to_string()}), comms),
             ),
         }
     }
 
-    fn exec_response_detail(response: &ExecResponse, peers: &[PeerMessage]) -> Value {
+    fn exec_response_detail(response: &ExecResponse, comms: &Communications) -> Value {
         // Use the wire result's sparse fields; add diagnostics only to activity.
         let mut detail = json!(response);
         if let Some(object) = detail.as_object_mut() {
@@ -157,14 +157,17 @@ impl ExecMcpServer {
                 json!(response.call_wall_time_seconds),
             );
         }
-        Self::activity_with_peers(detail, peers)
+        Self::activity_with_comms(detail, comms)
     }
 
-    fn activity_with_peers(mut detail: Value, peers: &[PeerMessage]) -> Value {
-        if !peers.is_empty()
-            && let Some(object) = detail.as_object_mut()
-        {
-            object.insert("peer_messages".into(), json!(peers));
+    fn activity_with_comms(mut detail: Value, comms: &Communications) -> Value {
+        if let Some(object) = detail.as_object_mut() {
+            if !comms.messages.is_empty() {
+                object.insert("peer_messages".into(), json!(comms.messages));
+            }
+            if !comms.delivery_receipts.is_empty() {
+                object.insert("delivery_receipts".into(), json!(comms.delivery_receipts));
+            }
         }
         detail
     }
@@ -216,9 +219,9 @@ impl ExecMcpServer {
         &self,
         session: Option<&str>,
         turn: Option<&SessionTurn>,
-    ) -> Result<Vec<PeerMessage>, McpError> {
+    ) -> Result<Communications, McpError> {
         let Some(context) = self.agent_pool.as_ref() else {
-            return Ok(Vec::new());
+            return Ok(Communications::default());
         };
         context
             .store()
@@ -233,9 +236,9 @@ impl ExecMcpServer {
         &self,
         session: Option<&str>,
         turn: Option<&SessionTurn>,
-    ) -> Vec<PeerMessage> {
+    ) -> Communications {
         match self.finish_tool(session, turn).await {
-            Ok(peers) => peers,
+            Ok(comms) => comms,
             Err(error) => {
                 eprintln!("agent pool piggyback collection failed; preserving primary tool result");
                 self.activity.emit(
@@ -248,13 +251,12 @@ impl ExecMcpServer {
                         "error": error.message.to_string(),
                     }),
                 );
-                Vec::new()
+                Communications::default()
             }
         }
     }
 
-    /// List leased members; optionally wait for session messages (any pool) or
-    /// membership changes here. Does not join.
+    /// List leased members immediately. Does not join; use pool_wait to wait.
     #[tool(output_schema = schema_for_output::<PoolMembersResult>(), annotations(read_only_hint = true))]
     async fn pool_members(
         &self,
@@ -269,27 +271,52 @@ impl ExecMcpServer {
         );
         let turn = self.begin_tool(session.as_deref()).await?;
         let (pool, principal) = self.agent_pool_context()?;
+        let result = pool.members(principal, args, session.as_deref());
+        let comms = self
+            .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
+            .await;
+        let (success, detail) = Self::pool_activity_detail(&result, &comms);
+        self.tool_finished("pool_members", session.as_deref(), started, success, detail);
+        Self::pool_result(result, comms)
+    }
+
+    /// Wait for this pool's messages, offered receipts, membership changes, or timeout.
+    /// Returns messages directly; timeout is a normal result. Does not join.
+    #[tool(output_schema = schema_for_output::<PoolWaitResult>(), annotations(read_only_hint = true))]
+    async fn pool_wait(
+        &self,
+        Parameters(args): Parameters<PoolWaitArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let session = Self::session(&context);
+        let started = self.tool_started("pool_wait", session.as_deref(), json!(&args));
+        let (pool, principal) = self.agent_pool_context()?;
         let result = tokio::select! {
             biased;
             _ = context.ct.cancelled() => {
-                self.tool_finished("pool_members", session.as_deref(), started, false,
-                    json!({"error": "pool_members cancelled"}));
-                // Cancellation must not offer unread inbox rows in a response
-                // the caller will discard. Membership and pending rows remain.
-                return Err(McpError::internal_error("pool_members cancelled", None));
+                self.tool_finished("pool_wait", session.as_deref(), started, false,
+                    json!({"error": "pool_wait cancelled"}));
+                return Err(McpError::internal_error("pool_wait cancelled", None));
             },
-            result = pool.wait_members(principal, args, session.as_deref()) => result,
+            result = pool.wait(principal, args, session.as_deref()) => result,
         };
-        let peers = self
-            .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
-            .await;
-        let (success, detail) = Self::pool_activity_detail(&result, &peers);
-        self.tool_finished("pool_members", session.as_deref(), started, success, detail);
-        Self::pool_result(result, peers)
+        let detail = match &result {
+            Ok(value) => json!(value),
+            Err(error) => json!({"error": error.message.to_string()}),
+        };
+        self.tool_finished(
+            "pool_wait",
+            session.as_deref(),
+            started,
+            result.is_ok(),
+            detail,
+        );
+        Self::pool_result(result, Communications::default())
     }
 
     /// Queue a message; first send joins and assigns a name. Messages arrive on
-    /// tool calls, never wake idle chats; no ACK reply needed.
+    /// tool calls, never wake idle chats. Direct sends later get offered receipts;
+    /// these confirm response preparation, not receipt, acceptance, or completion.
     #[tool(output_schema = schema_for_output::<PoolSendResult>(), annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true, idempotent_hint = false))]
     async fn pool_send(
         &self,
@@ -305,33 +332,24 @@ impl ExecMcpServer {
         let turn = self.begin_tool(session.as_deref()).await?;
         let (pool, principal) = self.agent_pool_context()?;
         let result = pool.send(principal, args, session.as_deref());
-        let peers = self
+        let comms = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
-        let (success, detail) = Self::pool_activity_detail(&result, &peers);
+        let (success, detail) = Self::pool_activity_detail(&result, &comms);
         self.tool_finished("pool_send", session.as_deref(), started, success, detail);
-        Self::pool_result(result, peers)
+        Self::pool_result(result, comms)
     }
 
     fn pool_result<T: serde::Serialize>(
         result: Result<T, McpError>,
-        peers: Vec<PeerMessage>,
+        comms: Communications,
     ) -> Result<CallToolResult, McpError> {
         match result {
             Ok(value) => {
                 let mut structured = serde_json::to_value(value).map_err(|_| {
                     McpError::internal_error("pool response serialization failed", None)
                 })?;
-                if !peers.is_empty()
-                    && let Some(object) = structured.as_object_mut()
-                {
-                    object.insert(
-                        "peer_messages".into(),
-                        serde_json::to_value(&peers).map_err(|_| {
-                            McpError::internal_error("peer message serialization failed", None)
-                        })?,
-                    );
-                }
+                structured = Self::activity_with_comms(structured, &comms);
                 let mut result =
                     CallToolResult::success(vec![ContentBlock::text(structured.to_string())]);
                 result.structured_content = Some(structured);
@@ -339,17 +357,17 @@ impl ExecMcpServer {
             }
             Err(error) => {
                 let mut text = error.message.to_string();
-                Self::append_peer_block(&mut text, &peers);
+                Self::append_comms_block(&mut text, &comms);
                 let mut result = CallToolResult::error(vec![ContentBlock::text(text)]);
-                if !peers.is_empty() {
-                    result.structured_content = Some(serde_json::json!({"peer_messages": peers}));
+                if !comms.is_empty() {
+                    result.structured_content = Some(Self::activity_with_comms(json!({}), &comms));
                 }
                 Ok(result)
             }
         }
     }
 
-    /// Run a stateless shell command; returns exit_code when done, session_id while running.
+    /// Start a command, shell, or REPL. Returns exit_code when done, session_id while running.
     #[tool(output_schema = schema_for_output::<ExecResponse>())]
     async fn exec_command(
         &self,
@@ -370,46 +388,12 @@ impl ExecMcpServer {
         );
         let turn = self.begin_tool(session.as_deref()).await?;
         let response = self.manager.exec_command(args).await;
-        let peers = self
+        let comms = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
-        let (success, detail) = Self::exec_activity_detail(&response, &peers);
+        let (success, detail) = Self::exec_activity_detail(&response, &comms);
         self.tool_finished("exec_command", session.as_deref(), started, success, detail);
-        Self::respond(response, peers)
-    }
-
-    /// Start a persistent shell, REPL, or long-running process.
-    #[tool(output_schema = schema_for_output::<ExecResponse>())]
-    async fn start_session(
-        &self,
-        Parameters(args): Parameters<StartSessionArgs>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let session = Self::session(&context);
-        let started = self.tool_started(
-            "start_session",
-            session.as_deref(),
-            json!({
-                "cmd": &args.cmd,
-                "workdir": &args.workdir,
-                "tty": args.tty,
-                "max_output_tokens": args.max_output_tokens,
-            }),
-        );
-        let turn = self.begin_tool(session.as_deref()).await?;
-        let response = self.manager.start_session(args).await;
-        let peers = self
-            .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
-            .await;
-        let (success, detail) = Self::exec_activity_detail(&response, &peers);
-        self.tool_finished(
-            "start_session",
-            session.as_deref(),
-            started,
-            success,
-            detail,
-        );
-        Self::respond(response, peers)
+        Self::respond(response, comms)
     }
 
     /// Send raw input or poll output; Ctrl-C alone interrupts the process group.
@@ -431,12 +415,12 @@ impl ExecMcpServer {
         );
         let turn = self.begin_tool(session.as_deref()).await?;
         let response = self.manager.write_stdin(args).await;
-        let peers = self
+        let comms = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
-        let (success, detail) = Self::exec_activity_detail(&response, &peers);
+        let (success, detail) = Self::exec_activity_detail(&response, &comms);
         self.tool_finished("write_stdin", session.as_deref(), started, success, detail);
-        Self::respond(response, peers)
+        Self::respond(response, comms)
     }
 
     /// Wait for process exit or timeout; ordinary output does not wake the wait.
@@ -463,12 +447,12 @@ impl ExecMcpServer {
             .await;
         match response {
             Ok(Some(response)) => {
-                let peers = self
+                let comms = self
                     .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
                     .await;
-                let detail = Self::exec_response_detail(&response, &peers);
+                let detail = Self::exec_response_detail(&response, &comms);
                 self.tool_finished("wait_for_exit", session.as_deref(), started, true, detail);
-                Self::success(response, peers)
+                Self::success(response, comms)
             }
             Ok(None) => {
                 self.tool_finished(
@@ -481,7 +465,7 @@ impl ExecMcpServer {
                 Err(McpError::internal_error("wait_for_exit cancelled", None))
             }
             Err(error) => {
-                let peers = self
+                let comms = self
                     .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
                     .await;
                 self.tool_finished(
@@ -489,34 +473,37 @@ impl ExecMcpServer {
                     session.as_deref(),
                     started,
                     false,
-                    Self::activity_with_peers(json!({"error": error.to_string()}), &peers),
+                    Self::activity_with_comms(json!({"error": error.to_string()}), &comms),
                 );
-                Ok(Self::tool_error(error, peers))
+                Ok(Self::tool_error(error, comms))
             }
         }
     }
 
     fn respond(
         result: anyhow::Result<ExecResponse>,
-        peers: Vec<PeerMessage>,
+        comms: Communications,
     ) -> Result<CallToolResult, McpError> {
         match result {
-            Ok(response) => Self::success(response, peers),
-            Err(error) => Ok(Self::tool_error(error, peers)),
+            Ok(response) => Self::success(response, comms),
+            Err(error) => Ok(Self::tool_error(error, comms)),
         }
     }
 
     fn success(
         mut response: ExecResponse,
-        peers: Vec<PeerMessage>,
+        comms: Communications,
     ) -> Result<CallToolResult, McpError> {
-        if !peers.is_empty() {
-            response.peer_messages = Some(peers.clone());
+        if !comms.messages.is_empty() {
+            response.peer_messages = Some(comms.messages.clone());
+        }
+        if !comms.delivery_receipts.is_empty() {
+            response.delivery_receipts = Some(comms.delivery_receipts.clone());
         }
         let structured = serde_json::to_value(&response)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let mut text = Self::response_summary(&response);
-        Self::append_peer_block(&mut text, &peers);
+        Self::append_comms_block(&mut text, &comms);
         let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
         result.structured_content = Some(structured);
         Ok(result)
@@ -544,29 +531,38 @@ impl ExecMcpServer {
         parts.join("; ")
     }
 
-    fn append_peer_block(text: &mut String, peers: &[PeerMessage]) {
-        if peers.is_empty() {
-            return;
-        }
-        text.push_str("\n\n=== PEER MESSAGES ===");
-        for message in peers {
-            text.push_str(&format!(
-                "\n[{} {} -> {} in {}] {}",
-                message.message_id, message.from, message.to, message.pool, message.message
-            ));
-            if let Some(reply) = message.in_reply_to.as_deref() {
-                text.push_str(&format!(" (in_reply_to={reply})"));
+    fn append_comms_block(text: &mut String, comms: &Communications) {
+        if !comms.messages.is_empty() {
+            text.push_str("\n\n=== PEER MESSAGES ===");
+            for message in &comms.messages {
+                text.push_str(&format!(
+                    "\n[{} {} -> {} in {}] {}",
+                    message.message_id, message.from, message.to, message.pool, message.message
+                ));
+                if let Some(reply) = message.in_reply_to.as_deref() {
+                    text.push_str(&format!(" (in_reply_to={reply})"));
+                }
             }
+            text.push_str("\n=== END PEER MESSAGES ===");
         }
-        text.push_str("\n=== END PEER MESSAGES ===");
+        if !comms.delivery_receipts.is_empty() {
+            text.push_str("\n\n=== DELIVERY RECEIPTS (offered, not read or accepted) ===");
+            for receipt in &comms.delivery_receipts {
+                text.push_str(&format!(
+                    "\n[{} in {}] offered to {} at {}",
+                    receipt.message_id, receipt.pool, receipt.to, receipt.offered_at_ms
+                ));
+            }
+            text.push_str("\n=== END DELIVERY RECEIPTS ===");
+        }
     }
 
-    fn tool_error(error: anyhow::Error, peers: Vec<PeerMessage>) -> CallToolResult {
+    fn tool_error(error: anyhow::Error, comms: Communications) -> CallToolResult {
         let mut text = error.to_string();
-        Self::append_peer_block(&mut text, &peers);
+        Self::append_comms_block(&mut text, &comms);
         let mut result = CallToolResult::error(vec![ContentBlock::text(text)]);
-        if !peers.is_empty() {
-            result.structured_content = Some(serde_json::json!({"peer_messages": peers}));
+        if !comms.is_empty() {
+            result.structured_content = Some(Self::activity_with_comms(json!({}), &comms));
         }
         result
     }

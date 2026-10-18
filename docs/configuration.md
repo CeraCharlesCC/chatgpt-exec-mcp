@@ -25,14 +25,12 @@ optional fields rather than setting them to null.
 ## Optional limits
 
 Durations are integer seconds. Omitted fields use these defaults.
-Session and command-continuation quotas apply separately.
+All running processes share the same session limit and idle timeout.
 
 | Field | Default | Allowed inclusive range |
 | --- | ---: | ---: |
-| `max_explicit_sessions` | 3 | 1–1024 |
-| `max_exec_continuations` | 3 | 1–1024 |
-| `explicit_session_idle_timeout` | 3600 | 1–31536000 |
-| `exec_continuation_idle_timeout` | 900 | 1–31536000 |
+| `max_sessions` | 6 | 1–2048 |
+| `session_idle_timeout` | 3600 | 1–31536000 |
 | `reaper_interval` | 30 | 1–86400 |
 | `output_cap_bytes` | 1048576 | 1–1073741824 |
 | `output_store_retention` | 604800 | 1–31536000 |
@@ -60,8 +58,8 @@ conditionally. Include `HOME`, `PATH`, or other variables your commands need.
 }
 ```
 
-A rule supports `exec_command` or `start_session` and applies when the command
-starts in `workdir_under` or a subdirectory. The directory must exist. Symlinks
+Rules use `tool: "exec_command"` and apply to processes started in
+`workdir_under` or its subdirectories. The directory must exist. Symlinks
 are resolved before matching; a later `cd` does not change which values apply.
 `set_from_env` maps child variable names to parent variable names.
 

@@ -3,9 +3,9 @@
 //! Membership is bound to `_meta["openai/session"]` on the first `pool_send`.
 //! Agent names are allocated automatically from the configured dictionary.
 //! Ordinary tool activity refreshes the membership lease and piggybacks queued
-//! peer messages. A message offered on one tool call is acknowledged by the
-//! same session's next tool call, giving at-least-once delivery without poll or
-//! acknowledgement tools.
+//! peer messages and offered receipts. A subsequent non-overlapping tool call
+//! retires previous offers. This is implicit retirement, not proof that a
+//! client received or read a response; interrupted responses may be lost.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AgentNameAllocation;
 
+#[cfg(test)]
+mod comm_tests;
 mod coordinator;
 mod storage;
 
@@ -34,18 +36,43 @@ const ADMIN_AGENT: &str = "admin";
 pub struct PoolMembersArgs {
     #[schemars(length(min = 1, max = MAX_NAME_CHARS))]
     pub pool: String,
-    /// Wait timeout in seconds; omit for an immediate snapshot.
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct PoolWaitArgs {
+    /// Pool to observe; messages and receipts are restricted to this pool.
+    #[schemars(length(min = 1, max = MAX_NAME_CHARS))]
+    pub pool: String,
+    /// Maximum wait; returns early for messages, offered receipts, or membership changes.
     #[serde(
-        default,
-        deserialize_with = "deserialize_optional_non_null_wait",
-        skip_serializing_if = "Option::is_none"
+        default = "default_pool_wait_seconds",
+        deserialize_with = "deserialize_pool_wait_seconds"
     )]
-    #[schemars(
-        with = "u64",
-        range(min = 5, max = 45),
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub wait_seconds: Option<u64>,
+    #[schemars(range(min = 5, max = 45), extend("default" = 35))]
+    pub wait_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+pub enum PoolWaitReason {
+    Message,
+    Receipt,
+    MembershipChanged,
+    Timeout,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
+pub struct PoolWaitResult {
+    pub reason: PoolWaitReason,
+    pub messages: Vec<PeerMessage>,
+    pub membership_changed: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
+    pub delivery_receipts: Vec<DeliveryReceipt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -118,6 +145,35 @@ pub struct PeerMessage {
     pub in_reply_to: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
+pub struct DeliveryReceipt {
+    pub message_id: String,
+    pub pool: String,
+    pub to: String,
+    pub status: ReceiptStatus,
+    pub offered_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+pub enum ReceiptStatus {
+    Offered,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Communications {
+    pub messages: Vec<PeerMessage>,
+    pub delivery_receipts: Vec<DeliveryReceipt>,
+}
+
+impl Communications {
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty() && self.delivery_receipts.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct AgentIdentity {
     pub pool: String,
@@ -156,6 +212,9 @@ pub struct PoolMembersResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<PeerMessage>", default)]
     pub peer_messages: Option<Vec<PeerMessage>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<DeliveryReceipt>", default)]
+    pub delivery_receipts: Option<Vec<DeliveryReceipt>>,
 }
 
 #[derive(Debug, Default, Serialize, JsonSchema)]
@@ -174,6 +233,9 @@ pub struct PoolSendResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<PeerMessage>", default)]
     pub peer_messages: Option<Vec<PeerMessage>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<DeliveryReceipt>", default)]
+    pub delivery_receipts: Option<Vec<DeliveryReceipt>>,
 }
 
 fn deserialize_optional_non_null_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -190,13 +252,21 @@ where
     )
 }
 
-fn deserialize_optional_non_null_wait<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+fn default_pool_wait_seconds() -> u64 {
+    35
+}
+
+fn deserialize_pool_wait_seconds<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<u64>::deserialize(deserializer)?
-        .ok_or_else(|| serde::de::Error::custom("null is not allowed; omit the field instead"))
-        .map(Some)
+    let seconds = u64::deserialize(deserializer)?;
+    if !(5..=45).contains(&seconds) {
+        return Err(serde::de::Error::custom(
+            "wait_seconds must be between 5 and 45",
+        ));
+    }
+    Ok(seconds)
 }
 
 fn deserialize_optional_non_null_action<'de, D>(
@@ -260,7 +330,7 @@ impl AgentPoolStore {
         })
     }
 
-    /// Start a correlated tool turn and ACK the previous committed offer.
+    /// Start a call, retiring prior offers only outside an overlapping group.
     pub async fn start_tool(
         &self,
         principal: &str,
@@ -271,15 +341,15 @@ impl AgentPoolStore {
             .await
     }
 
-    /// Only the latest concurrently started turn may offer inbox messages.
+    /// Collect communications for any call, including an older overlapping wait.
     pub async fn finish_tool_turn(
         &self,
         principal: &str,
         session: Option<&str>,
         turn: Option<&SessionTurn>,
-    ) -> Result<Vec<PeerMessage>, McpError> {
+    ) -> Result<Communications, McpError> {
         self.coordinator
-            .finish_tool_turn(&self.storage, principal, session, turn)
+            .finish_tool_turn(&self.storage, principal, session, turn, None)
             .await
     }
 
@@ -300,7 +370,11 @@ impl AgentPoolStore {
         principal: &str,
         limit: usize,
     ) -> Result<Vec<AdminMessage>, McpError> {
-        self.storage.admin_messages(principal, limit)
+        let (messages, changed) = self.storage.admin_messages(principal, limit)?;
+        if changed {
+            self.coordinator.committed_change();
+        }
+        Ok(messages)
     }
 
     /// Keep acknowledged admin messages visible until the store is reopened.
@@ -351,14 +425,15 @@ impl AgentPoolStore {
             .result)
     }
 
-    pub async fn wait_members(
+    pub async fn wait(
         &self,
         principal: &str,
-        args: PoolMembersArgs,
+        args: PoolWaitArgs,
         session: Option<&str>,
-    ) -> Result<PoolMembersResult, McpError> {
+    ) -> Result<PoolWaitResult, McpError> {
+        let turn = self.start_tool(principal, session).await?;
         self.coordinator
-            .wait_members(&self.storage, principal, args, session)
+            .wait(&self.storage, principal, args, session, turn.as_ref())
             .await
     }
 
@@ -416,9 +491,8 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::Arc;
 
-    fn store() -> (tempfile::TempDir, AgentPoolStore) {
+    pub(super) fn store() -> (tempfile::TempDir, AgentPoolStore) {
         store_with_allocation(AgentNameAllocation::default())
     }
 
@@ -443,7 +517,7 @@ mod tests {
         (directory, store)
     }
 
-    fn send(pool: &str, target: &str, body: &str) -> PoolSendArgs {
+    pub(super) fn send(pool: &str, target: &str, body: &str) -> PoolSendArgs {
         PoolSendArgs {
             pool: pool.into(),
             target: Some(target.into()),
@@ -453,7 +527,7 @@ mod tests {
         }
     }
 
-    fn leave(pool: &str) -> PoolSendArgs {
+    pub(super) fn leave(pool: &str) -> PoolSendArgs {
         PoolSendArgs {
             pool: pool.into(),
             target: None,
@@ -463,11 +537,19 @@ mod tests {
         }
     }
 
-    fn waiting(pool: &str, seconds: u64) -> PoolMembersArgs {
-        PoolMembersArgs {
+    pub(super) fn waiting(pool: &str, seconds: u64) -> PoolWaitArgs {
+        PoolWaitArgs {
             pool: pool.into(),
-            wait_seconds: Some(seconds),
+            wait_seconds: seconds,
         }
+    }
+
+    pub(super) async fn poll_pending<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -476,40 +558,45 @@ mod tests {
         for seconds in [0, 4, 46, u64::MAX] {
             assert!(
                 store
-                    .wait_members("owner", waiting("p", seconds), None)
+                    .wait("owner", waiting("p", seconds), Some("observer"))
                     .await
                     .is_err()
             );
         }
-        for value in [json!(null), json!(-1), json!(10.5), json!("35")] {
+        for value in [
+            json!(null),
+            json!(-1),
+            json!(4),
+            json!(46),
+            json!(10.5),
+            json!("35"),
+        ] {
             assert!(
-                serde_json::from_value::<PoolMembersArgs>(
-                    json!({"pool":"p", "wait_seconds":value})
-                )
-                .is_err()
+                serde_json::from_value::<PoolWaitArgs>(json!({"pool":"p", "wait_seconds":value}))
+                    .is_err()
             );
         }
-        let before = tokio::time::Instant::now();
-        let args = serde_json::from_value(json!({"pool":"p"})).unwrap();
         assert!(
-            store
-                .wait_members("owner", args, None)
-                .await
-                .unwrap()
-                .agents
-                .is_empty()
+            serde_json::from_value::<PoolMembersArgs>(json!({"pool":"p", "wait_seconds":35}))
+                .is_err()
         );
+        let args: PoolWaitArgs = serde_json::from_value(json!({"pool":"p"})).unwrap();
+        assert_eq!(args.wait_seconds, 35);
+        assert!(store.wait("owner", args, None).await.is_err());
+        let before = tokio::time::Instant::now();
+        let members = store
+            .members("owner", PoolMembersArgs { pool: "p".into() }, None)
+            .unwrap();
+        assert!(members.agents.is_empty());
         assert_eq!(tokio::time::Instant::now(), before);
         for seconds in [5, 10, 45] {
             let before = tokio::time::Instant::now();
-            assert!(
-                store
-                    .wait_members("owner", waiting("p", seconds), None)
-                    .await
-                    .unwrap()
-                    .agents
-                    .is_empty()
-            );
+            let result = store
+                .wait("owner", waiting("p", seconds), Some("observer"))
+                .await
+                .unwrap();
+            assert_eq!(result.reason, PoolWaitReason::Timeout);
+            assert!(result.messages.is_empty() && !result.membership_changed);
             assert_eq!(
                 tokio::time::Instant::now() - before,
                 Duration::from_secs(seconds)
@@ -518,157 +605,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_wakes_all_observers_on_join_leave_and_name_reuse() {
+    async fn wait_wakes_all_observers_and_detects_transient_memberships() {
         let (_directory, store) = store();
-        let store = Arc::new(store);
-        let observe = || {
-            let store = store.clone();
-            tokio::spawn(async move {
-                store
-                    .wait_members("owner", waiting("p", 35), None)
-                    .await
-                    .unwrap()
-            })
-        };
-        let first = observe();
-        let second = observe();
-        tokio::task::yield_now().await;
-        // Unrelated pool/account changes must not finish the wait.
+        let mut first = Box::pin(store.wait("owner", waiting("p", 35), Some("observer-1")));
+        let mut second = Box::pin(store.wait("owner", waiting("p", 35), Some("observer-2")));
+        poll_pending(first.as_mut()).await;
+        poll_pending(second.as_mut()).await;
         store
             .send("owner", send("other", "global", "join"), Some("other"))
             .unwrap();
         store
             .send("other-owner", send("p", "global", "join"), Some("other"))
             .unwrap();
-        tokio::task::yield_now().await;
-        assert!(!first.is_finished() && !second.is_finished());
+        poll_pending(first.as_mut()).await;
+        poll_pending(second.as_mut()).await;
+        // Even a join and leave coalesced into one wake is a membership change.
         store
             .send("owner", send("p", "global", "join"), Some("a"))
             .unwrap();
-        for task in [first, second] {
-            let result = tokio::time::timeout(Duration::from_secs(1), task)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(result.agents, ["alice"]);
-            assert!(result.self_agent.is_none());
-        }
-        let reused = observe();
-        tokio::task::yield_now().await;
-        // The same visible name is a new member, even if leave/join coalesce.
         store.send("owner", leave("p"), Some("a")).unwrap();
+        for result in [first.await.unwrap(), second.await.unwrap()] {
+            assert_eq!(result.reason, PoolWaitReason::MembershipChanged);
+            assert!(result.membership_changed && result.messages.is_empty());
+        }
+        let mut reused = Box::pin(store.wait("owner", waiting("p", 35), Some("observer")));
+        poll_pending(reused.as_mut()).await;
         store
             .send("owner", send("p", "global", "rejoin"), Some("a"))
             .unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), reused)
-                .await
-                .unwrap()
-                .unwrap()
-                .agents,
-            ["alice"]
-        );
-        let left = observe();
-        tokio::task::yield_now().await;
+        assert!(reused.await.unwrap().membership_changed);
+        let mut left = Box::pin(store.wait("owner", waiting("p", 35), Some("observer")));
+        poll_pending(left.as_mut()).await;
         store.admin_terminate("owner", "p", "alice").unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), left)
-                .await
-                .unwrap()
-                .unwrap()
-                .agents
-                .is_empty()
+        assert_eq!(
+            left.await.unwrap().reason,
+            PoolWaitReason::MembershipChanged
         );
     }
 
     #[tokio::test]
-    async fn wait_messages_across_pools_are_offered_once_and_cancellation_keeps_inbox() {
+    async fn wait_filters_pool_and_cancellation_keeps_unoffered_messages() {
         let (_directory, store) = store();
-        let store = Arc::new(store);
+        for pool in ["p", "q"] {
+            store
+                .send("owner", send(pool, "global", "join"), Some("a"))
+                .unwrap();
+        }
+        let mut waiter = Box::pin(store.wait("owner", waiting("p", 35), Some("a")));
+        poll_pending(waiter.as_mut()).await;
         store
-            .send("owner", send("p", "global", "join"), Some("a"))
+            .admin_send("owner", "q", "alice", "other-pool", None)
             .unwrap();
+        poll_pending(waiter.as_mut()).await;
         store
-            .send("owner", send("q", "global", "join"), Some("a"))
+            .admin_send("owner", "p", "alice", "selected-pool", None)
             .unwrap();
+        let result = waiter.await.unwrap();
+        assert_eq!(result.reason, PoolWaitReason::Message);
+        assert!(!result.membership_changed);
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].message, "selected-pool");
         let turn = store.start_tool("owner", Some("a")).await.unwrap();
-        let waiter = {
-            let store = store.clone();
-            tokio::spawn(async move {
-                store
-                    .wait_members("owner", waiting("p", 35), Some("a"))
-                    .await
-                    .unwrap()
-            })
-        };
-        tokio::task::yield_now().await;
-        store
-            .admin_send("owner", "q", "alice", "cross-pool", None)
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .unwrap()
-            .unwrap();
-        let peers = store
+        let comms = store
             .finish_tool_turn("owner", Some("a"), turn.as_ref())
             .await
             .unwrap();
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].message, "cross-pool");
-        assert_eq!(peers[0].pool, "q");
-        let turn = store.start_tool("owner", Some("a")).await.unwrap();
-        assert!(
-            store
-                .finish_tool_turn("owner", Some("a"), turn.as_ref())
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        let cancelled = {
-            let store = store.clone();
-            tokio::spawn(async move {
-                store
-                    .wait_members("owner", waiting("p", 35), Some("a"))
-                    .await
-            })
-        };
-        tokio::task::yield_now().await;
+        assert_eq!(comms.messages[0].message, "other-pool");
+        drop(turn);
+        let mut cancelled = Box::pin(store.wait("owner", waiting("p", 35), Some("a")));
+        poll_pending(cancelled.as_mut()).await;
+        drop(cancelled);
         store
             .admin_send("owner", "p", "alice", "retain", None)
             .unwrap();
-        cancelled.abort();
-        assert!(cancelled.await.unwrap_err().is_cancelled());
-        let turn = store.start_tool("owner", Some("a")).await.unwrap();
-        // Already pending messages return immediately without an internal offer.
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            store.wait_members("owner", waiting("p", 35), Some("a")),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let peers = store
-            .finish_tool_turn("owner", Some("a"), turn.as_ref())
+        let received = store
+            .wait("owner", waiting("p", 35), Some("a"))
             .await
             .unwrap();
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].message, "retain");
-        assert_eq!(
-            store
-                .members(
-                    "owner",
-                    PoolMembersArgs {
-                        pool: "p".into(),
-                        wait_seconds: None
-                    },
-                    Some("a")
-                )
-                .unwrap()
-                .self_agent
-                .as_deref(),
-            Some("alice")
-        );
+        assert_eq!(received.messages[0].message, "retain");
     }
 
     #[tokio::test]
@@ -685,12 +699,13 @@ mod tests {
             .unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            store.wait_members("owner", waiting("p", 35), None),
+            store.wait("owner", waiting("p", 35), Some("observer")),
         )
         .await
         .unwrap()
         .unwrap();
-        assert!(result.agents.is_empty());
+        assert_eq!(result.reason, PoolWaitReason::MembershipChanged);
+        assert!(result.membership_changed && result.messages.is_empty());
     }
 
     #[test]
@@ -1025,14 +1040,7 @@ mod tests {
             // A resumed ChatGPT session keeps the SQLite membership, not a new name.
             assert_eq!(
                 resumed
-                    .members(
-                        "owner",
-                        PoolMembersArgs {
-                            pool: "p".into(),
-                            wait_seconds: None,
-                        },
-                        Some(session),
-                    )
+                    .members("owner", PoolMembersArgs { pool: "p".into() }, Some(session),)
                     .unwrap()
                     .self_agent
                     .as_deref(),
@@ -1082,7 +1090,6 @@ mod tests {
                 "owner",
                 PoolMembersArgs {
                     pool: "left".into(),
-                    wait_seconds: None,
                 },
                 Some("session"),
             )
@@ -1095,7 +1102,6 @@ mod tests {
                 "owner",
                 PoolMembersArgs {
                     pool: "right".into(),
-                    wait_seconds: None,
                 },
                 Some("session"),
             )
@@ -1108,54 +1114,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_turns_do_not_block_tools_or_duplicate_offers() {
+    async fn an_older_wait_still_receives_after_a_newer_call_finishes() {
         let (_directory, store) = store();
-        let owner = "account-a";
         store
-            .send(owner, send("project", "global", "join"), Some("a"))
+            .send("owner", send("p", "global", "join"), Some("a"))
             .unwrap();
-        store
-            .send(owner, send("project", "global", "join"), Some("b"))
-            .unwrap();
-
-        // Consume and acknowledge Bob's join announcement first.
-        store.storage.begin_tool_state(owner, Some("a")).unwrap();
-        assert_eq!(
-            store
-                .storage
-                .collect_tool_messages(owner, Some("a"))
-                .unwrap()
-                .len(),
-            1
-        );
-        store.storage.begin_tool_state(owner, Some("a")).unwrap();
-
-        store
-            .send(owner, send("project", "alice", "parallel"), Some("b"))
-            .unwrap();
-
-        // Both turns can start before either finishes. Only the latest-started
-        // turn is allowed to offer the inbox row.
-        let first = store.start_tool(owner, Some("a")).await.unwrap().unwrap();
-        let second = store.start_tool(owner, Some("a")).await.unwrap().unwrap();
+        let mut waiter = Box::pin(store.wait("owner", waiting("p", 35), Some("a")));
+        poll_pending(waiter.as_mut()).await;
+        let newer = store.start_tool("owner", Some("a")).await.unwrap();
         assert!(
             store
-                .finish_tool_turn(owner, Some("a"), Some(&first))
+                .finish_tool_turn("owner", Some("a"), newer.as_ref())
                 .await
                 .unwrap()
                 .is_empty()
         );
+        drop(newer);
+        store
+            .admin_send("owner", "p", "alice", "arrives during wait", None)
+            .unwrap();
+        let received = waiter.await.unwrap();
+        assert_eq!(received.reason, PoolWaitReason::Message);
+        assert_eq!(received.messages[0].message, "arrives during wait");
+    }
+
+    #[tokio::test]
+    async fn overlapping_calls_reoffer_and_do_not_retire_each_others_batches() {
+        let (_directory, store) = store();
+        store
+            .send("owner", send("p", "global", "join"), Some("a"))
+            .unwrap();
+        store
+            .admin_send("owner", "p", "alice", "parallel", None)
+            .unwrap();
+        let first = store.start_tool("owner", Some("a")).await.unwrap();
         let offered = store
-            .finish_tool_turn(owner, Some("a"), Some(&second))
+            .finish_tool_turn("owner", Some("a"), first.as_ref())
             .await
             .unwrap();
-        assert_eq!(offered.len(), 1);
-        assert_eq!(offered[0].message, "parallel");
-
-        let third = store.start_tool(owner, Some("a")).await.unwrap().unwrap();
+        let second = store.start_tool("owner", Some("a")).await.unwrap();
+        let repeated = store
+            .finish_tool_turn("owner", Some("a"), second.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(offered.messages, repeated.messages);
+        assert_eq!(offered.messages.len(), 1);
+        drop(first);
+        drop(second);
+        let next = store.start_tool("owner", Some("a")).await.unwrap();
         assert!(
             store
-                .finish_tool_turn(owner, Some("a"), Some(&third))
+                .finish_tool_turn("owner", Some("a"), next.as_ref())
                 .await
                 .unwrap()
                 .is_empty()
@@ -1163,7 +1172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_latest_turn_keeps_messages_for_the_next_turn() {
+    async fn cancelling_a_newer_call_does_not_suppress_an_older_call() {
         let (_directory, store) = store();
         store
             .send("owner", send("p", "global", "join"), Some("a"))
@@ -1174,28 +1183,11 @@ mod tests {
             .admin_send("owner", "p", "alice", "retain after cancellation", None)
             .unwrap();
         drop(cancelled);
-        assert!(
-            store
-                .finish_tool_turn("owner", Some("a"), first.as_ref())
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        let next = store.start_tool("owner", Some("a")).await.unwrap();
-        let messages = store
-            .finish_tool_turn("owner", Some("a"), next.as_ref())
+        let offered = store
+            .finish_tool_turn("owner", Some("a"), first.as_ref())
             .await
             .unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].message, "retain after cancellation");
-        let acknowledged = store.start_tool("owner", Some("a")).await.unwrap();
-        assert!(
-            store
-                .finish_tool_turn("owner", Some("a"), acknowledged.as_ref())
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(offered.messages[0].message, "retain after cancellation");
     }
 
     #[tokio::test]
@@ -1216,9 +1208,10 @@ mod tests {
                 .finish_tool_turn(principal, Some("same-session"), turn.as_ref())
                 .await
                 .unwrap();
-            assert_eq!(offered.len(), 1);
-            assert_eq!(offered[0].message, principal);
+            assert_eq!(offered.messages.len(), 1);
+            assert_eq!(offered.messages[0].message, principal);
         }
+        drop(first);
         let acknowledged = store.start_tool("one", Some("same-session")).await.unwrap();
         assert!(
             store
@@ -1232,8 +1225,8 @@ mod tests {
             .finish_tool_turn("two", Some("same-session"), second.as_ref())
             .await
             .unwrap();
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].message, "two");
+        assert_eq!(retained.messages.len(), 1);
+        assert_eq!(retained.messages[0].message, "two");
     }
 
     #[tokio::test]
@@ -1242,7 +1235,7 @@ mod tests {
         use std::task::Poll;
 
         let (_directory, store) = store();
-        let mut waiter = Box::pin(store.wait_members("owner", waiting("p", 35), None));
+        let mut waiter = Box::pin(store.wait("owner", waiting("p", 35), Some("observer")));
         std::future::poll_fn(|context| {
             assert!(waiter.as_mut().poll(context).is_pending());
             Poll::Ready(())
@@ -1255,7 +1248,7 @@ mod tests {
         );
         assert!(
             store
-                .members("owner", waiting("p", 35), None)
+                .members("owner", PoolMembersArgs { pool: "p".into() }, None)
                 .unwrap()
                 .agents
                 .is_empty()
@@ -1273,7 +1266,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(observed.agents, ["alice"]);
+        assert_eq!(observed.reason, PoolWaitReason::MembershipChanged);
     }
 
     #[test]
@@ -1344,14 +1337,7 @@ mod tests {
         }
         assert_eq!(
             restarted
-                .members(
-                    "owner",
-                    PoolMembersArgs {
-                        pool: "p".into(),
-                        wait_seconds: None
-                    },
-                    Some("a")
-                )
+                .members("owner", PoolMembersArgs { pool: "p".into() }, Some("a"))
                 .unwrap()
                 .agents,
             ["alice"]
@@ -1408,8 +1394,7 @@ mod tests {
                 .members(
                     owner,
                     PoolMembersArgs {
-                        pool: "project".into(),
-                        wait_seconds: None,
+                        pool: "project".into()
                     },
                     Some("alice-session"),
                 )

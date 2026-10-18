@@ -129,23 +129,19 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         names.len(),
         listed["result"]["tools"].as_array().unwrap().len()
     );
-    for required in [
-        "exec_command",
-        "start_session",
-        "wait_for_exit",
-        "write_stdin",
-    ] {
+    for required in ["exec_command", "wait_for_exit", "write_stdin"] {
         assert!(
             names.contains(required),
             "missing execution tool {required}"
         );
     }
-    for agent_pool_tool in ["pool_members", "pool_send"] {
+    for agent_pool_tool in ["pool_members", "pool_send", "pool_wait"] {
         assert!(
             !names.contains(agent_pool_tool),
             "agent-pool tools must stay disabled without agent_pool configuration"
         );
     }
+    assert!(!names.contains("start_session"));
     for tool in listed["result"]["tools"].as_array().unwrap() {
         let properties = tool["outputSchema"]["properties"].as_object().unwrap();
         assert!(!properties.contains_key("call_wall_time_seconds"));
@@ -209,7 +205,7 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|tool| tool["name"] == "start_session")
+        .find(|tool| tool["name"] == "exec_command")
         .unwrap();
     assert!(
         start_tool["inputSchema"]["properties"]["cmd"]
@@ -233,7 +229,7 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
     assert!(
         start_tool["inputSchema"]["properties"]
             .get("yield_time_ms")
-            .is_none()
+            .is_some()
     );
     let write_tool = listed["result"]["tools"]
         .as_array()
@@ -300,8 +296,8 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
         ),
         (
             23,
-            "start_session",
-            json!({ "yield_time_ms": 250 }),
+            "exec_command",
+            json!({ "cmd": "true", "unexpected": 250 }),
             "unknown field",
         ),
         (
@@ -380,7 +376,7 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
             "jsonrpc": "2.0",
             "id": 30,
             "method": "tools/call",
-            "params": { "name": "start_session", "arguments": { "cmd": "   " } }
+            "params": { "name": "exec_command", "arguments": { "cmd": "   " } }
         }),
     )
     .await;
@@ -411,24 +407,17 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
             .is_none()
     );
 
-    // start_session is the tool whose complete argument object may be omitted.
-    let default_shell = request(
+    // Every new process now requires an explicit command.
+    let missing_command = request(
         &mut stdin,
         &mut stdout,
         json!({
             "jsonrpc": "2.0", "id": 28, "method": "tools/call",
-            "params": { "name": "start_session" }
+            "params": { "name": "exec_command" }
         }),
     )
     .await;
-    let default_id = default_shell["result"]["structuredContent"]["session_id"]
-        .as_str()
-        .unwrap();
-    let stopped = request(&mut stdin, &mut stdout, json!({
-        "jsonrpc": "2.0", "id": 29, "method": "tools/call",
-        "params": { "name": "write_stdin", "arguments": { "session_id": default_id, "chars": "exit 0\n" } }
-    })).await;
-    assert_eq!(stopped["result"]["structuredContent"]["exit_code"], 0);
+    assert!(missing_command.get("error").is_some() || missing_command["result"]["isError"] == true);
 
     let started = request(
         &mut stdin,
@@ -438,8 +427,8 @@ async fn stdio_initialize_list_and_stateful_tool_calls() {
             "id": 4,
             "method": "tools/call",
             "params": {
-                "name": "start_session",
-                "arguments": { "cmd": "exec /bin/bash --noprofile --norc" }
+                "name": "exec_command",
+                "arguments": { "cmd": "exec /bin/bash --noprofile --norc", "tty": true, "yield_time_ms": 250 }
             }
         }),
     )
@@ -827,7 +816,7 @@ async fn conditional_environment_follow_canonical_exec_workdir_only() {
                 "id": 8,
                 "method": "tools/call",
                 "params": {
-                    "name": "start_session",
+                    "name": "exec_command",
                     "arguments": {
                         "cmd": command,
                         "workdir": "project-root/project",
@@ -863,7 +852,7 @@ async fn conditional_environment_follow_canonical_exec_workdir_only() {
                     .unwrap(),
             );
         }
-        assert_eq!(explicit_output, "|||");
+        assert_eq!(explicit_output, "sentinel-user|sentinel-token||");
     }
 
     drop(stdin);

@@ -25,12 +25,6 @@ const CAPTURE_QUEUE_CHUNKS: usize = 128;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const FORCE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionOrigin {
-    ExecContinuation,
-    ExplicitSession,
-}
-
 #[derive(Clone, Debug)]
 pub struct PreparedOutput {
     pub snapshot: Snapshot,
@@ -66,7 +60,6 @@ pub(crate) struct TerminalDelivery {
 
 pub struct Session {
     pub id: SessionId,
-    pub origin: SessionOrigin,
     process: ProcessHandle,
     output_store: Arc<StdMutex<OutputStore>>,
     build_output: Option<BuildOutput>,
@@ -91,7 +84,6 @@ pub struct Session {
 impl Session {
     pub(crate) fn new(
         id: SessionId,
-        origin: SessionOrigin,
         spawned: SpawnedProcess,
         output_store: OutputStore,
         build_output: Option<BuildOutput>,
@@ -105,7 +97,6 @@ impl Session {
         let now = Instant::now();
         let session = Arc::new(Self {
             id,
-            origin,
             process,
             output_store: Arc::new(StdMutex::new(output_store)),
             build_output,

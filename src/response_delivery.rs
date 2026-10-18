@@ -102,6 +102,7 @@ pub(crate) async fn prepare_response(
             capture_error,
             output_ref: output_ref.as_ref().map(wire_output_ref),
             peer_messages: None,
+            delivery_receipts: None,
         },
         commit_end: prepared
             .read_error
@@ -130,6 +131,7 @@ pub(crate) fn delivered_terminal_response(
         capture_error: delivery.capture_error,
         output_ref: delivery.output_ref.as_ref().map(wire_output_ref),
         peer_messages: None,
+        delivery_receipts: None,
     }
 }
 

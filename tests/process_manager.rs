@@ -6,7 +6,6 @@ use chatgpt_exec_mcp::Config;
 use chatgpt_exec_mcp::ProcessManager;
 use chatgpt_exec_mcp::tools::ExecCommandArgs;
 use chatgpt_exec_mcp::tools::ExecResponse;
-use chatgpt_exec_mcp::tools::StartSessionArgs;
 use chatgpt_exec_mcp::tools::WaitForExitArgs;
 use chatgpt_exec_mcp::tools::WriteStdinArgs;
 use tempfile::TempDir;
@@ -185,10 +184,12 @@ async fn wait_for_exit_returns_on_exit_and_does_not_wake_on_output() {
     let workspace = TempDir::new().unwrap();
     let manager = ProcessManager::new(test_config(&workspace)).unwrap();
     let started = manager
-        .start_session(StartSessionArgs {
-            cmd: Some(": > ready; while ! test -f emit-first; do /bin/sleep 0.01; done; printf first; : > first-produced; while ! test -f finish; do /bin/sleep 0.01; done; printf second".into()),
-            tty: Some(false),
-            ..Default::default()
+        .exec_command(ExecCommandArgs {
+            cmd: ": > ready; while ! test -f emit-first; do /bin/sleep 0.01; done; printf first; : > first-produced; while ! test -f finish; do /bin/sleep 0.01; done; printf second".into(),
+            tty: false,
+            workdir: None,
+            max_output_tokens: None,
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap();
@@ -219,10 +220,12 @@ async fn wait_for_exit_returns_output_pending_before_and_produced_during_wait() 
     let workspace = TempDir::new().unwrap();
     let manager = ProcessManager::new(test_config(&workspace)).unwrap();
     let started = manager
-        .start_session(StartSessionArgs {
-            cmd: Some(": > ready; while ! test -f emit-before; do /bin/sleep 0.01; done; printf before; : > before-produced; while ! test -f finish; do /bin/sleep 0.01; done; printf after".into()),
-            tty: Some(false),
-            ..Default::default()
+        .exec_command(ExecCommandArgs {
+            cmd: ": > ready; while ! test -f emit-before; do /bin/sleep 0.01; done; printf before; : > before-produced; while ! test -f finish; do /bin/sleep 0.01; done; printf after".into(),
+            tty: false,
+            workdir: None,
+            max_output_tokens: None,
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap();
@@ -250,10 +253,12 @@ async fn wait_for_exit_does_not_block_concurrent_ctrl_c() {
     let workspace = TempDir::new().unwrap();
     let manager = ProcessManager::new(test_config(&workspace)).unwrap();
     let started = manager
-        .start_session(StartSessionArgs {
-            cmd: Some("sleep 60".into()),
-            tty: Some(false),
-            ..Default::default()
+        .exec_command(ExecCommandArgs {
+            cmd: "sleep 60".into(),
+            tty: false,
+            workdir: None,
+            max_output_tokens: None,
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap();
@@ -285,10 +290,12 @@ async fn wait_for_exit_does_not_block_concurrent_stdin() {
     let workspace = TempDir::new().unwrap();
     let manager = ProcessManager::new(test_config(&workspace)).unwrap();
     let started = manager
-        .start_session(StartSessionArgs {
-            cmd: Some("read line; printf 'got:%s\\n' \"$line\"".into()),
-            tty: Some(false),
-            ..Default::default()
+        .exec_command(ExecCommandArgs {
+            cmd: "read line; printf 'got:%s\\n' \"$line\"".into(),
+            tty: false,
+            workdir: None,
+            max_output_tokens: None,
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap();
@@ -324,10 +331,12 @@ async fn process_exit_racing_with_concurrent_write_delivers_output_once() {
     let workspace = TempDir::new().unwrap();
     let manager = ProcessManager::new(test_config(&workspace)).unwrap();
     let started = manager
-        .start_session(StartSessionArgs {
-            cmd: Some("while [ ! -e finish ]; do sleep 0.01; done; printf race-output".into()),
-            tty: Some(false),
-            ..Default::default()
+        .exec_command(ExecCommandArgs {
+            cmd: "while [ ! -e finish ]; do sleep 0.01; done; printf race-output".into(),
+            tty: false,
+            workdir: None,
+            max_output_tokens: None,
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap();
@@ -371,10 +380,12 @@ async fn concurrent_wait_for_exit_delivers_terminal_output_once_without_stale_re
     let workspace = TempDir::new().unwrap();
     let manager = ProcessManager::new(test_config(&workspace)).unwrap();
     let started = manager
-        .start_session(StartSessionArgs {
-            cmd: Some("while [ ! -e finish ]; do sleep 0.01; done; printf race-output".into()),
-            tty: Some(false),
-            ..Default::default()
+        .exec_command(ExecCommandArgs {
+            cmd: "while [ ! -e finish ]; do sleep 0.01; done; printf race-output".into(),
+            tty: false,
+            workdir: None,
+            max_output_tokens: None,
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap();
@@ -414,10 +425,12 @@ async fn wait_for_exit_uses_existing_output_truncation_and_recovery() {
     let workspace = TempDir::new().unwrap();
     let manager = ProcessManager::new(test_config(&workspace)).unwrap();
     let started = manager
-        .start_session(StartSessionArgs {
-            cmd: Some("sleep 0.35; head -c 1000 /dev/zero | tr '\\0' x".into()),
-            tty: Some(false),
-            ..Default::default()
+        .exec_command(ExecCommandArgs {
+            cmd: "sleep 0.35; head -c 1000 /dev/zero | tr '\\0' x".into(),
+            tty: false,
+            workdir: None,
+            max_output_tokens: None,
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap();
@@ -447,10 +460,12 @@ async fn wait_for_exit_rejects_invalid_and_expired_session_ids() {
     assert!(invalid.unwrap_err().to_string().contains("session_id"));
 
     let started = manager
-        .start_session(StartSessionArgs {
-            cmd: Some("sleep 60".into()),
-            tty: Some(false),
-            ..Default::default()
+        .exec_command(ExecCommandArgs {
+            cmd: "sleep 60".into(),
+            tty: false,
+            workdir: None,
+            max_output_tokens: None,
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap();
@@ -474,11 +489,12 @@ async fn interactive_bash_preserves_cwd_and_environment() {
     let workspace = TempDir::new().unwrap();
     let manager = ProcessManager::new(test_config(&workspace)).unwrap();
     let started = manager
-        .start_session(StartSessionArgs {
-            cmd: Some("exec /bin/bash --noprofile --norc".into()),
+        .exec_command(ExecCommandArgs {
+            cmd: "exec /bin/bash --noprofile --norc".into(),
             workdir: None,
-            tty: Some(true),
+            tty: true,
             max_output_tokens: Some(10_000),
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap();
@@ -508,11 +524,12 @@ async fn python_repl_preserves_variables() {
     let workspace = TempDir::new().unwrap();
     let manager = ProcessManager::new(test_config(&workspace)).unwrap();
     let started = manager
-        .start_session(StartSessionArgs {
-            cmd: Some("exec python3 -q".into()),
+        .exec_command(ExecCommandArgs {
+            cmd: "exec python3 -q".into(),
             workdir: None,
-            tty: Some(true),
+            tty: true,
             max_output_tokens: Some(10_000),
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap();
@@ -642,14 +659,16 @@ async fn build_summary_is_opt_in_and_raw_recovery_survives_later_polls() {
 async fn idle_reaper_expires_and_kills_session() {
     let workspace = TempDir::new().unwrap();
     let mut config = test_config(&workspace);
-    config.explicit_session_idle_timeout = Duration::from_secs(1);
+    config.session_idle_timeout = Duration::from_secs(1);
     config.reaper_interval = Duration::from_secs(1);
     let manager = ProcessManager::new(config).unwrap();
     let started = manager
-        .start_session(StartSessionArgs {
-            cmd: Some("sleep 60".into()),
-            tty: Some(false),
-            ..Default::default()
+        .exec_command(ExecCommandArgs {
+            cmd: "sleep 60".into(),
+            tty: false,
+            workdir: None,
+            max_output_tokens: None,
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap();
@@ -674,36 +693,39 @@ async fn idle_reaper_expires_and_kills_session() {
 }
 
 #[tokio::test]
-async fn explicit_and_continuation_quotas_are_separate() {
+async fn shells_and_commands_share_one_session_quota() {
     let workspace = TempDir::new().unwrap();
     let mut config = test_config(&workspace);
-    config.max_explicit_sessions = 1;
-    config.max_exec_continuations = 1;
+    config.max_sessions = 2;
     let manager = ProcessManager::new(config).unwrap();
 
-    let explicit = manager
-        .start_session(StartSessionArgs {
-            cmd: Some("sleep 60".into()),
-            tty: Some(false),
-            ..Default::default()
+    let shell = manager
+        .exec_command(ExecCommandArgs {
+            cmd: "exec /bin/bash --noprofile --norc".into(),
+            tty: true,
+            workdir: None,
+            max_output_tokens: None,
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap();
     let mut continuation_args = exec_args("sleep 60");
     continuation_args.yield_time_ms = Some(10);
     let continuation = manager.exec_command(continuation_args).await.unwrap();
-    assert!(explicit.session_id.is_some());
+    assert!(shell.session_id.is_some());
     assert!(continuation.session_id.is_some());
 
-    let second_explicit = manager
-        .start_session(StartSessionArgs {
-            cmd: Some("sleep 60".into()),
-            tty: Some(false),
-            ..Default::default()
+    let overflow = manager
+        .exec_command(ExecCommandArgs {
+            cmd: "sleep 60".into(),
+            tty: false,
+            workdir: None,
+            max_output_tokens: None,
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap_err();
-    assert!(second_explicit.to_string().contains("quota reached"));
+    assert!(overflow.to_string().contains("quota reached"));
     manager.shutdown_all().await;
 }
 
@@ -717,17 +739,6 @@ async fn invalid_workdir_never_spawns_a_child() {
             args.workdir = Some(workdir.into());
             args.tty = tty;
             assert!(manager.exec_command(args).await.is_err());
-            assert!(
-                manager
-                    .start_session(StartSessionArgs {
-                        cmd: Some("touch child-was-spawned".into()),
-                        workdir: Some(workdir.into()),
-                        tty: Some(tty),
-                        ..Default::default()
-                    })
-                    .await
-                    .is_err()
-            );
             assert!(!workspace.path().join("child-was-spawned").exists());
         }
     }
@@ -741,7 +752,7 @@ async fn invalid_workdir_never_spawns_a_child() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn default_session_handles_an_executable_shell_path_with_spaces_and_quotes() {
+async fn exec_uses_a_configured_shell_path_with_spaces_and_quotes() {
     let workspace = TempDir::new().unwrap();
     let shell = workspace.path().join("shell with 'quotes'");
     std::fs::copy("/bin/bash", &shell).unwrap();
@@ -749,9 +760,13 @@ async fn default_session_handles_an_executable_shell_path_with_spaces_and_quotes
     config.shell = shell.canonicalize().unwrap();
     let manager = ProcessManager::new(config).unwrap();
     let started = manager
-        .start_session(StartSessionArgs {
-            tty: Some(false),
-            ..Default::default()
+        .exec_command(ExecCommandArgs {
+            tty: false,
+
+            cmd: "exec /bin/bash --noprofile --norc".into(),
+            workdir: None,
+            max_output_tokens: None,
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap();
@@ -824,10 +839,12 @@ if mode == 'ordinary':
     .unwrap();
     let manager = ProcessManager::new(test_config(&workspace)).unwrap();
     let peer = manager
-        .start_session(StartSessionArgs {
-            cmd: Some("exec /bin/bash --noprofile --norc".into()),
-            tty: Some(false),
-            ..Default::default()
+        .exec_command(ExecCommandArgs {
+            cmd: "exec /bin/bash --noprofile --norc".into(),
+            tty: false,
+            workdir: None,
+            max_output_tokens: None,
+            yield_time_ms: Some(250),
         })
         .await
         .unwrap()

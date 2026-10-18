@@ -1,55 +1,56 @@
-//! Tool-turn ordering and observable-change/lease-expiry waiting.
-//! The only persistence dependency is a short synchronous transaction at each
-//! transition; no storage lock is held across a wait.
+//! Per-session overlapping calls and observable-change/lease-expiry waiting.
+//! No storage or session lock is held across a wait.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use rmcp::ErrorData as McpError;
-use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio::sync::watch;
 
 use super::storage::PoolStorage;
 use super::{
-    PeerMessage, PoolMembersArgs, PoolMembersResult, invalid, now_ms, storage_error, validate_name,
-    validate_session,
+    Communications, PoolMembersArgs, PoolWaitArgs, PoolWaitReason, PoolWaitResult, invalid, now_ms,
+    storage_error, validate_name, validate_session,
 };
 
-#[derive(Default)]
-struct SessionOrder {
-    next_sequence: u64,
-    latest_started: u64,
+type SessionKey = (String, String);
+type SessionCalls = Arc<Mutex<usize>>;
+
+/// Keeps an overlapping group of calls alive through response preparation.
+/// Calls in the same group may re-offer messages; they never retire one
+/// another's offers. A subsequent non-overlapping call retires the group.
+pub struct SessionTurn {
+    calls: SessionCalls,
+    principal: String,
+    session: String,
 }
 
-type SessionKey = (String, String);
-type SessionOrderHandle = Arc<AsyncMutex<SessionOrder>>;
-type SessionOrderWeak = Weak<AsyncMutex<SessionOrder>>;
-
-pub struct SessionTurn {
-    sequence: u64,
-    order: SessionOrderHandle,
+impl Drop for SessionTurn {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.calls.lock() {
+            *active -= 1;
+        }
+    }
 }
 
 pub(super) struct PoolCoordinator {
-    session_orders: Mutex<HashMap<SessionKey, SessionOrderWeak>>,
+    sessions: Mutex<HashMap<SessionKey, Weak<Mutex<usize>>>>,
     changes: watch::Sender<()>,
 }
 
 impl PoolCoordinator {
     pub(super) fn new() -> Self {
         Self {
-            session_orders: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
             changes: watch::channel(()).0,
         }
     }
 
-    /// Called by the facade only after a mutating storage transaction commits.
     pub(super) fn committed_change(&self) {
         self.changes.send_replace(());
     }
 
-    /// Start a correlated tool turn. Only the short inbox transition is
-    /// serialized; the actual tool operation runs without holding this lock.
     pub(super) async fn start_tool(
         &self,
         storage: &PoolStorage,
@@ -61,75 +62,105 @@ impl PoolCoordinator {
             return Ok(None);
         };
         validate_session(session)?;
-        let order = {
-            let mut orders = self.session_orders.lock().map_err(|_| storage_error())?;
-            orders.retain(|_, order| order.strong_count() > 0);
+        let calls = {
+            let mut sessions = self.sessions.lock().map_err(|_| storage_error())?;
+            sessions.retain(|_, calls| calls.strong_count() > 0);
             let key = (principal.to_owned(), session.to_owned());
-            if let Some(order) = orders.get(&key).and_then(Weak::upgrade) {
-                order
+            if let Some(calls) = sessions.get(&key).and_then(Weak::upgrade) {
+                calls
             } else {
-                let order = Arc::new(AsyncMutex::new(SessionOrder::default()));
-                orders.insert(key, Arc::downgrade(&order));
-                order
+                let calls = Arc::new(Mutex::new(0));
+                sessions.insert(key, Arc::downgrade(&calls));
+                calls
             }
         };
-        let mut state = order.lock().await;
-        state.next_sequence = state
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(storage_error)?;
-        let sequence = state.next_sequence;
-        state.latest_started = sequence;
-        storage.begin_tool_state(principal, Some(session))?;
-        drop(state);
-        Ok(Some(SessionTurn { sequence, order }))
+        let mut active = calls.lock().map_err(|_| storage_error())?;
+        if *active == 0 {
+            storage.begin_tool_state(principal, Some(session))?;
+        } else {
+            storage.refresh_tool_state(principal, Some(session))?;
+        }
+        *active += 1;
+        drop(active);
+        Ok(Some(SessionTurn {
+            calls,
+            principal: principal.into(),
+            session: session.into(),
+        }))
     }
 
-    /// Finish a correlated tool turn. A call that was superseded by a later
-    /// concurrently-started call does not offer inbox rows; the latest turn
-    /// will offer them instead.
     pub(super) async fn finish_tool_turn(
         &self,
         storage: &PoolStorage,
         principal: &str,
         session: Option<&str>,
         turn: Option<&SessionTurn>,
-    ) -> Result<Vec<PeerMessage>, McpError> {
+        pool: Option<&str>,
+    ) -> Result<Communications, McpError> {
         let (Some(session), Some(turn)) = (session, turn) else {
-            return Ok(Vec::new());
+            return Ok(Communications::default());
         };
-        let state = turn.order.lock().await;
-        if turn.sequence != state.latest_started {
-            return Ok(Vec::new());
+        if turn.principal != principal || turn.session != session {
+            return Err(invalid("tool turn belongs to another account or session"));
         }
-        storage.collect_tool_messages(principal, Some(session))
+        let comms = storage.collect_tool_comms(principal, Some(session), pool)?;
+        // Collecting a direct message may enqueue its sender's offered receipt.
+        if !comms.messages.is_empty() {
+            self.committed_change();
+        }
+        Ok(comms)
     }
 
-    pub(super) async fn wait_members(
+    pub(super) async fn wait(
         &self,
         storage: &PoolStorage,
         principal: &str,
-        args: PoolMembersArgs,
+        args: PoolWaitArgs,
         session: Option<&str>,
-    ) -> Result<PoolMembersResult, McpError> {
-        let Some(seconds) = args.wait_seconds else {
-            return Ok(storage.members_state(principal, &args, session)?.result);
-        };
-        if !(5..=45).contains(&seconds) {
+        turn: Option<&SessionTurn>,
+    ) -> Result<PoolWaitResult, McpError> {
+        let session =
+            session.ok_or_else(|| invalid("pool_wait requires openai/session metadata"))?;
+        validate_session(session)?;
+        if !(5..=45).contains(&args.wait_seconds) {
             return Err(invalid("wait_seconds must be between 5 and 45"));
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
-        // Subscribe before checking the database. A commit between the check
-        // and changed().await remains visible, including to multiple waiters.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(args.wait_seconds);
+        // Subscribe before observing state: commits between a read and await
+        // cannot be missed. Re-check the selected pool after every wakeup.
         let mut changes = self.changes.subscribe();
-        let mut state = storage.members_state(principal, &args, session)?;
-        let initial_members = state.member_ids.clone();
+        let members = PoolMembersArgs { pool: args.pool };
+        let mut state = storage.members_state(principal, &members, Some(session))?;
+        let initial_revision = state.membership_revision;
         loop {
-            if state.pending
-                || state.member_ids != initial_members
-                || tokio::time::Instant::now() >= deadline
-            {
-                return Ok(state.result);
+            let mut membership_changed = state.membership_revision != initial_revision;
+            if state.pending || membership_changed || tokio::time::Instant::now() >= deadline {
+                let comms = self
+                    .finish_tool_turn(storage, principal, Some(session), turn, Some(&members.pool))
+                    .await?;
+                // Collection may observe expiry or overlap a membership commit.
+                // Include changes through the final observed state as well.
+                state = storage.members_state(principal, &members, Some(session))?;
+                membership_changed |= state.membership_revision != initial_revision;
+                let reason = if !comms.messages.is_empty() {
+                    PoolWaitReason::Message
+                } else if !comms.delivery_receipts.is_empty() {
+                    PoolWaitReason::Receipt
+                } else if membership_changed {
+                    PoolWaitReason::MembershipChanged
+                } else if tokio::time::Instant::now() >= deadline {
+                    PoolWaitReason::Timeout
+                } else {
+                    // Expiry or an explicit leave can remove pending rows.
+                    state = storage.members_state(principal, &members, Some(session))?;
+                    continue;
+                };
+                return Ok(PoolWaitResult {
+                    reason,
+                    messages: comms.messages,
+                    membership_changed,
+                    delivery_receipts: comms.delivery_receipts,
+                });
             }
             let wake_at = state.next_expiry_ms.map_or(deadline, |expires| {
                 deadline.min(
@@ -137,13 +168,11 @@ impl PoolCoordinator {
                         + Duration::from_millis((expires - now_ms()).max(0) as u64),
                 )
             });
-            // No database or session-order lock is held while awaiting.
             tokio::select! {
                 _ = changes.changed() => {},
                 _ = tokio::time::sleep_until(wake_at) => {},
             }
-            // Observe state only: internal wakeups never ACK or offer messages.
-            state = storage.members_state(principal, &args, session)?;
+            state = storage.members_state(principal, &members, Some(session))?;
         }
     }
 }

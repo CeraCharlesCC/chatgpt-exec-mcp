@@ -264,7 +264,7 @@ fn strict_stateless_http_discovery_and_shared_pty_survive_reconnection() {
     let started = server.call(
         3,
         "tools/call",
-        json!({"name":"start_session","arguments":{"cmd":"/bin/bash"}}),
+        json!({"name":"exec_command","arguments":{"cmd":"/bin/bash","tty":true,"yield_time_ms":250}}),
     );
     assert_eq!(started.status, 200);
     let value = body(&started);

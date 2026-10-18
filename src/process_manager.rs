@@ -22,14 +22,12 @@ use crate::output_store::OutputStoreManager;
 use crate::output_summary::BuildOutput;
 use crate::response_delivery::{self, PreparedExecResponse};
 use crate::session::Session;
-use crate::session::SessionOrigin;
 use crate::session_id::SessionId;
 use crate::tools::ExecCommandArgs;
 use crate::tools::ExecResponse;
-use crate::tools::StartSessionArgs;
 use crate::tools::WaitForExitArgs;
 use crate::tools::WriteStdinArgs;
-use crate::tools::{DEFAULT_POLL_YIELD_MS, DEFAULT_SESSION_YIELD_MS, DEFAULT_WRITE_YIELD_MS};
+use crate::tools::{DEFAULT_POLL_YIELD_MS, DEFAULT_WRITE_YIELD_MS};
 use crate::tools::{MAX_WAIT_SECONDS, MAX_YIELD_MS, MIN_WAIT_SECONDS, MIN_YIELD_MS};
 
 #[derive(Default)]
@@ -39,7 +37,6 @@ struct StoreState {
 }
 
 struct ReservedSession {
-    origin: SessionOrigin,
     lease: Weak<()>,
 }
 
@@ -78,7 +75,6 @@ impl Drop for StartupReservation {
 }
 
 struct StartAndWaitArgs {
-    origin: SessionOrigin,
     command: String,
     workdir: Option<String>,
     tty: bool,
@@ -121,7 +117,7 @@ impl ProcessManager {
 
     pub(crate) fn instructions(&self) -> String {
         let default_instructions = concat!(
-            "Use exec_command for commands; start_session only for persistent state. ",
+            "Use exec_command to start commands, shells, and REPLs; tty only selects a PTY. Reuse session_id with write_stdin to preserve process state. ",
             "Prefer wait_for_exit for completion; ordinary output does not wake it. ",
             "Use write_stdin for input, Ctrl-C, or output polling. ",
             "Truncated output includes output_ref for the raw log.",
@@ -159,7 +155,6 @@ impl ProcessManager {
         let build_output = BuildOutput::for_command(&args.cmd);
         let output_tokens = output_tokens(args.max_output_tokens, build_output);
         self.start_and_wait(StartAndWaitArgs {
-            origin: SessionOrigin::ExecContinuation,
             command: args.cmd,
             workdir: args.workdir,
             tty: args.tty,
@@ -170,34 +165,8 @@ impl ProcessManager {
         .await
     }
 
-    pub async fn start_session(&self, args: StartSessionArgs) -> anyhow::Result<ExecResponse> {
-        validate_output_tokens(args.max_output_tokens)?;
-        let command = args.cmd.unwrap_or_else(|| {
-            format!(
-                "exec '{}'",
-                self.config.shell.to_string_lossy().replace('\'', "'\\''")
-            )
-        });
-        if command.trim().is_empty() {
-            bail!("cmd must not be empty");
-        }
-        let build_output = BuildOutput::for_command(&command);
-        let output_tokens = output_tokens(args.max_output_tokens, build_output);
-        self.start_and_wait(StartAndWaitArgs {
-            origin: SessionOrigin::ExplicitSession,
-            command,
-            workdir: args.workdir,
-            tty: args.tty.unwrap_or(true),
-            yield_ms: DEFAULT_SESSION_YIELD_MS,
-            max_output_tokens: output_tokens,
-            build_output,
-        })
-        .await
-    }
-
     async fn start_and_wait(&self, args: StartAndWaitArgs) -> anyhow::Result<ExecResponse> {
         let StartAndWaitArgs {
-            origin,
             command,
             workdir,
             tty,
@@ -207,16 +176,16 @@ impl ProcessManager {
         } = args;
         let started = Instant::now();
         let cwd = self.resolve_workdir(workdir.as_deref())?;
-        let reservation = self.reserve(origin).await?;
+        let reservation = self.reserve().await?;
         let id = reservation.id.clone();
         // Blocking artifact creation owns its result; a cancelled waiter drops
         // the unpublished store and removes its files when creation finishes.
         let output_store = self.create_output_store().await?;
-        let spawned = self.spawn(&id, origin, &command, &cwd, tty).await?;
+        let spawned = self.spawn(&id, &command, &cwd, tty).await?;
         // Registration transfers ownership to the manager. A cancelled initial
         // wait then follows the existing registered-session lifetime policy.
         let session = self
-            .commit_reservation(reservation, origin, spawned, output_store, build_output)
+            .commit_reservation(reservation, spawned, output_store, build_output)
             .await?;
         session
             .wait_until_exit_or_timeout(Duration::from_millis(yield_ms))
@@ -425,14 +394,13 @@ impl ProcessManager {
     async fn spawn(
         &self,
         id: &SessionId,
-        origin: SessionOrigin,
         command: &str,
         cwd: &Path,
         tty: bool,
     ) -> anyhow::Result<codex_utils_pty::SpawnedProcess> {
         let cwd = std::fs::canonicalize(cwd).context("workdir canonicalize failed before spawn")?;
         validate_directory(&cwd).context("invalid spawn workdir")?;
-        let mut environment = self.config.child_env.for_spawn(origin, &cwd);
+        let mut environment = self.config.child_env.for_spawn(&cwd);
         environment.insert("CHATGPT_EXEC_SESSION".into(), id.to_string());
         let program = self.config.shell.to_string_lossy().into_owned();
         let arguments = vec!["-c".to_owned(), command.to_owned()];
@@ -478,7 +446,7 @@ impl ProcessManager {
         std::fs::canonicalize(&path).context("workdir canonicalize failed")
     }
 
-    async fn reserve(&self, origin: SessionOrigin) -> anyhow::Result<StartupReservation> {
+    async fn reserve(&self) -> anyhow::Result<StartupReservation> {
         if self.shutting_down.load(Ordering::SeqCst) {
             bail!("server is shutting down");
         }
@@ -489,28 +457,10 @@ impl ProcessManager {
         state
             .reserved
             .retain(|_, reservation| reservation.lease.strong_count() > 0);
-        let active = state
-            .sessions
-            .values()
-            .filter(|session| session.origin == origin)
-            .count()
-            + state
-                .reserved
-                .values()
-                .filter(|reservation| reservation.origin == origin)
-                .count();
-        let limit = match origin {
-            SessionOrigin::ExecContinuation => self.config.max_exec_continuations,
-            SessionOrigin::ExplicitSession => self.config.max_explicit_sessions,
-        };
+        let active = state.sessions.len() + state.reserved.len();
+        let limit = self.config.max_sessions;
         if active >= limit {
-            bail!(
-                "{} session quota reached ({limit})",
-                match origin {
-                    SessionOrigin::ExecContinuation => "exec continuation",
-                    SessionOrigin::ExplicitSession => "explicit",
-                }
-            );
+            bail!("session quota reached ({limit})");
         }
 
         let id = SessionId::generate_unique(|candidate| {
@@ -520,7 +470,6 @@ impl ProcessManager {
         state.reserved.insert(
             id.clone(),
             ReservedSession {
-                origin,
                 lease: Arc::downgrade(&lease),
             },
         );
@@ -534,7 +483,6 @@ impl ProcessManager {
     async fn commit_reservation(
         &self,
         reservation: StartupReservation,
-        origin: SessionOrigin,
         spawned: codex_utils_pty::SpawnedProcess,
         output_store: OutputStore,
         build_output: Option<BuildOutput>,
@@ -549,13 +497,7 @@ impl ProcessManager {
         }
         // Session capture tasks start only after acquiring the registry lock.
         // No await separates task ownership from registration.
-        let session = Session::new(
-            reservation.id.clone(),
-            origin,
-            spawned,
-            output_store,
-            build_output,
-        );
+        let session = Session::new(reservation.id.clone(), spawned, output_store, build_output);
         state
             .sessions
             .insert(reservation.id.clone(), Arc::clone(&session));
@@ -587,12 +529,7 @@ impl ProcessManager {
                 .sessions
                 .iter()
                 .filter_map(|(id, session)| {
-                    let timeout = match session.origin {
-                        SessionOrigin::ExecContinuation => {
-                            self.config.exec_continuation_idle_timeout
-                        }
-                        SessionOrigin::ExplicitSession => self.config.explicit_session_idle_timeout,
-                    };
+                    let timeout = self.config.session_idle_timeout;
                     (session.idle_for() >= timeout).then(|| id.clone())
                 })
                 .collect();
@@ -736,10 +673,12 @@ mod tests {
 
     async fn test_session(manager: &Arc<ProcessManager>, command: &str) -> String {
         manager
-            .start_session(StartSessionArgs {
-                cmd: Some(command.into()),
-                tty: Some(false),
-                ..Default::default()
+            .exec_command(ExecCommandArgs {
+                cmd: command.into(),
+                tty: false,
+                workdir: None,
+                max_output_tokens: None,
+                yield_time_ms: Some(250),
             })
             .await
             .unwrap()
@@ -1059,40 +998,22 @@ mod tests {
 
     async fn startup(
         manager: &ProcessManager,
-        origin: SessionOrigin,
         command: &str,
         tty: bool,
     ) -> anyhow::Result<ExecResponse> {
-        match origin {
-            SessionOrigin::ExecContinuation => {
-                manager
-                    .exec_command(ExecCommandArgs {
-                        cmd: command.into(),
-                        tty,
-                        yield_time_ms: Some(MIN_YIELD_MS),
-                        workdir: None,
-                        max_output_tokens: None,
-                    })
-                    .await
-            }
-            SessionOrigin::ExplicitSession => {
-                manager
-                    .start_session(StartSessionArgs {
-                        cmd: Some(command.into()),
-                        tty: Some(tty),
-                        ..Default::default()
-                    })
-                    .await
-            }
-        }
+        manager
+            .exec_command(ExecCommandArgs {
+                cmd: command.into(),
+                tty,
+                yield_time_ms: Some(MIN_YIELD_MS),
+                workdir: None,
+                max_output_tokens: None,
+            })
+            .await
     }
 
-    async fn completed_startup(
-        manager: &ProcessManager,
-        origin: SessionOrigin,
-        command: &str,
-    ) -> ExecResponse {
-        let initial = startup(manager, origin, command, false).await.unwrap();
+    async fn completed_startup(manager: &ProcessManager, command: &str) -> ExecResponse {
+        let initial = startup(manager, command, false).await.unwrap();
         if let Some(id) = initial.session_id.as_ref() {
             let mut completed = manager.wait_for_exit(test_wait_args(id)).await.unwrap();
             completed.output.insert_str(0, &initial.output);
@@ -1105,8 +1026,7 @@ mod tests {
     fn quota_one_manager(workspace: &TempDir) -> Arc<ProcessManager> {
         let mut manager = test_manager(workspace);
         let config = &mut Arc::get_mut(&mut manager).unwrap().config;
-        config.max_exec_continuations = 1;
-        config.max_explicit_sessions = 1;
+        config.max_sessions = 1;
         manager
     }
 
@@ -1136,10 +1056,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            for origin in [
-                SessionOrigin::ExecContinuation,
-                SessionOrigin::ExplicitSession,
-            ] {
+            for tty in [false, true] {
                 let workspace = TempDir::new().unwrap();
                 let manager = quota_one_manager(&workspace);
                 let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -1149,17 +1066,15 @@ mod tests {
                     release_rx.recv().unwrap();
                 });
                 started_rx.await.unwrap();
-                let mut cancelled =
-                    Box::pin(startup(&manager, origin, "touch cancelled-child", false));
+                let mut cancelled = Box::pin(startup(&manager, "touch cancelled-child", tty));
                 poll_pending(cancelled.as_mut()).await;
-                let error = startup(&manager, origin, "true", false)
+                let error = startup(&manager, "true", false)
                     .await
                     .unwrap_err()
                     .to_string();
                 assert!(error.contains("quota reached"), "{error}");
                 drop(cancelled);
-                let mut replacement =
-                    Box::pin(completed_startup(&manager, origin, "printf quota-reused"));
+                let mut replacement = Box::pin(completed_startup(&manager, "printf quota-reused"));
                 poll_pending(replacement.as_mut()).await;
                 release_tx.send(()).unwrap();
                 blocker.await.unwrap();
@@ -1177,16 +1092,13 @@ mod tests {
     async fn dropped_reservation_releases_quota_while_registry_is_locked() {
         let workspace = TempDir::new().unwrap();
         let manager = quota_one_manager(&workspace);
-        for origin in [
-            SessionOrigin::ExecContinuation,
-            SessionOrigin::ExplicitSession,
-        ] {
-            let reservation = manager.reserve(origin).await.unwrap();
+        for _ in 0..2 {
+            let reservation = manager.reserve().await.unwrap();
             let state = manager.state.lock().await;
             drop(reservation);
             drop(state);
             // Do not yield to the deferred map-removal task before reuse.
-            let replacement = manager.reserve(origin).await.unwrap();
+            let replacement = manager.reserve().await.unwrap();
             drop(replacement);
         }
         manager.shutdown_all().await;
@@ -1226,10 +1138,7 @@ mod tests {
         for tty in [false, true] {
             let workspace = TempDir::new().unwrap();
             let manager = quota_one_manager(&workspace);
-            let reservation = manager
-                .reserve(SessionOrigin::ExecContinuation)
-                .await
-                .unwrap();
+            let reservation = manager.reserve().await.unwrap();
             let id = reservation.id.clone();
             let cwd = workspace.path().to_path_buf();
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -1237,13 +1146,7 @@ mod tests {
             let worker_manager = Arc::clone(&manager);
             let mut spawning = Box::pin(complete_spawn(async move {
                 let spawned = worker_manager
-                    .spawn(
-                        &id,
-                        SessionOrigin::ExecContinuation,
-                        "echo $$ > child.pid; read line",
-                        &cwd,
-                        tty,
-                    )
+                    .spawn(&id, "echo $$ > child.pid; read line", &cwd, tty)
                     .await?;
                 ready_tx.send(()).unwrap();
                 let _ = finish_rx.await;
@@ -1254,8 +1157,7 @@ mod tests {
             let pid = child_pid(&workspace).await;
             drop(spawning);
             drop(reservation);
-            let response =
-                completed_startup(&manager, SessionOrigin::ExecContinuation, "printf reused").await;
+            let response = completed_startup(&manager, "printf reused").await;
             assert_eq!(response.output, "reused");
             finish_tx.send(()).unwrap();
             child_terminated(pid).await;
@@ -1271,16 +1173,12 @@ mod tests {
         for tty in [false, true] {
             let workspace = TempDir::new().unwrap();
             let manager = quota_one_manager(&workspace);
-            let reservation = manager
-                .reserve(SessionOrigin::ExecContinuation)
-                .await
-                .unwrap();
+            let reservation = manager.reserve().await.unwrap();
             let store = manager.create_output_store().await.unwrap();
             let raw = store.snapshot(0).path;
             let spawned = manager
                 .spawn(
                     &reservation.id,
-                    SessionOrigin::ExecContinuation,
                     "echo $$ > child.pid; read line",
                     workspace.path(),
                     tty,
@@ -1289,21 +1187,15 @@ mod tests {
                 .unwrap();
             let pid = child_pid(&workspace).await;
             let state = manager.state.lock().await;
-            let mut registering = Box::pin(manager.commit_reservation(
-                reservation,
-                SessionOrigin::ExecContinuation,
-                spawned,
-                store,
-                None,
-            ));
+            let mut registering =
+                Box::pin(manager.commit_reservation(reservation, spawned, store, None));
             poll_pending(registering.as_mut()).await;
             drop(registering);
             assert!(!raw.exists());
             drop(state);
             child_terminated(pid).await;
             assert_eq!(manager.active_session_count().await, 0);
-            let response =
-                completed_startup(&manager, SessionOrigin::ExecContinuation, "printf reused").await;
+            let response = completed_startup(&manager, "printf reused").await;
             assert_eq!(response.output, "reused");
             no_artifacts(&manager).await;
             manager.shutdown_all().await;
@@ -1321,7 +1213,7 @@ mod tests {
         std::fs::set_permissions(&invalid_shell, std::fs::Permissions::from_mode(0o600)).unwrap();
         Arc::get_mut(&mut manager).unwrap().config.shell = invalid_shell;
         for _ in 0..2 {
-            let error = startup(&manager, SessionOrigin::ExecContinuation, "true", false)
+            let error = startup(&manager, "true", false)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -1329,15 +1221,11 @@ mod tests {
             no_artifacts(&manager).await;
         }
         Arc::get_mut(&mut manager).unwrap().config.shell = PathBuf::from("/bin/bash");
-        let reservation = manager
-            .reserve(SessionOrigin::ExecContinuation)
-            .await
-            .unwrap();
+        let reservation = manager.reserve().await.unwrap();
         let store = manager.create_output_store().await.unwrap();
         let spawned = manager
             .spawn(
                 &reservation.id,
-                SessionOrigin::ExecContinuation,
                 "echo $$ > child.pid; read line",
                 workspace.path(),
                 false,
@@ -1347,13 +1235,7 @@ mod tests {
         let pid = child_pid(&workspace).await;
         manager.shutdown_all().await;
         let result = manager
-            .commit_reservation(
-                reservation,
-                SessionOrigin::ExecContinuation,
-                spawned,
-                store,
-                None,
-            )
+            .commit_reservation(reservation, spawned, store, None)
             .await;
         assert!(result.is_err());
         child_terminated(pid).await;
