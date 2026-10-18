@@ -165,6 +165,14 @@ async fn asset(Path(path): Path<String>) -> Response {
             "text/javascript; charset=utf-8",
             include_str!("webui/app.js"),
         ),
+        "state.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("webui/state.js"),
+        ),
+        "api.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("webui/api.js"),
+        ),
         "dom.js" => (
             "text/javascript; charset=utf-8",
             include_str!("webui/dom.js"),
@@ -176,6 +184,26 @@ async fn asset(Path(path): Path<String>) -> Response {
         "model/messages.js" => (
             "text/javascript; charset=utf-8",
             include_str!("webui/model/messages.js"),
+        ),
+        "views/activity.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("webui/views/activity.js"),
+        ),
+        "views/pools.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("webui/views/pools.js"),
+        ),
+        "views/inbox.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("webui/views/inbox.js"),
+        ),
+        "views/menu.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("webui/views/menu.js"),
+        ),
+        "views/tool-output.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("webui/views/tool-output.js"),
         ),
         "vendor/prism.js" => (
             "text/javascript; charset=utf-8",
