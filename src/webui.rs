@@ -4,7 +4,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -143,6 +143,7 @@ struct TerminateResponse {
 pub fn router(state: WebUiState) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/_admin/assets/{*path}", get(asset))
         .route("/_admin/api/snapshot", get(snapshot))
         .route("/_admin/api/send", post(send))
         .route("/_admin/api/ack", post(ack))
@@ -153,6 +154,34 @@ pub fn router(state: WebUiState) -> Router {
 
 async fn index() -> Html<&'static str> {
     Html(include_str!("webui.html"))
+}
+
+async fn asset(Path(path): Path<String>) -> Response {
+    // Explicitly register each browser asset so a standalone binary never has
+    // to read front-end files from the working directory at runtime.
+    let (content_type, contents) = match path.trim_start_matches('/') {
+        "styles.css" => ("text/css; charset=utf-8", include_str!("webui/styles.css")),
+        "app.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("webui/app.js"),
+        ),
+        "vendor/prism.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("webui/vendor/prism.js"),
+        ),
+        // Add future native ES modules to this allowlist when they are extracted.
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        contents,
+    )
+        .into_response()
 }
 
 async fn snapshot(State(state): State<WebUiState>) -> Result<Response, WebError> {

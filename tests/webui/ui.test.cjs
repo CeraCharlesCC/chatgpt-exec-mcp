@@ -2,9 +2,16 @@ const {test, before, after} = require('node:test');
 const assert = require('node:assert/strict');
 const {readFileSync} = require('node:fs');
 const {createServer} = require('node:http');
+const {join} = require('node:path');
 const {chromium} = require('playwright');
 
-const html = readFileSync(require('node:path').join(__dirname, '../../src/webui.html'));
+const html = readFileSync(join(__dirname, '../../src/webui.html'));
+const assetDir = join(__dirname, '../../src/webui');
+const assets = new Map([
+  ['/_admin/assets/styles.css', ['styles.css', 'text/css; charset=utf-8']],
+  ['/_admin/assets/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ['/_admin/assets/vendor/prism.js', ['vendor/prism.js', 'text/javascript; charset=utf-8']],
+]);
 let browser, server, url;
 before(async () => {
   browser = await chromium.launch({
@@ -12,8 +19,22 @@ before(async () => {
     args: ['--no-sandbox'],
   });
   server = createServer((req, res) => {
-    res.setHeader('Content-Type', 'text/html');
-    res.end(html);
+    const pathname = new URL(req.url, 'http://localhost').pathname;
+    if (req.method === 'GET' && pathname === '/') {
+      res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
+      return res.end(html);
+    }
+    const asset = req.method === 'GET' ? assets.get(pathname) : undefined;
+    if (asset) {
+      res.writeHead(200, {
+        'Content-Type': asset[1],
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+      });
+      return res.end(readFileSync(join(assetDir, asset[0])));
+    }
+    res.writeHead(404, {'Content-Type': 'text/plain; charset=utf-8'});
+    res.end('Not Found');
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   url = `http://127.0.0.1:${server.address().port}`;
@@ -55,6 +76,14 @@ function fixture() {
 async function open(t, data = fixture(), viewport = {width: 1440, height: 900}) {
   const context = await browser.newContext({viewport});
   t.after(() => context.close());
+  // Native ES modules do not expose lexical bindings on window. Install only
+  // test-harness references to the real module exports, including on reloads.
+  await context.addInitScript(() => {
+    document.addEventListener('DOMContentLoaded', async () => {
+      const {refresh, clearHistory, state} = await import('/_admin/assets/app.js');
+      Object.assign(window, {refresh, clearHistory, state});
+    }, {once: true});
+  });
   const page = await context.newPage();
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -62,9 +91,11 @@ async function open(t, data = fixture(), viewport = {width: 1440, height: 900}) 
   await page.route('**/_admin/api/snapshot', route => route.fulfill({json: data}));
   await page.goto(url);
   await page.waitForFunction(() => document.querySelector('#status').textContent.includes('vtest'));
+  await page.waitForFunction(() => typeof refresh === 'function');
   // Manual refreshes let tests cross age boundaries without timing-dependent sleeps.
   await page.evaluate(() => { window.testClock = Date.now(); Date.now = () => window.testClock; });
   return {page, data, poll: async () => {
+    await page.waitForFunction(() => typeof refresh === 'function');
     await page.evaluate(async () => { window.testClock += 2000; await refresh(); });
   }};
 }

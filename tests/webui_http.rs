@@ -88,6 +88,40 @@ fn send_args(target: Option<&str>, message: Option<&str>) -> PoolSendArgs {
 }
 
 #[tokio::test]
+async fn embedded_webui_assets_have_correct_mime_types_and_unknown_paths_are_not_served() {
+    let server = Dashboard::start(WebUiState::without_pool(Arc::new(ActivityHub::new(10)))).await;
+    for (path, content_type) in [
+        ("styles.css", "text/css; charset=utf-8"),
+        ("app.js", "text/javascript; charset=utf-8"),
+        ("vendor/prism.js", "text/javascript; charset=utf-8"),
+    ] {
+        let response = server
+            .client
+            .get(format!("{}/_admin/assets/{path}", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(response.headers()["content-type"], content_type, "{path}");
+        assert_eq!(response.headers()["cache-control"], "no-store", "{path}");
+        assert_eq!(
+            response.headers()["x-content-type-options"],
+            "nosniff",
+            "{path}"
+        );
+        assert!(!response.bytes().await.unwrap().is_empty(), "{path}");
+    }
+
+    let missing = server
+        .client
+        .get(format!("{}/_admin/assets/unknown.js", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn disabled_pool_snapshot_keeps_activity_and_rejects_controls() {
     let activity = Arc::new(ActivityHub::new(10));
     activity.emit(
