@@ -34,6 +34,28 @@ To use an existing Chrome installation instead of downloading Chromium:
 WEBUI_BROWSER=/absolute/path/to/chrome npm test
 ```
 
+`npm test` runs both the Playwright UI regressions (`ui.test.cjs`) and the
+browser-independent conversation model tests (`model.test.cjs`). To run only
+the model tests, use `npm run test:model`. From the repository root, run
+`cargo test --test webui_http --locked` for HTTP routing, asset, and admin API
+coverage. The Rust and browser suites are complementary: run both when changing
+the WebUI.
+
+## WebUI development
+
+The WebUI uses browser-native ES modules in `src/webui/`, with markup in
+`src/webui.html` and styles in `src/webui/styles.css`. These assets are embedded
+in the Rust binary by `src/webui.rs`; no frontend build step is required.
+
+Keep application coordination in `app.js`, rendering in `views/`, and
+browser-independent logic in `model/`. When changing polling or rendering,
+preserve user interactions such as scrolling and text selection, and guard
+against stale responses restoring cleared history.
+
+When adding an asset, register it in `src/webui.rs` and the Playwright HTTP
+fixture in `tests/webui/ui.test.cjs`. Cover UI changes with browser tests and
+model changes with Node tests, using the commands above.
+
 ## Release artifact
 
 To reproduce the standalone binary assembled by the release workflow:

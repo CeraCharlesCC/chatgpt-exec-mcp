@@ -1,6 +1,10 @@
+use std::collections::{BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
+use axum::routing::get;
 use chatgpt_exec_mcp::activity::ActivityHub;
 use chatgpt_exec_mcp::agent_pool::{AgentPoolStore, PoolSendArgs};
 use chatgpt_exec_mcp::webui::{WebUiState, router};
@@ -17,11 +21,15 @@ struct Dashboard {
 
 impl Dashboard {
     async fn start(state: WebUiState) -> Self {
+        Self::start_router(router(state)).await
+    }
+
+    async fn start_router(app: Router) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (shutdown, stopped) = oneshot::channel();
         tokio::spawn(async move {
-            axum::serve(listener, router(state))
+            axum::serve(listener, app)
                 .with_graceful_shutdown(async {
                     let _ = stopped.await;
                 })
@@ -87,48 +95,238 @@ fn send_args(target: Option<&str>, message: Option<&str>) -> PoolSendArgs {
     }
 }
 
-#[tokio::test]
-async fn embedded_webui_assets_have_correct_mime_types_and_unknown_paths_are_not_served() {
-    let server = Dashboard::start(WebUiState::without_pool(Arc::new(ActivityHub::new(10)))).await;
-    for (path, content_type) in [
-        ("styles.css", "text/css; charset=utf-8"),
-        ("app.js", "text/javascript; charset=utf-8"),
-        ("state.js", "text/javascript; charset=utf-8"),
-        ("api.js", "text/javascript; charset=utf-8"),
-        ("dom.js", "text/javascript; charset=utf-8"),
-        ("model/events.js", "text/javascript; charset=utf-8"),
-        ("model/messages.js", "text/javascript; charset=utf-8"),
-        ("views/activity.js", "text/javascript; charset=utf-8"),
-        ("views/pools.js", "text/javascript; charset=utf-8"),
-        ("views/inbox.js", "text/javascript; charset=utf-8"),
-        ("views/menu.js", "text/javascript; charset=utf-8"),
-        ("views/tool-output.js", "text/javascript; charset=utf-8"),
-        ("vendor/prism.js", "text/javascript; charset=utf-8"),
-    ] {
+const ASSET_PREFIX: &str = "/_admin/assets/";
+
+fn html_asset_references(html: &str) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for attribute in ["href=\"", "src=\"", "href='", "src='"] {
+        let quote = attribute.chars().last().unwrap();
+        let mut remaining = html;
+        while let Some((_, tail)) = remaining.split_once(attribute) {
+            let (value, rest) = tail
+                .split_once(quote)
+                .expect("HTML attributes must be quoted");
+            assert!(
+                !value.starts_with("https:")
+                    && !value.starts_with("http:")
+                    && !value.starts_with("//"),
+                "WebUI must not load a CDN or external browser asset: {value}"
+            );
+            if value.starts_with(ASSET_PREFIX) {
+                paths.insert(value.to_owned());
+            }
+            remaining = rest;
+        }
+    }
+    paths
+}
+
+fn source_asset_path(uri: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/webui")
+        .join(uri.strip_prefix(ASSET_PREFIX).unwrap())
+}
+
+fn source_asset_inventory() -> BTreeSet<String> {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/webui");
+    let mut directories = vec![base.clone()];
+    let mut assets = BTreeSet::new();
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                directories.push(path);
+            } else if matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("js" | "css")
+            ) {
+                let relative = path.strip_prefix(&base).unwrap().to_str().unwrap();
+                assets.insert(format!("{ASSET_PREFIX}{relative}"));
+            }
+        }
+    }
+    assets
+}
+
+fn module_imports(source: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    for line in source.lines().map(str::trim) {
+        if !(line.starts_with("import ")
+            || line.starts_with("export ")
+            || line.starts_with("} from "))
+        {
+            continue;
+        }
+        for marker in [" from '", " from \"", "import '", "import \""] {
+            if let Some((_, rest)) = line.split_once(marker) {
+                let quote = marker.chars().last().unwrap();
+                let (specifier, _) = rest
+                    .split_once(quote)
+                    .expect("module import must be quoted");
+                imports.push(specifier.to_owned());
+                break;
+            }
+        }
+    }
+    imports
+}
+
+fn resolve_asset_import(parent: &str, specifier: &str) -> String {
+    assert!(
+        specifier.starts_with("./") || specifier.starts_with("../"),
+        "ES modules must use relative, embedded imports: {specifier}"
+    );
+    let mut parts: Vec<String> = parent
+        .trim_start_matches('/')
+        .split('/')
+        .map(str::to_owned)
+        .collect();
+    parts.pop();
+    for segment in specifier.split('/') {
+        match segment {
+            "." => {}
+            ".." => {
+                assert!(
+                    parts.len() > 2,
+                    "module import escapes asset root: {specifier}"
+                );
+                parts.pop();
+            }
+            "" => panic!("empty module import segment in {specifier}"),
+            _ => parts.push(segment.to_owned()),
+        }
+    }
+    let resolved = format!("/{}", parts.join("/"));
+    assert!(
+        resolved.starts_with(ASSET_PREFIX),
+        "import escapes asset root: {resolved}"
+    );
+    resolved
+}
+
+async fn assert_embedded_assets(server: &Dashboard) {
+    let page = server.client.get(&server.url).send().await.unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    assert_eq!(page.headers()["content-type"], "text/html; charset=utf-8");
+    let html = page.text().await.unwrap();
+    let references = html_asset_references(&html);
+    assert!(references.contains("/_admin/assets/styles.css"));
+    assert!(references.contains("/_admin/assets/app.js"));
+
+    let expected = source_asset_inventory();
+    let mut pending: VecDeque<String> = references.into_iter().collect();
+    let mut seen = BTreeSet::new();
+    while let Some(uri) = pending.pop_front() {
+        if !seen.insert(uri.clone()) {
+            continue;
+        }
+        assert!(
+            expected.contains(&uri),
+            "asset reference lacks a source file: {uri}"
+        );
         let response = server
             .client
-            .get(format!("{}/_admin/assets/{path}", server.url))
+            .get(format!("{}{uri}", server.url))
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "{path}");
-        assert_eq!(response.headers()["content-type"], content_type, "{path}");
-        assert_eq!(response.headers()["cache-control"], "no-store", "{path}");
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let mime = if uri.ends_with(".css") {
+            "text/css; charset=utf-8"
+        } else {
+            "text/javascript; charset=utf-8"
+        };
+        assert_eq!(response.headers()["content-type"], mime, "{uri}");
+        assert_eq!(response.headers()["cache-control"], "no-store", "{uri}");
         assert_eq!(
             response.headers()["x-content-type-options"],
             "nosniff",
-            "{path}"
+            "{uri}"
         );
-        assert!(!response.bytes().await.unwrap().is_empty(), "{path}");
+        let body = response.text().await.unwrap();
+        assert_eq!(
+            body,
+            std::fs::read_to_string(source_asset_path(&uri)).unwrap(),
+            "{uri}"
+        );
+        if uri.ends_with(".js") {
+            for specifier in module_imports(&body) {
+                pending.push_back(resolve_asset_import(&uri, &specifier));
+            }
+        }
     }
+    assert_eq!(
+        seen, expected,
+        "every frontend JS/CSS file must be referenced, recursively importable and embedded"
+    );
 
-    let missing = server
-        .client
-        .get(format!("{}/_admin/assets/unknown.js", server.url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    for unknown in [
+        "/_admin/assets/unknown.js",
+        "/_admin/assets/views/missing.js",
+        "/_admin/assets/vendor/prism.css",
+        "/_admin/assets/package.json",
+    ] {
+        let response = server
+            .client
+            .get(format!("{}{unknown}", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{unknown}");
+    }
+}
+
+#[tokio::test]
+async fn embedded_assets_and_admin_api_work_on_standalone_and_merged_routers() {
+    for merged in [false, true] {
+        let state = WebUiState::without_pool(Arc::new(ActivityHub::new(10)));
+        let app = if merged {
+            // Match transport.rs: the WebUI router is merged with the main MCP routes.
+            Router::new()
+                .route("/readyz", get(|| async { "ready" }))
+                .route("/mcp", get(|| async { "mcp" }))
+                .merge(router(state))
+        } else {
+            // Match the separately bound loopback WebUI listener.
+            router(state)
+        };
+        let server = Dashboard::start_router(app).await;
+        assert_embedded_assets(&server).await;
+
+        if merged {
+            let ready = server
+                .client
+                .get(format!("{}/readyz", server.url))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(ready.text().await.unwrap(), "ready");
+            let mcp = server
+                .client
+                .get(format!("{}/mcp", server.url))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(mcp.text().await.unwrap(), "mcp");
+        }
+        let snapshot = server.snapshot().await;
+        assert_eq!(snapshot["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(snapshot["pools"], json!([]));
+        assert_eq!(
+            server
+                .post(
+                    "send",
+                    json!({"pool":"example","target":"global","message":"hello"}),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                )
+                .await,
+            "agent pool is not configured"
+        );
+        assert_eq!(
+            server.post("clear", json!({}), StatusCode::OK).await,
+            json!({"cleared_events":0,"cleared_admin_messages":0})
+        );
+    }
 }
 
 #[tokio::test]
