@@ -2,8 +2,13 @@ import { $, esc, interacting, syncList, time } from '../dom.js';
 
 export function renderInbox(state) {
   const root = $('#inbox'), messages = state.data?.admin_messages || [];
+  $('#inboxPagination').hidden = !state.data ||
+    (state.inboxPageIndex === 0 && !state.data.admin_messages_next_cursor);
+  $('#inboxPageLabel').textContent = `Page ${state.inboxPageIndex + 1}${state.inboxLoading ? ' · loading…' : ''}`;
+  $('#inboxNewer').disabled = state.inboxLoading || state.inboxPageIndex === 0;
+  $('#inboxOlder').disabled = state.inboxLoading || !state.data?.admin_messages_next_cursor;
   if (interacting(root)) return;
-  syncList(root, messages, m => m.message_id, m => `<div class="message-head"><span>${esc(m.from)} · ${esc(m.pool)}</span>${time(m.created_ms, '')}</div><div style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.message)}</div><div class="message-actions"><button class="ack" data-message-id="${esc(m.message_id)}" title="ACKed messages stay visible until history is cleared or the server restarts">ACK</button></div>`, 'No messages', 'message');
+  syncList(root, messages, m => m.message_id, m => `<div class="message-head"><span>${esc(m.from)} · ${esc(m.pool)}</span>${time(m.created_ms, '')}</div><div style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.message)}</div><div class="message-actions"><button class="ack" data-message-id="${esc(m.message_id)}" title="ACKed messages stay visible until history is cleared or the server restarts">ACK</button></div>`, state.inboxLoading ? 'Loading messages…' : 'No messages', 'message');
   for (const row of root.children) {
     const message = messages.find(m => m.message_id === row.dataset.key);
     if (!message) continue;
@@ -14,9 +19,11 @@ export function renderInbox(state) {
   }
 }
 
-export function bindInbox(ackMessage) {
+export function bindInbox({ackMessage, changePage}) {
   $('#inbox').onclick = event => {
     const button = event.target.closest('button.ack');
     if (button && !button.disabled) ackMessage(button.dataset.messageId);
   };
+  $('#inboxNewer').onclick = () => changePage(-1);
+  $('#inboxOlder').onclick = () => changePage(1);
 }

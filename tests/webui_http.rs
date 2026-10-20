@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,21 +48,35 @@ impl Dashboard {
     }
 
     async fn snapshot(&self) -> Value {
-        let response = self
-            .client
-            .get(format!("{}/_admin/api/snapshot", self.url))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        self.snapshot_after(None).await
+    }
+
+    async fn snapshot_after(&self, cursor: Option<&str>) -> Value {
+        let mut request = self.client.get(format!("{}/_admin/api/snapshot", self.url));
+        if let Some(cursor) = cursor {
+            request = request.query(&[("cursor", cursor)]);
+        }
+        let response = request.send().await.unwrap();
+        if response.status() != StatusCode::OK {
+            panic!(
+                "snapshot request failed: {}",
+                response.text().await.unwrap()
+            );
+        }
         assert_eq!(response.headers()["content-type"], "application/json");
         response.json().await.unwrap()
     }
 
     async fn post(&self, endpoint: &str, body: Value, status: StatusCode) -> Value {
+        let token = self.snapshot().await["csrf_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let response = self
             .client
             .post(format!("{}/_admin/api/{endpoint}", self.url))
+            .header("origin", &self.url)
+            .header("x-webui-csrf-token", token)
             .json(&body)
             .send()
             .await
@@ -369,6 +383,294 @@ async fn disabled_pool_snapshot_keeps_activity_and_rejects_controls() {
     assert_eq!(server.snapshot().await["events"], json!([]));
     let next_id = activity.emit("tool.start", "info", None, vec![], json!({}));
     assert_eq!(next_id, 2, "clearing must not reuse event IDs");
+}
+
+#[tokio::test]
+async fn admin_posts_require_same_origin_loopback_host_json_and_csrf_token() {
+    let workspace = TempDir::new().unwrap();
+    let store =
+        Arc::new(AgentPoolStore::open(&workspace.path().join("private/pool.sqlite")).unwrap());
+    let sent = store
+        .send(
+            "account-a",
+            send_args(Some("admin"), Some("unread")),
+            Some("session"),
+        )
+        .unwrap();
+    let message_id = sent.message_id.unwrap();
+    let activity = Arc::new(ActivityHub::new(20));
+    activity.emit(
+        "tool.finish",
+        "info",
+        None,
+        vec![],
+        json!({"output":"keep"}),
+    );
+    let server = Dashboard::start(
+        WebUiState::for_principal(store.clone(), "account-a".into(), activity).unwrap(),
+    )
+    .await;
+    let token = server.snapshot().await["csrf_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    for (endpoint, body) in [
+        (
+            "send",
+            json!({"pool":"team", "target":"global", "message":"attack"}),
+        ),
+        ("ack", json!({"message_id":message_id})),
+        ("clear", json!({})),
+        ("terminate", json!({"pool":"team", "agent":"Alice"})),
+    ] {
+        let uri = format!("{}/_admin/api/{endpoint}", server.url);
+        let body = body.to_string();
+        // Browser no-cors fetch: this simple text/plain request used to mutate state.
+        let response = server
+            .client
+            .post(&uri)
+            .header("origin", "http://localhost:9999")
+            .header("content-type", "text/plain")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{endpoint}: cross-origin simple POST"
+        );
+
+        let response = server
+            .client
+            .post(&uri)
+            .header("origin", "http://localhost:9999")
+            .header("x-webui-csrf-token", &token)
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{endpoint}: cross-origin with token"
+        );
+
+        let response = server
+            .client
+            .post(&uri)
+            .header("origin", &server.url)
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{endpoint}: missing token"
+        );
+
+        let response = server
+            .client
+            .post(&uri)
+            .header("x-webui-csrf-token", &token)
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{endpoint}: missing Origin"
+        );
+
+        let response = server
+            .client
+            .post(&uri)
+            .header("origin", &server.url)
+            .header("x-webui-csrf-token", &token)
+            .header("content-type", "text/plain")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{endpoint}: wrong content type"
+        );
+
+        let response = server
+            .client
+            .post(&uri)
+            .header("host", "evil.example")
+            .header("origin", "http://evil.example")
+            .header("x-webui-csrf-token", &token)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{endpoint}: DNS rebinding Host"
+        );
+    }
+
+    // A DNS-rebound GET must not be allowed to read the bearer CSRF token.
+    let response = server
+        .client
+        .get(format!("{}/_admin/api/snapshot", server.url))
+        .header("host", "evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    assert_eq!(
+        server.snapshot().await["events"].as_array().unwrap().len(),
+        1
+    );
+    assert!(!store.admin_messages("account-a", 10).unwrap()[0].acknowledged);
+    assert_eq!(store.admin_members("account-a").unwrap().len(), 1);
+    let turn = store
+        .start_tool("account-a", Some("session"))
+        .await
+        .unwrap();
+    let inbox = store
+        .finish_tool_turn("account-a", Some("session"), turn.as_ref())
+        .await
+        .unwrap();
+    assert!(
+        inbox.messages.is_empty(),
+        "cross-origin send must not queue messages"
+    );
+}
+
+#[tokio::test]
+async fn admin_inbox_cursor_pages_reach_older_unread_messages_and_offer_receipts() {
+    let workspace = TempDir::new().unwrap();
+    let path = workspace.path().join("private/pool.sqlite");
+    let store = Arc::new(AgentPoolStore::open(&path).unwrap());
+    let mut expected = HashSet::new();
+    let mut oldest_id = String::new();
+    for i in 0..455 {
+        let message = format!("message-{i:03}");
+        let result = store
+            .send(
+                "account-a",
+                send_args(Some("admin"), Some(&message)),
+                Some("session"),
+            )
+            .unwrap();
+        let id = result.message_id.unwrap();
+        if i == 0 {
+            oldest_id = id.clone();
+        }
+        expected.insert(id);
+    }
+    // Force identical timestamps: cursor pagination must break ties by ID.
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE admin_messages SET created=1000 WHERE principal='account-a'",
+        [],
+    )
+    .unwrap();
+    let server = Dashboard::start(
+        WebUiState::for_principal(
+            store.clone(),
+            "account-a".into(),
+            Arc::new(ActivityHub::new(10)),
+        )
+        .unwrap(),
+    )
+    .await;
+
+    let mut seen = HashSet::new();
+    let mut cursor = None;
+    let mut lengths = vec![];
+    let mut last_page_cursor = None;
+    let mut older_page_id = String::new();
+    for _ in 0..4 {
+        let page = server.snapshot_after(cursor.as_deref()).await;
+        let messages = page["admin_messages"].as_array().unwrap();
+        lengths.push(messages.len());
+        older_page_id = messages.last().unwrap()["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for message in messages {
+            assert_eq!(message["acknowledged"], false);
+            assert!(
+                seen.insert(message["message_id"].as_str().unwrap().to_owned()),
+                "duplicate page item"
+            );
+        }
+        // The lookahead row that establishes has_more must not create a receipt.
+        let offered: i64 = db.query_row("SELECT COUNT(*) FROM admin_messages WHERE offered_at IS NOT NULL AND principal='account-a'", [], |row| row.get(0)).unwrap();
+        let receipts: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM delivery_receipts WHERE recipient='admin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(offered as usize, seen.len());
+        assert_eq!(receipts as usize, seen.len());
+
+        last_page_cursor = cursor;
+        cursor = page["admin_messages_next_cursor"]
+            .as_str()
+            .map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(lengths, vec![200, 200, 55]);
+    assert_eq!(
+        seen, expected,
+        "all 455 retained messages must be reachable"
+    );
+    assert!(seen.contains(&oldest_id));
+
+    assert_eq!(
+        server
+            .post("ack", json!({"message_id":older_page_id}), StatusCode::OK)
+            .await,
+        json!({"acknowledged":true})
+    );
+    let last_page = server.snapshot_after(last_page_cursor.as_deref()).await;
+    let oldest = last_page["admin_messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["message_id"] == older_page_id)
+        .unwrap();
+    assert_eq!(oldest["acknowledged"], true);
+
+    for cursor in [
+        "garbage",
+        "1000:not-a-uuid",
+        "1000:00000000-0000-0000-0000-000000000000:extra",
+    ] {
+        let response = server
+            .client
+            .get(format!("{}/_admin/api/snapshot", server.url))
+            .query(&[("cursor", cursor)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "malformed cursor {cursor}"
+        );
+    }
 }
 
 #[tokio::test]

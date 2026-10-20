@@ -64,10 +64,11 @@ function fixture() {
   const lines = Array.from({length: 100}, (_, n) => `line ${n} with selectable text`).join('\n');
   const peer = {pool: 'beta', message_id: 'received-1', from: 'Bob', to: 'Alice', message: 'beta incoming\nsecond line'};
   return {
-    version: 'test', uptime_seconds: 0,
+    version: 'test', uptime_seconds: 0, csrf_token: 'browser-test-csrf-token',
     pools: [{name: 'alpha', agents: [agent('alpha', 'Alice', 'chat-alpha')]},
       {name: 'beta', agents: [agent('beta', 'Alice', 'chat-beta'), agent('beta', 'Bob', 'chat-bob')]}],
     admin_messages: [{pool: 'old-pool', message_id: 'inbox-1', from: 'Former agent', message: '<script>unsafe()</script>\ninbox message', created_ms: now, acknowledged: false}],
+    admin_messages_next_cursor: null,
     events: [
       event(1, 'tool.start', {tool: 'exec_command', arguments: {cmd: lines}}, [identity('alpha', 'Alice')]),
       event(2, 'tool.finish', {tool: 'exec_command', start_event_id: 1, result: {output: lines}}, [identity('alpha', 'Alice')]),
@@ -98,7 +99,7 @@ async function open(t, data = fixture(), viewport = {width: 1440, height: 900}) 
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   t.after(() => assert.deepEqual(errors, [], 'no browser exceptions'));
-  await page.route('**/_admin/api/snapshot', route => route.fulfill({json: data}));
+  await page.route('**/_admin/api/snapshot*', route => route.fulfill({json: data}));
   await page.goto(url);
   await page.waitForFunction(() => document.querySelector('#status').textContent.includes('vtest'));
   await page.waitForFunction(() => typeof refresh === 'function');
@@ -137,6 +138,8 @@ test('polls preserve nested scroll, focus and working pool/send interactions', a
 
   let sent;
   await page.route('**/_admin/api/send', route => {
+    assert.equal(route.request().headers()['x-webui-csrf-token'], 'browser-test-csrf-token');
+    assert.equal(route.request().headers()['content-type'], 'application/json');
     sent = route.request().postDataJSON();
     return route.fulfill({json: {recipients: ['Bob']}});
   });
@@ -160,6 +163,7 @@ test('admin ACK keeps the message visible across polls and browser reloads', asy
   const requests = [];
   await page.route('**/_admin/api/ack', async route => {
     assert.equal(route.request().method(), 'POST');
+    assert.equal(route.request().headers()['x-webui-csrf-token'], 'browser-test-csrf-token');
     requests.push(route.request().postDataJSON());
     await new Promise(resolve => { complete = resolve; });
     data.admin_messages[0].acknowledged = true;
@@ -184,6 +188,48 @@ test('admin ACK keeps the message visible across polls and browser reloads', asy
   await page.waitForFunction(() => document.querySelector('#inbox .ack')?.textContent === 'ACKed');
   assert.equal(await page.locator('#inbox .message').count(), 2);
   assert.equal(await button.isDisabled(), true);
+});
+
+test('admin inbox cursor navigation reaches older unread messages and preserves ACKs', async t => {
+  const {page, data, poll} = await open(t);
+  const cursor = '1000:msg_00000000-0000-4000-8000-000000000000';
+  data.admin_messages_next_cursor = cursor;
+  const older = {
+    ...data, admin_messages_next_cursor: null,
+    admin_messages: [{...data.admin_messages[0], message_id: 'inbox-old', message: 'old unread message'}],
+  };
+  await poll();
+  assert.equal(await page.locator('#inboxOlder').isEnabled(), true);
+  assert.equal(await page.locator('#inboxNewer').isDisabled(), true);
+
+  const seenCursors = [];
+  await page.route('**/_admin/api/snapshot*', route => {
+    const requested = new URL(route.request().url()).searchParams.get('cursor');
+    seenCursors.push(requested);
+    return route.fulfill({json: requested === cursor ? older : data});
+  });
+  await page.locator('#inboxOlder').click();
+  await page.waitForFunction(() => document.querySelector('#inbox')?.textContent.includes('old unread message'));
+  assert.equal(await page.locator('#inboxPageLabel').innerText(), 'Page 2');
+  assert.equal(await page.locator('#inboxNewer').isEnabled(), true);
+  assert.equal(await page.locator('#inboxOlder').isDisabled(), true);
+  assert.ok(seenCursors.includes(cursor));
+
+  await page.route('**/_admin/api/ack', route => {
+    assert.equal(route.request().postDataJSON().message_id, 'inbox-old');
+    older.admin_messages[0].acknowledged = true;
+    return route.fulfill({json: {acknowledged: true}});
+  });
+  await page.locator('#inbox .ack').click();
+  await page.waitForFunction(() => document.querySelector('#inbox .ack')?.textContent === 'ACKed');
+  await poll();
+
+  await page.locator('#inboxNewer').click();
+  await page.waitForFunction(() => document.querySelector('#inbox')?.textContent.includes('inbox message'));
+  assert.equal(await page.locator('#inboxPageLabel').innerText(), 'Page 1');
+  await page.locator('#inboxOlder').click();
+  await page.waitForFunction(() => document.querySelector('#inbox')?.textContent.includes('old unread message'));
+  assert.equal(await page.locator('#inbox .ack').innerText(), 'ACKed');
 });
 
 test('failed admin ACKs leave messages unread and allow a retry', async t => {

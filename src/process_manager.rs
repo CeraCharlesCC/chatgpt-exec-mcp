@@ -21,7 +21,7 @@ use crate::output_store::OutputStore;
 use crate::output_store::OutputStoreManager;
 use crate::output_summary::BuildOutput;
 use crate::response_delivery::{self, PreparedExecResponse};
-use crate::session::Session;
+use crate::session::{Session, SessionLease};
 use crate::session_id::SessionId;
 use crate::tools::ExecCommandArgs;
 use crate::tools::ExecResponse;
@@ -184,7 +184,7 @@ impl ProcessManager {
         let spawned = self.spawn(&id, &command, &cwd, tty).await?;
         // Registration transfers ownership to the manager. A cancelled initial
         // wait then follows the existing registered-session lifetime policy.
-        let session = self
+        let (session, _lease) = self
             .commit_reservation(reservation, spawned, output_store, build_output)
             .await?;
         session
@@ -198,9 +198,12 @@ impl ProcessManager {
         validate_output_tokens(args.max_output_tokens)?;
         let started = Instant::now();
         let id = SessionId::parse(&args.session_id)?;
-        let session = {
+        let (session, _lease) = {
             let state = self.state.lock().await;
-            state.sessions.get(&id).cloned()
+            state
+                .sessions
+                .get(&id)
+                .map(|session| (Arc::clone(session), session.lease()))
         }
         .ok_or_else(|| anyhow::anyhow!("unknown or expired session_id `{id}`"))?;
 
@@ -256,12 +259,14 @@ impl ProcessManager {
         validate_output_tokens(args.max_output_tokens)?;
         let started = Instant::now();
         let id = SessionId::parse(&args.session_id)?;
-        let session = {
+        let (session, _lease) = {
             let state = self.state.lock().await;
-            state.sessions.get(&id).cloned()
+            state
+                .sessions
+                .get(&id)
+                .map(|session| (Arc::clone(session), session.lease()))
         }
         .ok_or_else(|| anyhow::anyhow!("unknown or expired session_id `{id}`"))?;
-        session.touch();
 
         tokio::pin!(cancelled);
         let wait = session.wait_until_exit_or_timeout(Duration::from_secs(args.wait_seconds));
@@ -486,7 +491,7 @@ impl ProcessManager {
         spawned: codex_utils_pty::SpawnedProcess,
         output_store: OutputStore,
         build_output: Option<BuildOutput>,
-    ) -> anyhow::Result<Arc<Session>> {
+    ) -> anyhow::Result<(Arc<Session>, SessionLease)> {
         let mut state = self.state.lock().await;
         if self.shutting_down.load(Ordering::SeqCst)
             || state.reserved.remove(&reservation.id).is_none()
@@ -498,11 +503,12 @@ impl ProcessManager {
         // Session capture tasks start only after acquiring the registry lock.
         // No await separates task ownership from registration.
         let session = Session::new(reservation.id.clone(), spawned, output_store, build_output);
+        let lease = session.lease();
         state
             .sessions
             .insert(reservation.id.clone(), Arc::clone(&session));
         drop(state);
-        Ok(session)
+        Ok((session, lease))
     }
 
     fn remove_if_same_locked(state: &mut StoreState, id: &SessionId, expected: &Arc<Session>) {
@@ -530,7 +536,8 @@ impl ProcessManager {
                 .iter()
                 .filter_map(|(id, session)| {
                     let timeout = self.config.session_idle_timeout;
-                    (session.idle_for() >= timeout).then(|| id.clone())
+                    (!session.has_active_operations() && session.idle_for() >= timeout)
+                        .then(|| id.clone())
                 })
                 .collect();
             ids.into_iter()
@@ -904,6 +911,27 @@ mod tests {
         manager.shutdown_all().await;
     }
 
+    #[tokio::test]
+    async fn reaper_does_not_terminate_a_session_during_an_active_wait() {
+        let workspace = TempDir::new().unwrap();
+        let mut manager = test_manager(&workspace);
+        let config = &mut Arc::get_mut(&mut manager).unwrap().config;
+        config.session_idle_timeout = Duration::from_secs(1);
+        config.reaper_interval = Duration::from_secs(1);
+
+        let session_id = test_session(&manager, "sleep 4; printf FINISHED").await;
+        let reaper = manager.spawn_reaper();
+        let response = manager
+            .wait_for_exit(test_wait_args(&session_id))
+            .await
+            .unwrap();
+        assert_eq!(response.exit_code, Some(0));
+        assert!(response.output.contains("FINISHED"));
+        assert_eq!(manager.active_session_count().await, 0);
+        manager.shutdown_all().await;
+        reaper.await.unwrap();
+    }
+
     #[test]
     fn implicit_output_budgets_match_policy_and_explicit_override_wins() {
         assert_eq!(output_tokens(None, None), 8_000);
@@ -920,6 +948,7 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let manager = test_manager(&workspace);
         let session_id = test_session(&manager, "sleep 60").await;
+        let session = pinned_session(&manager, &session_id).await;
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
         let waiter = manager.wait_for_exit_cancellable(test_wait_args(&session_id), async move {
@@ -927,8 +956,10 @@ mod tests {
         });
         tokio::pin!(waiter);
         poll_pending(waiter.as_mut()).await;
+        assert!(session.has_active_operations());
         cancel_tx.send(()).unwrap();
         assert!(waiter.await.unwrap().is_none());
+        assert!(!session.has_active_operations());
         assert_eq!(manager.active_session_count().await, 1);
 
         let interrupted = manager

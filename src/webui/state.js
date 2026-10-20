@@ -1,1 +1,1 @@
-export const state = {data: null, view: 'activity', filter: 'all', pool: '', agent: '', session: '', format: true, group: false, refreshing: false, refreshEpoch: 0, clearing: false, acking: new Set()};
+export const state = {data: null, view: 'activity', filter: 'all', pool: '', agent: '', session: '', format: true, group: false, refreshing: false, refreshPending: false, refreshEpoch: 0, clearing: false, acking: new Set(), inboxCursors: [null], inboxPageIndex: 0, inboxLoading: false};

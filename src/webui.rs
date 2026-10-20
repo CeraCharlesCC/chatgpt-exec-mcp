@@ -4,12 +4,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header, uri::Authority};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::activity::{ActivityEvent, ActivityHub};
 use crate::agent_pool::{AdminMember, AdminMessage, AgentIdentity, AgentPoolStore};
@@ -40,6 +41,7 @@ pub struct WebUiState {
     pool: Option<AgentPoolContext>,
     activity: Arc<ActivityHub>,
     started: Instant,
+    csrf_token: String,
 }
 
 impl WebUiState {
@@ -67,6 +69,7 @@ impl WebUiState {
             pool,
             activity,
             started: Instant::now(),
+            csrf_token: Uuid::new_v4().to_string(),
         }
     }
 
@@ -90,11 +93,19 @@ struct PoolSnapshot {
 #[derive(Serialize)]
 struct SnapshotResponse {
     version: &'static str,
+    csrf_token: String,
     generated_ms: i64,
     uptime_seconds: u64,
     pools: Vec<PoolSnapshot>,
     admin_messages: Vec<AdminMessage>,
+    admin_messages_next_cursor: Option<String>,
     events: Vec<ActivityEvent>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxQuery {
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -224,8 +235,13 @@ async fn asset(Path(path): Path<String>) -> Response {
         .into_response()
 }
 
-async fn snapshot(State(state): State<WebUiState>) -> Result<Response, WebError> {
-    let (members, admin_messages) = match state.pool_context() {
+async fn snapshot(
+    State(state): State<WebUiState>,
+    headers: HeaderMap,
+    Query(query): Query<InboxQuery>,
+) -> Result<Response, WebError> {
+    validate_admin_host(&headers)?;
+    let (members, page) = match state.pool_context() {
         Ok(context) => (
             context
                 .store()
@@ -233,10 +249,16 @@ async fn snapshot(State(state): State<WebUiState>) -> Result<Response, WebError>
                 .map_err(pool_error)?,
             context
                 .store()
-                .admin_messages(context.principal(), 200)
+                .admin_messages_page(context.principal(), 200, query.cursor.as_deref())
                 .map_err(pool_error)?,
         ),
-        Err(_) => (Vec::new(), Vec::new()),
+        Err(_) => (
+            Vec::new(),
+            crate::agent_pool::AdminMessagesPage {
+                messages: Vec::new(),
+                next_cursor: None,
+            },
+        ),
     };
 
     let mut grouped = BTreeMap::<String, Vec<AdminMember>>::new();
@@ -252,16 +274,23 @@ async fn snapshot(State(state): State<WebUiState>) -> Result<Response, WebError>
         StatusCode::OK,
         &SnapshotResponse {
             version: env!("CARGO_PKG_VERSION"),
+            csrf_token: state.csrf_token.clone(),
             generated_ms: now_ms(),
             uptime_seconds: state.started.elapsed().as_secs(),
             pools,
-            admin_messages,
+            admin_messages: page.messages,
+            admin_messages_next_cursor: page.next_cursor,
             events: state.activity.snapshot(400),
         },
     )
 }
 
-async fn send(State(state): State<WebUiState>, body: Bytes) -> Result<Response, WebError> {
+async fn send(
+    State(state): State<WebUiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, WebError> {
+    validate_admin_post(&state, &headers)?;
     let request: SendRequest = serde_json::from_slice(&body)
         .map_err(|error| WebError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
     let context = state.pool_context()?;
@@ -300,7 +329,12 @@ async fn send(State(state): State<WebUiState>, body: Bytes) -> Result<Response, 
     json_response(StatusCode::OK, &result)
 }
 
-async fn ack(State(state): State<WebUiState>, body: Bytes) -> Result<Response, WebError> {
+async fn ack(
+    State(state): State<WebUiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, WebError> {
+    validate_admin_post(&state, &headers)?;
     let request: AckRequest = serde_json::from_slice(&body)
         .map_err(|error| WebError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
     let context = state.pool_context()?;
@@ -311,7 +345,12 @@ async fn ack(State(state): State<WebUiState>, body: Bytes) -> Result<Response, W
     json_response(StatusCode::OK, &AckResponse { acknowledged })
 }
 
-async fn clear(State(state): State<WebUiState>, body: Bytes) -> Result<Response, WebError> {
+async fn clear(
+    State(state): State<WebUiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, WebError> {
+    validate_admin_post(&state, &headers)?;
     let _: ClearRequest = serde_json::from_slice(&body)
         .map_err(|error| WebError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
     let cleared_admin_messages = match state.pool.as_ref() {
@@ -331,7 +370,12 @@ async fn clear(State(state): State<WebUiState>, body: Bytes) -> Result<Response,
     )
 }
 
-async fn terminate(State(state): State<WebUiState>, body: Bytes) -> Result<Response, WebError> {
+async fn terminate(
+    State(state): State<WebUiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, WebError> {
+    validate_admin_post(&state, &headers)?;
     let request: TerminateRequest = serde_json::from_slice(&body)
         .map_err(|error| WebError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
     let context = state.pool_context()?;
@@ -359,7 +403,74 @@ fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Result<Response
             "JSON serialization failed",
         )
     })?;
-    Ok((status, [(header::CONTENT_TYPE, "application/json")], body).into_response())
+    Ok((
+        status,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+/// The dashboard is exposed on loopback only. Reject other Host values even
+/// on GET: otherwise DNS rebinding could disclose the CSRF token in snapshots.
+fn validate_admin_host(headers: &HeaderMap) -> Result<&str, WebError> {
+    let forbidden = || WebError::new(StatusCode::FORBIDDEN, "invalid WebUI host");
+    let host = headers
+        .get(header::HOST)
+        .ok_or_else(forbidden)?
+        .to_str()
+        .map_err(|_| forbidden())?;
+    let authority: Authority = host.parse().map_err(|_| forbidden())?;
+    if host.contains('@')
+        || !matches!(
+            authority.host().to_ascii_lowercase().as_str(),
+            "localhost" | "127.0.0.1" | "[::1]" | "::1"
+        )
+    {
+        return Err(forbidden());
+    }
+    Ok(host)
+}
+
+fn validate_admin_post(state: &WebUiState, headers: &HeaderMap) -> Result<(), WebError> {
+    let host = validate_admin_host(headers)?;
+    let forbidden = || WebError::new(StatusCode::FORBIDDEN, "invalid WebUI origin or CSRF token");
+    let origin = headers
+        .get(header::ORIGIN)
+        .ok_or_else(forbidden)?
+        .to_str()
+        .map_err(|_| forbidden())?;
+    if ![format!("http://{host}"), format!("https://{host}")]
+        .iter()
+        .any(|expected| origin.eq_ignore_ascii_case(expected))
+    {
+        return Err(forbidden());
+    }
+    if headers
+        .get("x-webui-csrf-token")
+        .is_none_or(|token| token.as_bytes() != state.csrf_token.as_bytes())
+    {
+        return Err(forbidden());
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return Err(WebError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/json",
+        ));
+    }
+    Ok(())
 }
 
 fn pool_error(error: rmcp::ErrorData) -> WebError {

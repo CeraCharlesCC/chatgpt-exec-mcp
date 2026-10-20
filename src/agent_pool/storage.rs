@@ -15,9 +15,10 @@ use uuid::Uuid;
 use crate::config::AgentNameAllocation;
 
 use super::{
-    ADMIN_AGENT, AdminMember, AdminMessage, AgentIdentity, Communications, DeliveryReceipt,
-    MAX_NAME_CHARS, PeerMessage, PoolAction, PoolMembersArgs, PoolMembersResult, PoolSendArgs,
-    PoolSendResult, ReceiptStatus, invalid, now_ms, storage_error, validate_name, validate_session,
+    ADMIN_AGENT, AdminMember, AdminMessage, AdminMessagesPage, AgentIdentity, Communications,
+    DeliveryReceipt, MAX_NAME_CHARS, PeerMessage, PoolAction, PoolMembersArgs, PoolMembersResult,
+    PoolSendArgs, PoolSendResult, ReceiptStatus, invalid, now_ms, storage_error, validate_name,
+    validate_session,
 };
 
 const MAX_PENDING: i64 = 10_000;
@@ -580,36 +581,74 @@ impl PoolStorage {
         Ok(members)
     }
 
-    pub(super) fn admin_messages(
+    pub(super) fn admin_messages_page(
         &self,
         principal: &str,
         limit: usize,
-    ) -> Result<(Vec<AdminMessage>, bool), McpError> {
+        cursor: Option<&str>,
+    ) -> Result<(AdminMessagesPage, bool), McpError> {
         validate_name(principal, "principal")?;
+        // Cursor is the (timestamp, ID) of the last displayed message. IDs
+        // break ties for messages created within the same millisecond.
+        let after = cursor
+            .map(|value| {
+                let (created, id) = value
+                    .split_once(':')
+                    .ok_or_else(|| invalid("invalid admin message cursor"))?;
+                let created = created
+                    .parse::<i64>()
+                    .map_err(|_| invalid("invalid admin message cursor"))?;
+                Uuid::parse_str(
+                    id.strip_prefix("msg_")
+                        .ok_or_else(|| invalid("invalid admin message cursor"))?,
+                )
+                .map_err(|_| invalid("invalid admin message cursor"))?;
+                Ok::<_, McpError>((created, id))
+            })
+            .transpose()?;
+        let limit = limit.min(500);
         let now = now_ms();
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|_| storage_error())?;
         cleanup(&transaction, now)?;
-        let messages = {
+        let mut messages = {
             let mut statement = transaction.prepare(
                 "SELECT id,pool,sender,body,in_reply_to,created,acknowledged FROM admin_messages
-                 WHERE principal=?1 ORDER BY created DESC,id DESC LIMIT ?2",
+                 WHERE principal=?1 AND (?2 IS NULL OR created<?2 OR (created=?2 AND id<?3))
+                 ORDER BY created DESC,id DESC LIMIT ?4",
             ).map_err(|_| storage_error())?;
             statement
-                .query_map(params![principal, limit.min(500) as i64], |row| {
-                    Ok(AdminMessage {
-                        message_id: row.get(0)?,
-                        pool: row.get(1)?,
-                        from: row.get(2)?,
-                        message: row.get(3)?,
-                        in_reply_to: row.get(4)?,
-                        created_ms: row.get(5)?,
-                        acknowledged: row.get(6)?,
-                    })
-                })
+                .query_map(
+                    params![
+                        principal,
+                        after.as_ref().map(|a| a.0),
+                        after.as_ref().map(|a| a.1),
+                        (limit + 1) as i64
+                    ],
+                    |row| {
+                        Ok(AdminMessage {
+                            message_id: row.get(0)?,
+                            pool: row.get(1)?,
+                            from: row.get(2)?,
+                            message: row.get(3)?,
+                            in_reply_to: row.get(4)?,
+                            created_ms: row.get(5)?,
+                            acknowledged: row.get(6)?,
+                        })
+                    },
+                )
                 .map_err(|_| storage_error())?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|_| storage_error())?
+        };
+        let has_more = messages.len() > limit;
+        messages.truncate(limit);
+        let next_cursor = if has_more {
+            messages
+                .last()
+                .map(|last| format!("{}:{}", last.created_ms, last.message_id))
+        } else {
+            None
         };
         let mut changed = false;
         for message in &messages {
@@ -633,7 +672,13 @@ impl PoolStorage {
                 .map_err(|_| storage_error())?;
         }
         transaction.commit().map_err(|_| storage_error())?;
-        Ok((messages, changed))
+        Ok((
+            AdminMessagesPage {
+                messages,
+                next_cursor,
+            },
+            changed,
+        ))
     }
 
     pub(super) fn admin_ack(&self, principal: &str, message_id: &str) -> Result<bool, McpError> {

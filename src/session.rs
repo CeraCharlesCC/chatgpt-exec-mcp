@@ -58,6 +58,21 @@ pub(crate) struct TerminalDelivery {
     pub output_ref: Option<OutputReference>,
 }
 
+/// Keeps an in-flight tool call from being mistaken for an idle session.
+/// Dropping the lease starts the idle clock again, including on cancellation.
+pub(crate) struct SessionLease {
+    session: Arc<Session>,
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        self.session.touch();
+        self.session
+            .active_operations
+            .fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub struct Session {
     pub id: SessionId,
     process: ProcessHandle,
@@ -79,6 +94,7 @@ pub struct Session {
     terminal_delivery: StdMutex<Option<TerminalDelivery>>,
     pub interaction_lock: Mutex<()>,
     last_used: StdMutex<Instant>,
+    active_operations: AtomicUsize,
 }
 
 impl Session {
@@ -116,6 +132,7 @@ impl Session {
             terminal_delivery: StdMutex::new(None),
             interaction_lock: Mutex::new(()),
             last_used: StdMutex::new(now),
+            active_operations: AtomicUsize::new(0),
         });
 
         let (capture_tx, capture_rx) = mpsc::channel(CAPTURE_QUEUE_CHUNKS);
@@ -264,6 +281,20 @@ impl Session {
         if let Ok(mut last_used) = self.last_used.lock() {
             *last_used = Instant::now();
         }
+    }
+
+    /// Acquire while holding the manager's session-map lock, so eviction and
+    /// the start of an operation cannot race with each other.
+    pub(crate) fn lease(self: &Arc<Self>) -> SessionLease {
+        self.active_operations.fetch_add(1, Ordering::SeqCst);
+        self.touch();
+        SessionLease {
+            session: Arc::clone(self),
+        }
+    }
+
+    pub(crate) fn has_active_operations(&self) -> bool {
+        self.active_operations.load(Ordering::SeqCst) != 0
     }
 
     pub fn idle_for(&self) -> Duration {

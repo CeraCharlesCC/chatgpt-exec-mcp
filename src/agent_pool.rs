@@ -201,6 +201,13 @@ pub struct AdminMessage {
     pub acknowledged: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub struct AdminMessagesPage {
+    pub messages: Vec<AdminMessage>,
+    /// Keyset cursor for the next (older) page, or None at the end of history.
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
 pub struct PoolMembersResult {
@@ -370,11 +377,20 @@ impl AgentPoolStore {
         principal: &str,
         limit: usize,
     ) -> Result<Vec<AdminMessage>, McpError> {
-        let (messages, changed) = self.storage.admin_messages(principal, limit)?;
+        Ok(self.admin_messages_page(principal, limit, None)?.messages)
+    }
+
+    pub fn admin_messages_page(
+        &self,
+        principal: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<AdminMessagesPage, McpError> {
+        let (page, changed) = self.storage.admin_messages_page(principal, limit, cursor)?;
         if changed {
             self.coordinator.committed_change();
         }
-        Ok(messages)
+        Ok(page)
     }
 
     /// Keep acknowledged admin messages visible until the store is reopened.

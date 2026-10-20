@@ -453,6 +453,11 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
     let admin_send: Value = server
         .webui_client
         .post(format!("http://{}/_admin/api/send", server.webui_address))
+        .header("origin", format!("http://{}", server.webui_address))
+        .header(
+            "x-webui-csrf-token",
+            snapshot["csrf_token"].as_str().unwrap(),
+        )
         .json(&json!({"pool":"WebUI","target":debug_agent,"message":"human reply"}))
         .send()
         .await

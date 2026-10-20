@@ -1,6 +1,6 @@
 import { $, clearSelection, setPointerTarget, clearPointerTarget, hasPointerTarget } from './dom.js';
 import { state } from './state.js';
-import { fetchSnapshot, sendAdminMessage, terminateAgent, ackAdminMessage, clearAdminHistory } from './api.js';
+import { fetchSnapshot, setCsrfToken, sendAdminMessage, terminateAgent, ackAdminMessage, clearAdminHistory } from './api.js';
 import { toast, setCover, connection, bindMenu } from './views/menu.js';
 import { renderEvents, bindActivity } from './views/activity.js';
 import { renderPools, bindPools } from './views/pools.js';
@@ -21,7 +21,12 @@ async function clearHistory() {
     if (state.data) {
       state.data.events = [];
       state.data.admin_messages = [];
+      state.data.admin_messages_next_cursor = null;
     }
+    state.inboxCursors = [null];
+    state.inboxPageIndex = 0;
+    state.inboxLoading = false;
+    state.refreshPending = false;
     clearSelection();
     render();
     $('#clearHint').textContent = 'History cleared.';
@@ -76,30 +81,60 @@ async function ackMessage(messageId) {
   } catch (e) { toast(e.message, true); }
   finally { state.acking.delete(messageId); renderInbox(state); }
 }
+
+function changePage(direction) {
+  if (state.clearing || state.inboxLoading || !state.data) return;
+  if (direction === 1) {
+    const cursor = state.data.admin_messages_next_cursor;
+    if (!cursor) return;
+    state.inboxCursors = state.inboxCursors.slice(0, state.inboxPageIndex + 1);
+    state.inboxCursors.push(cursor);
+    state.inboxPageIndex++;
+  } else if (direction === -1 && state.inboxPageIndex > 0) {
+    state.inboxPageIndex--;
+  } else return;
+  state.refreshEpoch++;
+  state.inboxLoading = true;
+  state.data.admin_messages = [];
+  state.data.admin_messages_next_cursor = null;
+  clearSelection();
+  renderInbox(state);
+  if (state.refreshing) state.refreshPending = true;
+  else void refresh();
+}
 async function refresh() {
   // Never let a slow poll overlap another request and overwrite newer data.
   if (state.refreshing || state.clearing) return;
   state.refreshing = true;
   const epoch = state.refreshEpoch;
   try {
-    const r = await fetchSnapshot();
+    const r = await fetchSnapshot(state.inboxCursors[state.inboxPageIndex]);
     if (!r.ok) throw new Error(await r.text());
     const data = await r.json();
     if (epoch !== state.refreshEpoch) return;
+    setCsrfToken(data.csrf_token);
     state.data = data;
+    state.inboxLoading = false;
     connection(true);
     $('#status').textContent = `v${state.data.version} · up ${Math.floor(state.data.uptime_seconds / 60)}m`;
     render();
   } catch (e) {
     if (epoch !== state.refreshEpoch) return;
+    state.inboxLoading = false;
     connection(false);
     $('#status').textContent = 'disconnected';
     toast(e.message, true);
-  } finally { state.refreshing = false; }
+  } finally {
+    state.refreshing = false;
+    if (state.refreshPending && !state.clearing) {
+      state.refreshPending = false;
+      void refresh();
+    }
+  }
 }
 bindMenu({state, clearHistory});
 bindPools({state, terminate, selectPool});
-bindInbox(ackMessage);
+bindInbox({ackMessage, changePage});
 bindActivity({state, render, selectPool, toast});
 $('#send').onclick = send;
 function selectPool(pool) {

@@ -304,6 +304,23 @@ input:focus,select:focus,textarea:focus {
   max-height:40vh;
   overflow:auto
 }
+.inbox-pagination:not([hidden]) {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px;
+  padding:4px 0
+}
+.inbox-pagination button {
+  background:var(--panel2);
+  border:1px solid var(--border);
+  border-radius:5px;
+  color:var(--text);
+  padding:5px 8px;
+  cursor:pointer
+}
+.inbox-pagination button:disabled {opacity:.45;cursor:default}
+.inbox-pagination span {font-size:12px;color:var(--muted)}
 .message {
   border:1px solid var(--border);
   border-radius:8px;
