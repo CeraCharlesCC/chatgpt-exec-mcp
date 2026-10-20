@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::activity::{ActivityEvent, ActivityHub};
+use crate::activity::{ActivityEvent, ActivityHub, ActivityPage};
 use crate::agent_pool::{AdminMember, AdminMessage, AgentIdentity, AgentPoolStore};
 use crate::agent_pool_context::AgentPoolContext;
 
@@ -105,10 +105,16 @@ struct SnapshotResponse {
     events_has_more: bool,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct InboxQuery {
+struct SnapshotQuery {
     cursor: Option<String>,
+    #[serde(default = "default_all")]
+    all: bool,
+}
+
+fn default_all() -> bool {
+    true
 }
 
 #[derive(Default, Deserialize)]
@@ -257,10 +263,17 @@ async fn asset(Path(path): Path<String>) -> Response {
 async fn snapshot(
     State(state): State<WebUiState>,
     headers: HeaderMap,
-    Query(query): Query<InboxQuery>,
+    Query(query): Query<SnapshotQuery>,
 ) -> Result<Response, WebError> {
     validate_admin_host(&headers)?;
-    let (members, page) = match state.pool_context() {
+    if query.all && query.cursor.is_some() {
+        return Err(WebError::new(
+            StatusCode::BAD_REQUEST,
+            "all cannot be combined with cursor",
+        ));
+    }
+    let limit = if query.all { 500 } else { 200 };
+    let (members, mut page) = match state.pool_context() {
         Ok(context) => (
             context
                 .store()
@@ -269,7 +282,7 @@ async fn snapshot(
                 .map_err(pool_error)?,
             context
                 .store()
-                .admin_messages_page_async(context.principal(), 200, query.cursor.as_deref())
+                .admin_messages_page_async(context.principal(), limit, query.cursor.as_deref())
                 .await
                 .map_err(pool_error)?,
         ),
@@ -291,26 +304,67 @@ async fn snapshot(
         .map(|(name, agents)| PoolSnapshot { name, agents })
         .collect();
 
-    // Snapshot pages and their bounded correlation metadata only touch RAM;
-    // no archive chunks are decompressed during normal polling.
-    let activity_page = state.activity.snapshot_page(200);
+    if query.all
+        && let Some(context) = &state.pool
+    {
+        while let Some(cursor) = page.next_cursor.take() {
+            let next = context
+                .store()
+                .admin_messages_page_async(context.principal(), 500, Some(&cursor))
+                .await
+                .map_err(pool_error)?;
+            page.messages.extend(next.messages);
+            page.next_cursor = next.next_cursor;
+        }
+    }
 
-    json_response(
-        StatusCode::OK,
-        &SnapshotResponse {
-            version: env!("CARGO_PKG_VERSION"),
-            csrf_token: state.csrf_token.clone(),
-            generated_ms: now_ms(),
-            uptime_seconds: state.started.elapsed().as_secs(),
-            pools,
-            admin_messages: page.messages,
-            admin_messages_next_cursor: page.next_cursor,
-            events: activity_page.events,
-            correlated_events: activity_page.correlated_events,
-            events_next_before_id: activity_page.next_before_id,
-            events_has_more: activity_page.has_more,
-        },
-    )
+    let build_response = move || {
+        let activity_page = if query.all {
+            ActivityPage {
+                events: state.activity.snapshot_all().map_err(|_| {
+                    WebError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "could not load all events",
+                    )
+                })?,
+                correlated_events: Vec::new(),
+                next_before_id: None,
+                has_more: false,
+            }
+        } else {
+            // Normal polling only touches RAM, including correlation metadata.
+            state.activity.snapshot_page(200)
+        };
+        json_response(
+            StatusCode::OK,
+            &SnapshotResponse {
+                version: env!("CARGO_PKG_VERSION"),
+                csrf_token: state.csrf_token.clone(),
+                generated_ms: now_ms(),
+                uptime_seconds: state.started.elapsed().as_secs(),
+                pools,
+                admin_messages: page.messages,
+                admin_messages_next_cursor: page.next_cursor,
+                events: activity_page.events,
+                correlated_events: activity_page.correlated_events,
+                events_next_before_id: activity_page.next_before_id,
+                events_has_more: activity_page.has_more,
+            },
+        )
+    };
+    if query.all {
+        // Both decompression and potentially large JSON serialization run off-thread.
+        tokio::task::spawn_blocking(build_response)
+            .await
+            .map_err(|_| {
+                WebError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not build snapshot",
+                )
+            })?
+    } else {
+        build_response()
+    }
 }
 
 async fn events(
@@ -334,7 +388,7 @@ async fn events(
     }
     let hub = state.activity.clone();
     // A history page may decompress a chunk or touch disk. Do not block a
-    // Tokio worker while it loads; snapshots never enter this path.
+    // Tokio worker while it loads.
     let page = tokio::task::spawn_blocking(move || hub.page(query.before_id, limit))
         .await
         .map_err(|_| WebError::new(StatusCode::INTERNAL_SERVER_ERROR, "could not load events"))?;

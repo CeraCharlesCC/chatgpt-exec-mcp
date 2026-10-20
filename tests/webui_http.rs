@@ -52,7 +52,10 @@ impl Dashboard {
     }
 
     async fn snapshot_after(&self, cursor: Option<&str>) -> Value {
-        let mut request = self.client.get(format!("{}/_admin/api/snapshot", self.url));
+        let mut request = self
+            .client
+            .get(format!("{}/_admin/api/snapshot", self.url))
+            .query(&[("all", "false")]);
         if let Some(cursor) = cursor {
             request = request.query(&[("cursor", cursor)]);
         }
@@ -64,6 +67,18 @@ impl Dashboard {
             );
         }
         assert_eq!(response.headers()["content-type"], "application/json");
+        response.json().await.unwrap()
+    }
+
+    async fn full_snapshot(&self) -> Value {
+        let response = self
+            .client
+            .get(format!("{}/_admin/api/snapshot", self.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
         response.json().await.unwrap()
     }
 
@@ -463,6 +478,23 @@ async fn activity_history_paginates_across_archive_and_memory_without_gaps() {
             .all(|pair| pair[0] == pair[1] + 1)
     );
 
+    // The default snapshot includes the entire retained suffix, decoding zstd
+    // chunks as needed, with each event appearing exactly once in ID order.
+    let full = server.full_snapshot().await;
+    let all_ids: Vec<_> = full["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        all_ids,
+        newest_to_oldest.iter().rev().copied().collect::<Vec<_>>()
+    );
+    assert_eq!(full["events_has_more"], false);
+    assert!(full["events_next_before_id"].is_null());
+    assert_eq!(full["correlated_events"], json!([]));
+
     // CLEAR must invalidate both the RAM page and any pending/finished archive.
     assert_eq!(
         server.post("clear", json!({}), StatusCode::OK).await["cleared_events"],
@@ -470,6 +502,7 @@ async fn activity_history_paginates_across_archive_and_memory_without_gaps() {
     );
     assert_eq!(server.snapshot().await["events"], json!([]));
     assert_eq!(server.events_page(None, None).await["events"], json!([]));
+    assert_eq!(server.full_snapshot().await["events"], json!([]));
     assert_eq!(
         activity.emit("tool.start", "info", None, vec![], json!({})),
         2636
@@ -818,7 +851,7 @@ async fn admin_inbox_cursor_pages_reach_older_unread_messages_and_offer_receipts
     let store = Arc::new(AgentPoolStore::open(&path).unwrap());
     let mut expected = HashSet::new();
     let mut oldest_id = String::new();
-    for i in 0..455 {
+    for i in 0..755 {
         let message = format!("message-{i:03}");
         let result = store
             .send(
@@ -890,10 +923,10 @@ async fn admin_inbox_cursor_pages_reach_older_unread_messages_and_offer_receipts
             break;
         }
     }
-    assert_eq!(lengths, vec![200, 200, 55]);
+    assert_eq!(lengths, vec![200, 200, 200, 155]);
     assert_eq!(
         seen, expected,
-        "all 455 retained messages must be reachable"
+        "all 755 retained messages must be reachable"
     );
     assert!(seen.contains(&oldest_id));
 
@@ -912,6 +945,25 @@ async fn admin_inbox_cursor_pages_reach_older_unread_messages_and_offer_receipts
         .unwrap();
     assert_eq!(oldest["acknowledged"], true);
 
+    let full = server.full_snapshot().await;
+    let all_messages: HashSet<_> = full["admin_messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["message_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(all_messages, expected);
+    assert!(full["admin_messages_next_cursor"].is_null());
+    assert!(
+        full["admin_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["message_id"] == older_page_id && message["acknowledged"] == true
+            })
+    );
+
     for cursor in [
         "garbage",
         "1000:not-a-uuid",
@@ -920,7 +972,7 @@ async fn admin_inbox_cursor_pages_reach_older_unread_messages_and_offer_receipts
         let response = server
             .client
             .get(format!("{}/_admin/api/snapshot", server.url))
-            .query(&[("cursor", cursor)])
+            .query(&[("all", "false"), ("cursor", cursor)])
             .send()
             .await
             .unwrap();
@@ -929,6 +981,25 @@ async fn admin_inbox_cursor_pages_reach_older_unread_messages_and_offer_receipts
             StatusCode::BAD_REQUEST,
             "malformed cursor {cursor}"
         );
+    }
+}
+
+#[tokio::test]
+async fn snapshot_rejects_invalid_full_export_queries() {
+    let server = Dashboard::start(WebUiState::without_pool(Arc::new(ActivityHub::new(10)))).await;
+    for query in [
+        "all=invalid",
+        "all=true&cursor=anything",
+        "cursor=anything",
+        "unknown=true",
+    ] {
+        let response = server
+            .client
+            .get(format!("{}/_admin/api/snapshot?{query}", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
     }
 }
 
@@ -1062,7 +1133,7 @@ async fn handlers_scope_snapshot_send_ack_and_termination_to_principal() {
         .unwrap(),
     )
     .await;
-    let snapshot = server.snapshot().await;
+    let snapshot = server.full_snapshot().await;
     assert_eq!(snapshot["pools"].as_array().unwrap().len(), 1);
     assert_eq!(snapshot["pools"][0]["agents"].as_array().unwrap().len(), 1);
     assert_eq!(snapshot["pools"][0]["agents"][0]["agent"], "Alice");

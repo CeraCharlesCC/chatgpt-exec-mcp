@@ -1,8 +1,8 @@
 //! In-memory recent activity with a bounded, temporary compressed history.
 //!
-//! The dashboard's normal snapshots touch only the recent queue. Older pages
-//! read zstd chunks on demand; serialization and file I/O run on one background
-//! worker and never hold the activity mutex.
+//! The dashboard's periodic snapshots touch only the recent queue. Full
+//! snapshots and older pages read zstd chunks on demand. Archive writes run
+//! on one background worker; file I/O never holds the activity mutex.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -678,8 +678,7 @@ impl ActivityHub {
         id
     }
 
-    /// Only copy recent events. Polling and ordinary snapshots never open,
-    /// decompress, or inspect the content of an archive file.
+    /// Only copy recent events, without opening or decompressing archive files.
     pub fn snapshot(&self, limit: usize) -> Vec<ActivityEvent> {
         if !self.enabled {
             return Vec::new();
@@ -692,6 +691,43 @@ impl ActivityHub {
             .skip(state.recent.len() - count)
             .cloned()
             .collect()
+    }
+
+    /// Copy all retained events in ascending ID order, including compressed
+    /// history. Call from a blocking worker: archive I/O runs outside the mutex.
+    /// Fail rather than silently returning an incomplete export on archive errors.
+    pub fn snapshot_all(&self) -> io::Result<Vec<ActivityEvent>> {
+        let (generation, recent, pending, archived) = {
+            let state = lock_state(&self.shared);
+            (
+                state.generation,
+                state.recent.iter().cloned().collect::<Vec<_>>(),
+                state
+                    .pending
+                    .iter()
+                    .map(|chunk| Arc::clone(&chunk.events))
+                    .collect::<Vec<_>>(),
+                state.archived.iter().cloned().collect::<Vec<_>>(),
+            )
+        };
+        // Pin both pending buffers and immutable archive files from one instant;
+        // compression, retention, and new emissions cannot introduce gaps or duplicates.
+        let result = (|| {
+            let mut events = Vec::new();
+            for chunk in archived {
+                events.extend(read_chunk(&chunk)?);
+            }
+            for chunk in pending {
+                events.extend(chunk.iter().cloned());
+            }
+            events.extend(recent);
+            Ok(events)
+        })();
+        // Like history pages, a snapshot racing CLEAR must discard the old generation.
+        if lock_state(&self.shared).generation != generation {
+            return Ok(Vec::new());
+        }
+        result
     }
 
     /// An atomic recent-only snapshot with its linked but off-page endpoints.
@@ -1074,6 +1110,7 @@ mod tests {
             );
         }
         assert!(hub.snapshot(200).is_empty());
+        assert!(hub.snapshot_all().unwrap().is_empty());
         for before in [None, Some(1), Some(u64::MAX)] {
             let page = hub.page(before, 200);
             assert!(page.events.is_empty());
@@ -1214,6 +1251,39 @@ mod tests {
     }
 
     #[test]
+    fn full_snapshot_combines_archived_pending_and_recent_events_once() {
+        let hub = ActivityHub::new(500);
+        emit(&hub, 500);
+        await_archive(&hub);
+        let hook = Arc::new(WorkerTestHook {
+            entered: Barrier::new(2),
+            resume: Barrier::new(2),
+            finished: Barrier::new(2),
+        });
+        *hub.shared.worker_hook.lock().unwrap() = Some(Arc::clone(&hook));
+        emit(&hub, 250);
+        hook.entered.wait();
+        // One archived chunk, one pending chunk, and the recent queue must all
+        // be visible while the compression worker is paused outside the mutex.
+        let pending = hub.snapshot_all();
+        hook.resume.wait();
+        hook.finished.wait();
+        *hub.shared.worker_hook.lock().unwrap() = None;
+        await_archive(&hub);
+        let pending = pending.unwrap();
+        assert_eq!(
+            pending.iter().map(|event| event.id).collect::<Vec<_>>(),
+            (1..=750).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_value(&pending).unwrap(),
+            serde_json::to_value(hub.snapshot_all().unwrap()).unwrap()
+        );
+        assert_eq!(hub.clear(), 750);
+        assert!(hub.snapshot_all().unwrap().is_empty());
+    }
+
+    #[test]
     fn rotates_8_chunks_and_enforces_retention() {
         let hub = ActivityHub::new(500);
         // Allow the archive worker to finish between spills. Retention tests
@@ -1235,6 +1305,14 @@ mod tests {
         assert_eq!(
             history_newest_first(&hub),
             (251..=2_500).rev().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            hub.snapshot_all()
+                .unwrap()
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            (251..=2_500).collect::<Vec<_>>()
         );
         assert_eq!(hub.page(None, usize::MAX).events.len(), 200);
         assert_eq!(hub.page(None, 0).events.len(), 1);
@@ -1380,6 +1458,10 @@ mod tests {
         await_archive(&hub);
         let file = lock_state(&hub.shared).archived[0].file.path.clone();
         fs::write(&file, b"not a zstd frame").unwrap();
+        assert!(
+            hub.snapshot_all().is_err(),
+            "a full export must not silently omit a corrupt archive"
+        );
         let snapshot = hub.snapshot(200);
         assert_eq!(snapshot.first().unwrap().id, 301);
         assert_eq!(snapshot.last().unwrap().id, 500);

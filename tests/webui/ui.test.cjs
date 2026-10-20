@@ -854,7 +854,7 @@ test('slow snapshot requests do not overlap and race newer snapshots', async t =
   let release, requested, requests = 0;
   const gate = new Promise(resolve => { release = resolve; });
   const started = new Promise(resolve => { requested = resolve; });
-  await page.route('**/_admin/api/snapshot', async route => {
+  await page.route('**/_admin/api/snapshot?all=false', async route => {
     requests++;
     requested();
     await gate;
@@ -875,10 +875,10 @@ test('the header indicator follows connectivity and the drawer supports keyboard
   assert.doesNotMatch(await page.locator('.top').innerText(), /debug console|up 0m/);
   assert.equal(await page.locator('.brand .dot').count(), 1);
   assert.equal(await page.locator('#connectionStatus').getAttribute('data-connection'), 'connected');
-  await page.route('**/_admin/api/snapshot', route => route.fulfill({status: 503, body: 'offline'}));
+  await page.route('**/_admin/api/snapshot?all=false', route => route.fulfill({status: 503, body: 'offline'}));
   await poll();
   assert.equal(await page.locator('#connectionStatus').getAttribute('aria-label'), 'Disconnected');
-  await page.route('**/_admin/api/snapshot', route => route.fulfill({json: data}));
+  await page.route('**/_admin/api/snapshot?all=false', route => route.fulfill({json: data}));
   await poll();
   assert.equal(await page.locator('#connectionStatus').getAttribute('aria-label'), 'Connected');
 
@@ -1001,7 +1001,7 @@ test('a snapshot requested before CLEAR cannot restore erased history', async t 
   const gate = new Promise(resolve => { release = resolve; });
   const requested = new Promise(resolve => { started = resolve; });
   const stale = structuredClone(data);
-  await page.route('**/_admin/api/snapshot', async route => {
+  await page.route('**/_admin/api/snapshot?all=false', async route => {
     started();
     await gate;
     await route.fulfill({json: stale});
@@ -1020,7 +1020,7 @@ test('a snapshot requested before CLEAR cannot restore erased history', async t 
   await page.evaluate(async () => { await window.pendingRefresh; });
   assert.equal(await page.locator('#events [data-key]').count(), 0);
   assert.equal(await page.locator('#inbox .message').count(), 0);
-  await page.route('**/_admin/api/snapshot', route => route.fulfill({json: data}));
+  await page.route('**/_admin/api/snapshot?all=false', route => route.fulfill({json: data}));
 });
 
 test('formatted tools separate commands, arguments, results and errors safely in both views', async t => {
