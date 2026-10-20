@@ -5,24 +5,68 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::output_postprocessing::OutputProcessor;
 use crate::output_projection::Projection;
 use crate::output_projection::{omitted_marker, read_utf8_safe_head, read_utf8_safe_tail};
 
-const SCAN_BYTES: u64 = 64 * 1024;
-const MAX_LINE_BYTES: usize = 512;
-const MAX_EXCERPTS: usize = 3;
+/// Internal processor policy, ready for future configuration without changing
+/// session capture or delivery. Defaults retain the existing summary limits.
+#[derive(Clone, Copy, Debug)]
+struct SummaryLimits {
+    scan_bytes: u64,
+    max_line_bytes: usize,
+    max_excerpts: usize,
+    max_excerpt_bytes: usize,
+}
+
+impl Default for SummaryLimits {
+    fn default() -> Self {
+        Self {
+            scan_bytes: 64 * 1024,
+            max_line_bytes: 512,
+            max_excerpts: 3,
+            max_excerpt_bytes: 1024,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BuildSummary {
+    kind: BuildOutput,
+    limits: SummaryLimits,
+}
+
+impl BuildSummary {
+    pub(crate) fn for_command(command: &str) -> Option<Self> {
+        BuildOutput::for_command(command).map(|kind| Self {
+            kind,
+            limits: SummaryLimits::default(),
+        })
+    }
+}
+
+impl OutputProcessor for BuildSummary {
+    fn default_max_output_tokens(&self) -> usize {
+        2_000
+    }
+
+    fn replacement(&self, baseline: &Projection, budget: usize) -> io::Result<Option<String>> {
+        if !baseline.truncated || baseline.encoding_loss || budget < 512 {
+            return Ok(None);
+        }
+        summary_projection(baseline, self.kind, budget, self.limits)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BuildOutput {
+enum BuildOutput {
     Rustc,
     Cargo,
     Gradle,
 }
 
 impl BuildOutput {
-    pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 2_000;
-
-    pub(crate) fn for_command(command: &str) -> Option<Self> {
+    fn for_command(command: &str) -> Option<Self> {
         // Deliberately not a shell parser. We only recognize simple command
         // lists joined by &&, ||, ;, or newlines. Quoting, expansion, pipes,
         // redirects and grouping fall back to ordinary head/tail.
@@ -126,8 +170,8 @@ impl Excerpt {
 
 // Recognize ordinary SGR-colored lines, but copy their original bytes into
 // the response. Other controls, invalid UTF-8 and oversized lines are skipped.
-fn summary_text(bytes: &[u8]) -> Option<String> {
-    if bytes.len() > MAX_LINE_BYTES {
+fn summary_text(bytes: &[u8], max_line_bytes: usize) -> Option<String> {
+    if bytes.len() > max_line_bytes {
         return None;
     }
     let text = std::str::from_utf8(bytes)
@@ -158,37 +202,23 @@ fn summary_text(bytes: &[u8]) -> Option<String> {
     Some(plain.trim().to_owned())
 }
 
-pub(crate) fn add_build_summary(
-    mut baseline: Projection,
-    kind: Option<BuildOutput>,
-    budget: usize,
-) -> Projection {
-    if let Some(kind) = kind
-        && baseline.truncated
-        && !baseline.encoding_loss
-        && budget >= 512
-        && let Ok(Some(output)) = summary_projection(&baseline, kind, budget)
-    {
-        baseline.output = output;
-    }
-    // Optional scan/read/recognition failure does not invalidate a successful
-    // head/tail read. Capture status and cursor are owned by the caller.
-    baseline
-}
-
 fn summary_projection(
     baseline: &Projection,
     kind: BuildOutput,
     budget: usize,
+    limits: SummaryLimits,
 ) -> io::Result<Option<String>> {
+    if limits.max_excerpts == 0 || limits.scan_bytes == 0 {
+        return Ok(None);
+    }
     let snapshot = &baseline.snapshot;
     let range = snapshot.end - snapshot.start;
-    let scan_start = snapshot.end - range.min(SCAN_BYTES);
+    let scan_start = snapshot.end - range.min(limits.scan_bytes);
     let mut file = File::open(&snapshot.path)?;
     file.seek(SeekFrom::Start(scan_start))?;
     let mut scan = Vec::new();
     Read::by_ref(&mut file)
-        .take(range.min(SCAN_BYTES))
+        .take(range.min(limits.scan_bytes))
         .read_to_end(&mut scan)?;
     let marker_cost = omitted_marker(range).len();
     let mut candidates = Vec::new();
@@ -200,7 +230,7 @@ fn summary_projection(
         if (start == scan_start && scan_start != 0) || !line.ends_with(b"\n") {
             continue;
         }
-        if let Some(text) = summary_text(line)
+        if let Some(text) = summary_text(line, limits.max_line_bytes)
             && kind.is_summary(&text)
             && !baseline
                 .output
@@ -214,16 +244,17 @@ fn summary_projection(
         }
     }
 
-    // At most 20% (and 1 KiB) for excerpts plus their labels/extra markers.
+    // At most 20% and the processor's byte cap (1 KiB by default) for
+    // excerpts plus their labels/extra markers.
     // Prefer the latest fitting lines; preserve source order in the response.
-    let mut allowance = (budget / 5).min(1024);
+    let mut allowance = (budget / 5).min(limits.max_excerpt_bytes);
     let mut selected = Vec::new();
     for candidate in candidates.into_iter().rev() {
         let cost = candidate.bytes.len() + candidate.label().len() + marker_cost;
         if cost <= allowance {
             allowance -= cost;
             selected.push(candidate);
-            if selected.len() == MAX_EXCERPTS {
+            if selected.len() == limits.max_excerpts {
                 break;
             }
         }
@@ -232,7 +263,7 @@ fn summary_projection(
         return Ok(None);
     }
     selected.reverse();
-    let used = (budget / 5).min(1024) - allowance;
+    let used = (budget / 5).min(limits.max_excerpt_bytes) - allowance;
     let content_budget = budget - used - marker_cost;
     let head = read_utf8_safe_head(&mut file, snapshot.start, range, content_budget / 2)?;
     let tail = read_utf8_safe_tail(
@@ -271,6 +302,20 @@ mod tests {
     use crate::output_store::{OutputStore, OutputStoreManager};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    fn summarize(baseline: Projection, kind: Option<BuildOutput>, budget: usize) -> Projection {
+        let summary = kind.map(|kind| BuildSummary {
+            kind,
+            limits: SummaryLimits::default(),
+        });
+        crate::output_postprocessing::apply_processor(
+            baseline,
+            summary
+                .as_ref()
+                .map(|summary| summary as &dyn OutputProcessor),
+            budget,
+        )
+    }
 
     fn store(bytes: &[u8]) -> (TempDir, OutputStore) {
         let root = TempDir::new().unwrap();
@@ -345,7 +390,7 @@ mod tests {
         let (_root, store) = store(&bytes);
         let baseline = project(store.snapshot(0), 1024, false).unwrap();
         assert!(!baseline.output.contains("BUILD FAILED"));
-        let result = add_build_summary(baseline, Some(BuildOutput::Gradle), 1024);
+        let result = summarize(baseline, Some(BuildOutput::Gradle), 1024);
         assert!(result.output.starts_with("head\n"));
         assert!(result.output.ends_with("tail\n"));
         assert!(result.output.contains("BUILD FAILED in 1s\n"));
@@ -391,10 +436,10 @@ mod tests {
         ] {
             let (_root, store) = store(&bytes);
             let baseline = project(store.snapshot(0), 1024, false).unwrap();
-            let result = add_build_summary(baseline.clone(), None, 1024);
+            let result = summarize(baseline.clone(), None, 1024);
             assert_eq!(result.output, baseline.output);
             if bytes.len() < 1024 || bytes.ends_with(b"BUILD FAILED in 1s\n") {
-                let result = add_build_summary(baseline.clone(), Some(BuildOutput::Gradle), 1024);
+                let result = summarize(baseline.clone(), Some(BuildOutput::Gradle), 1024);
                 assert_eq!(result.output, baseline.output);
             }
         }
@@ -412,15 +457,15 @@ mod tests {
         let mut snapshot = store.snapshot(0);
         snapshot.end = summary_start + 8;
         let baseline = project(snapshot, 1024, true).unwrap();
-        let result = add_build_summary(baseline.clone(), Some(BuildOutput::Gradle), 1024);
+        let result = summarize(baseline.clone(), Some(BuildOutput::Gradle), 1024);
         assert_eq!(result.output, baseline.output);
         // A poll beginning inside the keyword must not recover prior output.
         let baseline = project(store.snapshot(summary_start + 8), 1024, false).unwrap();
-        let result = add_build_summary(baseline.clone(), Some(BuildOutput::Gradle), 1024);
+        let result = summarize(baseline.clone(), Some(BuildOutput::Gradle), 1024);
         assert_eq!(result.output, baseline.output);
         store.append(&b"cleanup\n".repeat(10_000)).unwrap();
         let baseline = project(store.snapshot(0), 1024, false).unwrap();
-        let result = add_build_summary(baseline.clone(), Some(BuildOutput::Gradle), 1024);
+        let result = summarize(baseline.clone(), Some(BuildOutput::Gradle), 1024);
         assert_eq!(result.output, baseline.output);
     }
 
@@ -452,7 +497,7 @@ mod tests {
         ] {
             let (_root, store) = store(&log(summary));
             let baseline = project(store.snapshot(0), 2048, false).unwrap();
-            let result = add_build_summary(baseline, Some(kind), 2048);
+            let result = summarize(baseline, Some(kind), 2048);
             assert!(
                 result.output.contains("[build summary excerpt;"),
                 "{summary}"
@@ -461,8 +506,8 @@ mod tests {
         }
         assert!(!BuildOutput::Rustc.is_summary("BUILD FAILED in 1s"));
         assert!(!BuildOutput::Gradle.is_summary("example: BUILD FAILED in 1s"));
-        assert!(summary_text(b"BUILD FAILED\x00 in 1s\n").is_none());
-        assert!(summary_text(b"BUILD FAILED\rforged\n").is_none());
+        assert!(summary_text(b"BUILD FAILED\x00 in 1s\n", 512).is_none());
+        assert!(summary_text(b"BUILD FAILED\rforged\n", 512).is_none());
     }
 
     #[test]
@@ -476,7 +521,7 @@ mod tests {
         let (_root, store) = store(&bytes);
         for budget in [1, 32, 128, 511, 512, 1024, 4096] {
             let baseline = project(store.snapshot(0), budget, false).unwrap();
-            let result = add_build_summary(baseline.clone(), Some(BuildOutput::Gradle), budget);
+            let result = summarize(baseline.clone(), Some(BuildOutput::Gradle), budget);
             assert!(result.output.len() <= budget);
             assert!(!result.encoding_loss);
             assert_eq!(result.snapshot.end, baseline.snapshot.end);
@@ -493,7 +538,7 @@ mod tests {
             .collect();
         let (_root, store) = store(&log(&summaries));
         let baseline = project(store.snapshot(0), 8192, false).unwrap();
-        let result = add_build_summary(baseline.clone(), Some(BuildOutput::Gradle), 8192);
+        let result = summarize(baseline.clone(), Some(BuildOutput::Gradle), 8192);
         assert_eq!(result.output.matches("[build summary excerpt;").count(), 3);
         assert!(!result.output.contains("BUILD SUCCESSFUL in 6s"));
         assert!(
@@ -501,7 +546,94 @@ mod tests {
                 < result.output.find("BUILD SUCCESSFUL in 9s").unwrap()
         );
         std::fs::remove_file(&baseline.snapshot.path).unwrap();
-        let result = add_build_summary(baseline.clone(), Some(BuildOutput::Gradle), 8192);
+        let result = summarize(baseline.clone(), Some(BuildOutput::Gradle), 8192);
         assert_eq!(result.output, baseline.output);
+    }
+
+    #[test]
+    fn processor_limits_bound_scanning_lines_and_excerpts() {
+        use crate::output_postprocessing::apply_processor;
+
+        let summaries: String = (0..5)
+            .map(|n| format!("BUILD SUCCESSFUL in {n}s\n"))
+            .collect();
+        let (_root, store) = store(&log(&summaries));
+        let baseline = project(store.snapshot(0), 4096, false).unwrap();
+        for limits in [
+            SummaryLimits {
+                scan_bytes: 0,
+                ..SummaryLimits::default()
+            },
+            // A nonzero scan window containing only cleanup lines.
+            SummaryLimits {
+                scan_bytes: 100,
+                ..SummaryLimits::default()
+            },
+            SummaryLimits {
+                max_line_bytes: 10,
+                ..SummaryLimits::default()
+            },
+            SummaryLimits {
+                max_excerpts: 0,
+                ..SummaryLimits::default()
+            },
+            SummaryLimits {
+                max_excerpt_bytes: 0,
+                ..SummaryLimits::default()
+            },
+            // The excerpt text fits, but its byte-range label and markers do not.
+            SummaryLimits {
+                max_excerpt_bytes: 24,
+                ..SummaryLimits::default()
+            },
+        ] {
+            let processor = BuildSummary {
+                kind: BuildOutput::Gradle,
+                limits,
+            };
+            let result = apply_processor(baseline.clone(), Some(&processor), 4096);
+            assert_eq!(result.output, baseline.output, "{limits:?}");
+        }
+
+        let processor = BuildSummary {
+            kind: BuildOutput::Gradle,
+            limits: SummaryLimits {
+                max_excerpts: 1,
+                ..SummaryLimits::default()
+            },
+        };
+        let result = apply_processor(baseline.clone(), Some(&processor), 4096);
+        assert_eq!(result.output.matches("[build summary excerpt;").count(), 1);
+        assert!(result.output.contains("BUILD SUCCESSFUL in 4s\n"));
+        assert!(!result.output.contains("BUILD SUCCESSFUL in 3s\n"));
+        assert!(result.output.len() <= 4096);
+        assert_eq!(result.snapshot.end, baseline.snapshot.end);
+    }
+
+    #[test]
+    fn invalid_utf8_and_held_partial_scalars_keep_original_projection() {
+        use crate::output_postprocessing::OutputPostprocessing;
+
+        let mut bytes = log("BUILD FAILED in 1s\n");
+        bytes[0] = 0xff;
+        let (_root, store) = store(&bytes);
+        let baseline = project(store.snapshot(0), 1024, false).unwrap();
+        assert!(baseline.encoding_loss);
+        let stage = OutputPostprocessing::for_command("gradle test");
+        let result = stage.apply(baseline.clone(), 1024);
+        assert_eq!(result.output, baseline.output);
+        assert!(result.encoding_loss);
+        assert_eq!(result.snapshot.end, baseline.snapshot.end);
+
+        let (_root, store) = self::store(b"progress\n\xe2\x82");
+        let baseline = project(store.snapshot(0), 1024, true).unwrap();
+        assert_eq!(baseline.output, "progress\n");
+        let result = stage.apply(baseline.clone(), 1024);
+        assert_eq!(result.output, baseline.output);
+        assert_eq!(result.snapshot.end, b"progress\n".len() as u64);
+        assert_eq!(
+            result.snapshot.stored_bytes,
+            b"progress\n\xe2\x82".len() as u64
+        );
     }
 }

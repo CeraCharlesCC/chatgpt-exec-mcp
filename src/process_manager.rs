@@ -17,9 +17,9 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
 use crate::config::Config;
+use crate::output_postprocessing::OutputPostprocessing;
 use crate::output_store::OutputStore;
 use crate::output_store::OutputStoreManager;
-use crate::output_summary::BuildOutput;
 use crate::response_delivery::{self, PreparedExecResponse};
 use crate::session::{Session, SessionLease};
 use crate::session_id::SessionId;
@@ -80,7 +80,7 @@ struct StartAndWaitArgs {
     tty: bool,
     yield_ms: u64,
     max_output_tokens: usize,
-    build_output: Option<BuildOutput>,
+    postprocessing: OutputPostprocessing,
 }
 
 pub struct ProcessManager {
@@ -152,15 +152,15 @@ impl ProcessManager {
         let yield_ms = args.yield_ms();
         validate_yield_ms(yield_ms)?;
         validate_output_tokens(args.max_output_tokens)?;
-        let build_output = BuildOutput::for_command(&args.cmd);
-        let output_tokens = output_tokens(args.max_output_tokens, build_output);
+        let postprocessing = OutputPostprocessing::for_command(&args.cmd);
+        let output_tokens = output_tokens(args.max_output_tokens, postprocessing);
         self.start_and_wait(StartAndWaitArgs {
             command: args.cmd,
             workdir: args.workdir,
             tty: args.tty,
             yield_ms,
             max_output_tokens: output_tokens,
-            build_output,
+            postprocessing,
         })
         .await
     }
@@ -172,7 +172,7 @@ impl ProcessManager {
             tty,
             yield_ms,
             max_output_tokens,
-            build_output,
+            postprocessing,
         } = args;
         let started = Instant::now();
         let cwd = self.resolve_workdir(workdir.as_deref())?;
@@ -185,7 +185,7 @@ impl ProcessManager {
         // Registration transfers ownership to the manager. A cancelled initial
         // wait then follows the existing registered-session lifetime policy.
         let (session, _lease) = self
-            .commit_reservation(reservation, spawned, output_store, build_output)
+            .commit_reservation(reservation, spawned, output_store, postprocessing)
             .await?;
         session
             .wait_until_exit_or_timeout(Duration::from_millis(yield_ms))
@@ -236,7 +236,7 @@ impl ProcessManager {
                 .await;
         }
 
-        let max_output_tokens = output_tokens(args.max_output_tokens, session.build_output());
+        let max_output_tokens = output_tokens(args.max_output_tokens, session.postprocessing());
         self.build_response(&id, &session, started, max_output_tokens)
             .await
     }
@@ -295,7 +295,7 @@ impl ProcessManager {
         // Re-snapshot under the interaction lock. Terminal state and output may
         // have changed while this passive wait was pending or while a concurrent
         // write_stdin owned the lock.
-        let max_output_tokens = output_tokens(args.max_output_tokens, session.build_output());
+        let max_output_tokens = output_tokens(args.max_output_tokens, session.postprocessing());
         let prepare = response_delivery::prepare_response(
             &session,
             started,
@@ -490,7 +490,7 @@ impl ProcessManager {
         reservation: StartupReservation,
         spawned: codex_utils_pty::SpawnedProcess,
         output_store: OutputStore,
-        build_output: Option<BuildOutput>,
+        postprocessing: OutputPostprocessing,
     ) -> anyhow::Result<(Arc<Session>, SessionLease)> {
         let mut state = self.state.lock().await;
         if self.shutting_down.load(Ordering::SeqCst)
@@ -502,7 +502,12 @@ impl ProcessManager {
         }
         // Session capture tasks start only after acquiring the registry lock.
         // No await separates task ownership from registration.
-        let session = Session::new(reservation.id.clone(), spawned, output_store, build_output);
+        let session = Session::new(
+            reservation.id.clone(),
+            spawned,
+            output_store,
+            postprocessing,
+        );
         let lease = session.lease();
         state
             .sessions
@@ -599,14 +604,8 @@ fn validate_directory(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn output_tokens(requested: Option<usize>, build_output: Option<BuildOutput>) -> usize {
-    requested.unwrap_or_else(|| {
-        if build_output.is_some() {
-            BuildOutput::DEFAULT_MAX_OUTPUT_TOKENS
-        } else {
-            crate::tools::DEFAULT_MAX_OUTPUT_TOKENS
-        }
-    })
+fn output_tokens(requested: Option<usize>, postprocessing: OutputPostprocessing) -> usize {
+    requested.unwrap_or_else(|| postprocessing.default_max_output_tokens())
 }
 
 fn validate_yield_ms(value: u64) -> anyhow::Result<()> {
@@ -934,13 +933,22 @@ mod tests {
 
     #[test]
     fn implicit_output_budgets_match_policy_and_explicit_override_wins() {
-        assert_eq!(output_tokens(None, None), 8_000);
+        assert_eq!(output_tokens(None, OutputPostprocessing::default()), 8_000);
         assert_eq!(
-            output_tokens(None, Some(BuildOutput::Cargo)),
-            BuildOutput::DEFAULT_MAX_OUTPUT_TOKENS
+            output_tokens(None, OutputPostprocessing::for_command("cargo test")),
+            2_000
         );
-        assert_eq!(output_tokens(Some(321), None), 321);
-        assert_eq!(output_tokens(Some(321), Some(BuildOutput::Gradle)), 321);
+        assert_eq!(
+            output_tokens(Some(321), OutputPostprocessing::default()),
+            321
+        );
+        assert_eq!(
+            output_tokens(
+                Some(321),
+                OutputPostprocessing::for_command("./gradlew build")
+            ),
+            321
+        );
     }
 
     #[tokio::test]
@@ -1218,8 +1226,12 @@ mod tests {
                 .unwrap();
             let pid = child_pid(&workspace).await;
             let state = manager.state.lock().await;
-            let mut registering =
-                Box::pin(manager.commit_reservation(reservation, spawned, store, None));
+            let mut registering = Box::pin(manager.commit_reservation(
+                reservation,
+                spawned,
+                store,
+                OutputPostprocessing::default(),
+            ));
             poll_pending(registering.as_mut()).await;
             drop(registering);
             assert!(!raw.exists());
@@ -1266,7 +1278,7 @@ mod tests {
         let pid = child_pid(&workspace).await;
         manager.shutdown_all().await;
         let result = manager
-            .commit_reservation(reservation, spawned, store, None)
+            .commit_reservation(reservation, spawned, store, OutputPostprocessing::default())
             .await;
         assert!(result.is_err());
         child_terminated(pid).await;

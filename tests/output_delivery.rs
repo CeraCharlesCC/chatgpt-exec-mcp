@@ -50,7 +50,7 @@ fn manager(workspace: &TempDir) -> std::sync::Arc<ProcessManager> {
         serde_json::json!({
             "version": 1, "workspace": ".", "shell": "/bin/bash", "output_store_dir": "outputs",
             "child_env": { "inherit": [], "rules": [] },
-            "explicit_session_idle_timeout": 60, "exec_continuation_idle_timeout": 60,
+            "session_idle_timeout": 60,
             "output_store_retention": 60, "output_store_max_bytes": 67108864
         })
         .to_string(),

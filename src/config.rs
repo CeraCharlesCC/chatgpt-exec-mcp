@@ -76,15 +76,6 @@ struct FileConfig {
     max_sessions: Option<usize>,
     #[serde(default, deserialize_with = "present_limit")]
     session_idle_timeout: Option<u64>,
-    // Version-1 migration aliases. Never merge legacy environment rules.
-    #[serde(default, deserialize_with = "present_limit")]
-    max_explicit_sessions: Option<usize>,
-    #[serde(default, deserialize_with = "present_limit")]
-    max_exec_continuations: Option<usize>,
-    #[serde(default, deserialize_with = "present_limit")]
-    explicit_session_idle_timeout: Option<u64>,
-    #[serde(default, deserialize_with = "present_limit")]
-    exec_continuation_idle_timeout: Option<u64>,
     #[serde(default = "thirty")]
     reaper_interval: u64,
     #[serde(default = "megabyte")]
@@ -199,7 +190,6 @@ struct EnvRule {
 #[serde(rename_all = "snake_case")]
 enum Tool {
     ExecCommand,
-    StartSession,
 }
 
 #[derive(Clone)]
@@ -266,7 +256,7 @@ impl Config {
             .context("config JSON has trailing input")?;
         // Serde errors can include an offending scalar. Never echo config values.
         let raw: FileConfig = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!(
-            "config schema invalid: unknown/missing field or invalid field type (see configuration.md)"))?;
+            "config schema invalid: unknown/missing field or invalid field type (see docs/configuration.md and docs/compatibility-migrations.md)"))?;
         if raw.version != 1 {
             bail!("config version must be 1");
         }
@@ -338,58 +328,14 @@ impl Config {
                 agent_name_allocation: agent_pool.agent_name_allocation,
             })
         }).transpose()?;
-        let legacy_quota =
-            raw.max_explicit_sessions.is_some() || raw.max_exec_continuations.is_some();
-        let legacy_timeout = raw.explicit_session_idle_timeout.is_some()
-            || raw.exec_continuation_idle_timeout.is_some();
-        if raw.max_sessions.is_some() && legacy_quota {
-            bail!("max_sessions cannot be combined with legacy session quotas");
-        }
-        if raw.session_idle_timeout.is_some() && legacy_timeout {
-            bail!("session_idle_timeout cannot be combined with legacy idle timeouts");
-        }
-        for (name, value, maximum) in [
-            (
-                "max_explicit_sessions",
-                raw.max_explicit_sessions.map(|n| n as u64),
-                1024,
-            ),
-            (
-                "max_exec_continuations",
-                raw.max_exec_continuations.map(|n| n as u64),
-                1024,
-            ),
-            (
-                "explicit_session_idle_timeout",
-                raw.explicit_session_idle_timeout,
-                31_536_000,
-            ),
-            (
-                "exec_continuation_idle_timeout",
-                raw.exec_continuation_idle_timeout,
-                31_536_000,
-            ),
-        ] {
-            if value.is_some_and(|n| !(1..=maximum).contains(&n)) {
-                bail!("{name} must be in 1..={maximum}");
-            }
-        }
         let config = Self {
             workspace,
             shell,
             output_store_dir,
             child_env,
             additional_instructions,
-            max_sessions: raw.max_sessions.unwrap_or_else(|| {
-                raw.max_explicit_sessions.unwrap_or(3) + raw.max_exec_continuations.unwrap_or(3)
-            }),
-            session_idle_timeout: Duration::from_secs(raw.session_idle_timeout.unwrap_or_else(
-                || {
-                    raw.explicit_session_idle_timeout
-                        .unwrap_or(3600)
-                        .max(raw.exec_continuation_idle_timeout.unwrap_or(900))
-                },
-            )),
+            max_sessions: raw.max_sessions.unwrap_or(6),
+            session_idle_timeout: Duration::from_secs(raw.session_idle_timeout.unwrap_or(3600)),
             reaper_interval: Duration::from_secs(raw.reaper_interval),
             output_cap_bytes: raw.output_cap_bytes,
             output_store_retention: Duration::from_secs(raw.output_store_retention),
@@ -488,11 +434,8 @@ fn resolve_env(
         }
     }
     for rule in &raw.rules {
-        if matches!(rule.tool, Tool::StartSession) {
-            bail!(
-                "child_env rule tool=start_session was removed; explicitly migrate it to exec_command or remove the rule"
-            );
-        }
+        // Deserialization accepts only the current execution tool.
+        let Tool::ExecCommand = rule.tool;
         if rule.set_from_env.is_empty() {
             bail!("child_env rule set_from_env must not be empty");
         }
@@ -599,7 +542,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn unified_session_limits_migrate_legacy_values_and_reject_ambiguity() {
+    fn unified_session_limits_keep_defaults_and_validate_boundaries() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let base = json!({
@@ -617,32 +560,22 @@ mod tests {
         let defaults = load(json!({})).unwrap();
         assert_eq!(defaults.max_sessions, 6);
         assert_eq!(defaults.session_idle_timeout.as_secs(), 3600);
-        let legacy = load(json!({
-            "max_explicit_sessions":2, "max_exec_continuations":4,
-            "explicit_session_idle_timeout":60, "exec_continuation_idle_timeout":90
-        }))
-        .unwrap();
-        assert_eq!(legacy.max_sessions, 6);
-        assert_eq!(legacy.session_idle_timeout.as_secs(), 90);
-        let unified = load(json!({"max_sessions":9, "session_idle_timeout":120})).unwrap();
-        assert_eq!(unified.max_sessions, 9);
-        assert_eq!(unified.session_idle_timeout.as_secs(), 120);
+        for (quota, timeout) in [(1, 1), (6, 90), (9, 120), (2048, 31_536_000)] {
+            let config =
+                load(json!({"max_sessions":quota, "session_idle_timeout":timeout})).unwrap();
+            assert_eq!(config.max_sessions, quota);
+            assert_eq!(config.session_idle_timeout.as_secs(), timeout);
+        }
         for invalid in [
-            json!({"max_sessions":6,"max_explicit_sessions":3}),
-            json!({"session_idle_timeout":60,"exec_continuation_idle_timeout":60}),
             json!({"max_sessions":null}),
             json!({"session_idle_timeout":null}),
-            json!({"max_explicit_sessions":0}),
-            json!({"exec_continuation_idle_timeout":0}),
+            json!({"max_sessions":0}),
+            json!({"max_sessions":2049}),
+            json!({"session_idle_timeout":0}),
+            json!({"session_idle_timeout":31_536_001}),
         ] {
             assert!(load(invalid).is_err());
         }
-        let error = load(json!({"child_env":{"inherit":[], "rules":[{
-            "tool":"start_session", "workdir_under":".", "set_from_env":{"TOKEN":"SOURCE"}
-        }]}}))
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("explicitly migrate"), "{error}");
     }
 
     #[test]

@@ -130,27 +130,7 @@ fn rejects_schema_errors_and_invalid_paths_and_limits() {
             json!(31536001),
             "session_idle_timeout must be in",
         ),
-        (
-            "max_explicit_sessions",
-            json!(0),
-            "max_explicit_sessions must be in",
-        ),
-        (
-            "max_exec_continuations",
-            json!(1025),
-            "max_exec_continuations must be in",
-        ),
         ("reaper_interval", json!(0), "reaper_interval must be in"),
-        (
-            "exec_continuation_idle_timeout",
-            json!(-1),
-            "config schema invalid",
-        ),
-        (
-            "explicit_session_idle_timeout",
-            json!(31536001),
-            "explicit_session_idle_timeout must be in",
-        ),
         ("output_cap_bytes", json!(0), "output_cap_bytes must be in"),
         (
             "output_store_retention",
@@ -194,6 +174,36 @@ fn rejects_schema_errors_and_invalid_paths_and_limits() {
         "config JSON invalid or duplicate key",
     );
     rejected(&config().to_string().replace("\"rules\":[]", r#""rules":[{"tool":"exec_command","workdir_under":".","set_from_env":{"TARGET":"SOURCE","TARGET":"SOURCE"}}]"#), &[("SOURCE", "SECRET_SENTINEL")], "config JSON invalid or duplicate key");
+}
+
+#[test]
+fn removed_session_config_requires_explicit_migration_before_startup() {
+    for field in [
+        "max_explicit_sessions",
+        "max_exec_continuations",
+        "explicit_session_idle_timeout",
+        "exec_continuation_idle_timeout",
+    ] {
+        // Old values must never be silently ignored, even alongside new limits.
+        for old in [json!(3), json!(null), json!("SECRET_SENTINEL")] {
+            let mut value = config();
+            value[field] = old;
+            for unified in [false, true] {
+                if unified {
+                    value["max_sessions"] = json!(6);
+                    value["session_idle_timeout"] = json!(3600);
+                }
+                rejected(&value.to_string(), &[], "docs/compatibility-migrations.md");
+            }
+        }
+    }
+    let mut value = config();
+    value["child_env"]["rules"] = json!([{
+        "tool":"start_session", "workdir_under":".", "set_from_env":{"TARGET":"SOURCE"}
+    }]);
+    for env in [vec![], vec![("SOURCE", "SECRET_SENTINEL")]] {
+        rejected(&value.to_string(), &env, "docs/compatibility-migrations.md");
+    }
 }
 
 #[test]

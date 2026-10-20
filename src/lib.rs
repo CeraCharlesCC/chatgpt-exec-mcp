@@ -2,6 +2,7 @@ pub mod activity;
 pub mod agent_pool;
 mod agent_pool_context;
 pub mod config;
+mod output_postprocessing;
 pub mod output_projection;
 pub mod output_store;
 mod output_summary;

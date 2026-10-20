@@ -15,10 +15,10 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+use crate::output_postprocessing::OutputPostprocessing;
 use crate::output_projection::{Snapshot, project};
 use crate::output_store::OutputRefInfo;
 use crate::output_store::OutputStore;
-use crate::output_summary::{BuildOutput, add_build_summary};
 use crate::session_id::SessionId;
 
 const CAPTURE_QUEUE_CHUNKS: usize = 128;
@@ -77,7 +77,7 @@ pub struct Session {
     pub id: SessionId,
     process: ProcessHandle,
     output_store: Arc<StdMutex<OutputStore>>,
-    build_output: Option<BuildOutput>,
+    postprocessing: OutputPostprocessing,
     output_cursor: Mutex<u64>,
     output_sequence: AtomicU64,
     output_notify: Notify,
@@ -102,7 +102,7 @@ impl Session {
         id: SessionId,
         spawned: SpawnedProcess,
         output_store: OutputStore,
-        build_output: Option<BuildOutput>,
+        postprocessing: OutputPostprocessing,
     ) -> Arc<Self> {
         let SpawnedProcess {
             session: process,
@@ -115,7 +115,7 @@ impl Session {
             id,
             process,
             output_store: Arc::new(StdMutex::new(output_store)),
-            build_output,
+            postprocessing,
             output_cursor: Mutex::new(0),
             output_sequence: AtomicU64::new(0),
             output_notify: Notify::new(),
@@ -374,8 +374,8 @@ impl Session {
         self.output_sequence.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn build_output(&self) -> Option<BuildOutput> {
-        self.build_output
+    pub(crate) fn postprocessing(&self) -> OutputPostprocessing {
+        self.postprocessing
     }
 
     pub async fn send_input(&self, bytes: Vec<u8>) -> anyhow::Result<()> {
@@ -507,10 +507,10 @@ impl Session {
             .await?;
         let projection_snapshot = snapshot.clone();
         let hold_incomplete_utf8 = !self.is_terminal();
-        let build_output = self.build_output;
+        let postprocessing = self.postprocessing;
         match tokio::task::spawn_blocking(move || {
             let projection = project(projection_snapshot, max_bytes, hold_incomplete_utf8)?;
-            Ok(add_build_summary(projection, build_output, max_bytes))
+            Ok(postprocessing.apply(projection, max_bytes))
         })
         .await
         .map_err(|error| io::Error::other(format!("output projection task failed: {error}")))

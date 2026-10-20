@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub use crate::output_projection::{Projection, Snapshot};
+use crate::output_projection::Snapshot;
 
 const RAW_FILE: &str = "raw.log";
 
@@ -214,17 +214,6 @@ impl OutputStore {
             stored_bytes: self.committed_bytes,
             path: self.dir.join(RAW_FILE),
         }
-    }
-
-    /// Compatibility entry point; projection reads a snapshot independently of storage.
-    #[deprecated(note = "use output_projection::project instead")]
-    pub fn project(
-        &self,
-        snapshot: Snapshot,
-        budget: usize,
-        hold_incomplete_utf8: bool,
-    ) -> io::Result<Projection> {
-        crate::output_projection::project(snapshot, budget, hold_incomplete_utf8)
     }
 
     pub fn recovery_path_published(&self) -> bool {
