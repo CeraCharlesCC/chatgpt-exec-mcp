@@ -328,9 +328,16 @@ fn missing_metadata_and_old_versions_are_rejected_without_transport_sessions() {
             header,
             Some(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":params})),
         );
+        assert_eq!(
+            response.status,
+            400,
+            "invalid protocol request must fail as a client error, not a server failure: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let error = body(&response);
         assert!(
-            response.status >= 400 || body(&response).get("error").is_some(),
-            "accepted invalid protocol request"
+            error["error"]["code"].as_i64().is_some(),
+            "expected a JSON-RPC protocol error: {error}"
         );
         assert!(!response.headers.contains_key("mcp-session-id"));
     }

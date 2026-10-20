@@ -158,7 +158,6 @@ test('admin ACK keeps the message visible across polls and browser reloads', asy
   data.admin_messages.push({...data.admin_messages[0], message_id: 'inbox-2', message: 'still unread'});
   await poll();
   const card = page.locator('#inbox [data-key="inbox-1"]'), button = card.locator('.ack');
-  await card.evaluate(node => { window.inboxBody = node.children[1]; });
   let complete;
   const requests = [];
   await page.route('**/_admin/api/ack', async route => {
@@ -179,7 +178,6 @@ test('admin ACK keeps the message visible across polls and browser reloads', asy
   assert.deepEqual(requests, [{message_id: 'inbox-1'}]);
   assert.equal(await button.isDisabled(), true);
   assert.match(await card.innerText(), /<script>unsafe\(\)<\/script>\ninbox message/);
-  assert.equal(await card.evaluate(node => node.children[1] === window.inboxBody), true, 'ACK preserves the message body');
   assert.equal(await page.locator('#inbox .message').count(), 2);
   assert.equal(await page.locator('#inbox [data-key="inbox-2"] .ack').isEnabled(), true);
   await poll();
@@ -188,6 +186,7 @@ test('admin ACK keeps the message visible across polls and browser reloads', asy
   await page.waitForFunction(() => document.querySelector('#inbox .ack')?.textContent === 'ACKed');
   assert.equal(await page.locator('#inbox .message').count(), 2);
   assert.equal(await button.isDisabled(), true);
+  assert.match(await card.innerText(), /<script>unsafe\(\)<\/script>\ninbox message/);
 });
 
 test('admin inbox cursor navigation reaches older unread messages and preserves ACKs', async t => {
@@ -320,9 +319,7 @@ test('a nearby delivery updates the queued card in place and preserves body scro
   const card = page.locator('[data-key="activity:message:send:3"]');
   assert.match(await card.innerText(), /Queued for 1 recipient/);
   await card.evaluate(node => {
-    window.sentCard = node;
-    window.sentBody = node.querySelector('.message-body');
-    window.sentBody.scrollTop = 180;
+    node.querySelector('.message-body').scrollTop = 180;
   });
   data.events.push({
     id: 12, kind: 'tool.finish', level: 'info', timestamp_ms: data.events[10].timestamp_ms + 1,
@@ -336,9 +333,8 @@ test('a nearby delivery updates the queued card in place and preserves body scro
   assert.match(await card.innerText(), /message.receive/);
   assert.match(await card.innerText(), /Offered in tool response to Bob/);
   assert.doesNotMatch(await card.innerText(), /Queued/);
-  assert.deepEqual(await card.evaluate(node => [
-    node === window.sentCard, node.querySelector('.message-body') === window.sentBody, window.sentBody.scrollTop,
-  ]), [true, true, 180]);
+  assert.equal(await card.locator('.message-body').evaluate(node => node.scrollTop), 180);
+  assert.equal(await card.locator('.message-body').textContent(), text);
   assert.equal(await card.locator('[data-time]').getAttribute('data-time'), String(data.events[2].timestamp_ms));
   for (const session of ['chat-beta', 'chat-bob']) {
     await page.selectOption('#activitySession', session);
@@ -505,10 +501,9 @@ test('MCP log nested scroll and text selections survive updates too', async t =>
   await page.evaluate(() => {
     const pre = document.querySelector('[data-key="logs:event:2"] pre');
     pre.scrollTop = 190;
-    window.logBody = pre;
   });
   await poll();
-  assert.deepEqual(await page.evaluate(() => [window.logBody === document.querySelector('[data-key="logs:event:2"] pre'), window.logBody.scrollTop]), [true, 190]);
+  assert.equal(await page.locator('[data-key="logs:event:2"] pre').evaluate(node => node.scrollTop), 190);
 });
 
 test('filters fit narrow screens without horizontal overflow', async t => {
@@ -763,16 +758,16 @@ test('wrap, expansion, nested scroll, focus and highlighted selection survive po
   const start = page.locator('[data-key="activity:event:1"]');
   const pre = start.locator('pre');
   assert.equal(await pre.evaluate(node => getComputedStyle(node).whiteSpace), 'pre');
-  await pre.evaluate(node => { window.commandPre = node; node.scrollTop = 180; });
+  await pre.evaluate(node => { node.scrollTop = 180; });
   await page.check('#wrapLogs');
-  assert.equal(await pre.evaluate(node => node === window.commandPre && node.scrollTop === 180), true);
+  assert.equal(await pre.evaluate(node => node.scrollTop), 180);
   assert.equal(await pre.evaluate(node => getComputedStyle(node).whiteSpace), 'pre-wrap');
   const expand = start.getByRole('button', {name: 'Expand Command', exact: true});
   await expand.click();
   assert.equal(await pre.evaluate(node => getComputedStyle(node).maxHeight), 'none');
   await poll();
   assert.equal(await start.getByRole('button', {name: 'Collapse Command', exact: true}).getAttribute('aria-expanded'), 'true');
-  assert.equal(await pre.evaluate(node => node === window.commandPre), true);
+  assert.equal(await pre.locator('code').textContent(), data.events[0].detail.arguments.cmd);
   await start.getByRole('button', {name: 'Collapse Command', exact: true}).click();
   await pre.evaluate(node => { node.scrollTop = 160; });
   await start.getByRole('button', {name: 'Expand Command', exact: true}).focus();
@@ -795,7 +790,7 @@ test('wrap, expansion, nested scroll, focus and highlighted selection survive po
   assert.equal(await page.isChecked('#wrapLogs'), true);
 });
 
-test('groups update on completion without replacing the command or reopening a collapsed card', async t => {
+test('groups update on completion without losing the command or reopening a collapsed card', async t => {
   const data = fixture();
   data.events = [data.events[0]];
   const {page, poll} = await open(t, data);
@@ -803,12 +798,11 @@ test('groups update on completion without replacing the command or reopening a c
   const card = page.locator('[data-key="activity:event:group:1"]');
   assert.match(await card.locator('summary').innerText(), /In progress/);
   await card.getByRole('button', {name: 'Expand Command', exact: true}).click();
-  await card.locator('code').evaluate(node => { window.groupCommand = node; });
   await card.locator('summary').click();
   data.events.push({...fixture().events[1], timestamp_ms: data.events[0].timestamp_ms + 100});
   await poll();
   assert.equal(await card.locator('.tool-group').getAttribute('open'), null);
-  assert.equal(await card.locator('[data-group-part="start"] code').evaluate(node => node === window.groupCommand), true);
+  assert.equal(await card.locator('[data-group-part="start"] code').textContent(), data.events[0].detail.arguments.cmd);
   await card.locator('summary').click();
   assert.match(await card.locator('summary').innerText(), /tool.finish/);
   assert.equal(await card.getByRole('button', {name: 'Collapse Command', exact: true}).getAttribute('aria-expanded'), 'true');

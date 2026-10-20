@@ -11,7 +11,7 @@ fn command() -> Command {
     cmd.env_clear().stdin(Stdio::null());
     cmd
 }
-fn rejected(raw: &str, env: &[(&str, &str)]) {
+fn rejected(raw: &str, env: &[(&str, &str)], expected_error: &str) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("config.json");
     std::fs::write(&path, raw).unwrap();
@@ -28,6 +28,10 @@ fn rejected(raw: &str, env: &[(&str, &str)]) {
     );
     let diagnostics = String::from_utf8_lossy(&result.stderr);
     assert!(!diagnostics.is_empty());
+    assert!(
+        diagnostics.contains(expected_error),
+        "expected diagnostic {expected_error:?}, got {diagnostics:?}"
+    );
     assert!(
         !diagnostics.contains("SECRET_SENTINEL"),
         "leaked value: {diagnostics}"
@@ -65,8 +69,8 @@ fn required_config_and_removed_cli_are_rejected() {
 
 #[test]
 fn rejects_schema_errors_and_invalid_paths_and_limits() {
-    rejected("{", &[]);
-    rejected("{}", &[]);
+    rejected("{", &[], "config JSON invalid");
+    rejected("{}", &[], "config schema invalid");
     for field in [
         "version",
         "workspace",
@@ -76,39 +80,103 @@ fn rejects_schema_errors_and_invalid_paths_and_limits() {
     ] {
         let mut value = config();
         value.as_object_mut().unwrap().remove(field);
-        rejected(&value.to_string(), &[]);
+        rejected(&value.to_string(), &[], "config schema invalid");
     }
-    for (field, bad) in [
-        ("version", json!(2)),
-        ("workspace", json!("")),
-        ("workspace", json!("missing")),
-        ("shell", json!("")),
-        ("shell", json!(".")),
-        ("shell", json!("config.json")),
-        ("output_store_dir", json!("")),
-        ("instructions_file", json!("")),
-        ("instructions_file", json!("missing")),
-        ("instructions_file", Value::Null),
-        ("unexpected", json!("SECRET_SENTINEL")),
-        ("max_sessions", json!(0)),
-        ("max_sessions", json!(2049)),
-        ("session_idle_timeout", json!(0)),
-        ("session_idle_timeout", json!(31536001)),
-        ("max_explicit_sessions", json!(0)),
-        ("max_exec_continuations", json!(1025)),
-        ("reaper_interval", json!(0)),
-        ("exec_continuation_idle_timeout", json!(-1)),
-        ("explicit_session_idle_timeout", json!(31536001)),
-        ("output_cap_bytes", json!(0)),
-        ("output_store_retention", json!(0)),
-        ("output_store_min_retention", json!(0)),
-        ("output_store_max_bytes", json!(0)),
-        ("output_store_max_files", json!(0)),
-        ("output_store_headroom_bytes", json!(4294967297_u64)),
+    for (field, bad, expected_error) in [
+        ("version", json!(2), "config version must be 1"),
+        ("workspace", json!(""), "workspace must not be empty"),
+        (
+            "workspace",
+            json!("missing"),
+            "workspace canonicalize failed",
+        ),
+        ("shell", json!(""), "shell must not be empty"),
+        (
+            "shell",
+            json!("."),
+            "shell must be a regular executable file",
+        ),
+        ("shell", json!("config.json"), "shell is not executable"),
+        (
+            "output_store_dir",
+            json!(""),
+            "output_store_dir must not be empty",
+        ),
+        (
+            "instructions_file",
+            json!(""),
+            "instructions_file must not be empty",
+        ),
+        (
+            "instructions_file",
+            json!("missing"),
+            "instructions_file read failed",
+        ),
+        ("instructions_file", Value::Null, "config schema invalid"),
+        (
+            "unexpected",
+            json!("SECRET_SENTINEL"),
+            "config schema invalid",
+        ),
+        ("max_sessions", json!(0), "max_sessions must be in"),
+        ("max_sessions", json!(2049), "max_sessions must be in"),
+        (
+            "session_idle_timeout",
+            json!(0),
+            "session_idle_timeout must be in",
+        ),
+        (
+            "session_idle_timeout",
+            json!(31536001),
+            "session_idle_timeout must be in",
+        ),
+        (
+            "max_explicit_sessions",
+            json!(0),
+            "max_explicit_sessions must be in",
+        ),
+        (
+            "max_exec_continuations",
+            json!(1025),
+            "max_exec_continuations must be in",
+        ),
+        ("reaper_interval", json!(0), "reaper_interval must be in"),
+        (
+            "exec_continuation_idle_timeout",
+            json!(-1),
+            "config schema invalid",
+        ),
+        (
+            "explicit_session_idle_timeout",
+            json!(31536001),
+            "explicit_session_idle_timeout must be in",
+        ),
+        ("output_cap_bytes", json!(0), "output_cap_bytes must be in"),
+        (
+            "output_store_retention",
+            json!(0),
+            "output_store_retention must be in",
+        ),
+        (
+            "output_store_min_retention",
+            json!(0),
+            "config schema invalid",
+        ),
+        (
+            "output_store_max_bytes",
+            json!(0),
+            "output_store_max_bytes must be in",
+        ),
+        ("output_store_max_files", json!(0), "config schema invalid"),
+        (
+            "output_store_headroom_bytes",
+            json!(4294967297_u64),
+            "config schema invalid",
+        ),
     ] {
         let mut value = config();
         value[field] = bad;
-        rejected(&value.to_string(), &[]);
+        rejected(&value.to_string(), &[], expected_error);
     }
     // Repeated struct fields and nested map keys must both be rejected.
     rejected(
@@ -116,46 +184,108 @@ fn rejects_schema_errors_and_invalid_paths_and_limits() {
             .to_string()
             .replacen("\"version\":1", "\"version\":1,\"version\":1", 1),
         &[],
+        "config JSON invalid or duplicate key",
     );
     rejected(
         &config()
             .to_string()
             .replace("\"rules\":[]", "\"rules\":[],\"rules\":[]"),
         &[],
+        "config JSON invalid or duplicate key",
     );
-    rejected(&config().to_string().replace("\"rules\":[]", r#""rules":[{"tool":"exec_command","workdir_under":".","set_from_env":{"TARGET":"SOURCE","TARGET":"SOURCE"}}]"#), &[("SOURCE", "SECRET_SENTINEL")]);
+    rejected(&config().to_string().replace("\"rules\":[]", r#""rules":[{"tool":"exec_command","workdir_under":".","set_from_env":{"TARGET":"SOURCE","TARGET":"SOURCE"}}]"#), &[("SOURCE", "SECRET_SENTINEL")], "config JSON invalid or duplicate key");
 }
 
 #[test]
 fn agent_pool_requires_an_explicit_principal_and_database_path() {
-    for agent_pool in [
-        Value::Null,
-        json!({}),
-        json!({"database_path":"agent_pool.sqlite3"}),
-        json!({"principal":"owner"}),
-        json!({"principal":"", "database_path":"agent_pool.sqlite3"}),
-        json!({"principal":" owner", "database_path":"agent_pool.sqlite3"}),
-        json!({"principal":"owner\n", "database_path":"agent_pool.sqlite3"}),
-        json!({"principal":"owner", "database_path":""}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":179}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":604801}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":null}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":null}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_allocation":null}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_allocation":"unknown"}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_allocation":true}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":[]}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["Caesar", "Caesar"]}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["global"]}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["admin"]}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":[" Caesar"]}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["Caesar\n"]}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["x".repeat(129)]}),
-        json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "unknown":"SECRET_SENTINEL"}),
+    for (agent_pool, expected_error) in [
+        (Value::Null, "config schema invalid"),
+        (json!({}), "config schema invalid"),
+        (
+            json!({"database_path":"agent_pool.sqlite3"}),
+            "config schema invalid",
+        ),
+        (json!({"principal":"owner"}), "config schema invalid"),
+        (
+            json!({"principal":"", "database_path":"agent_pool.sqlite3"}),
+            "agent_pool.principal must be",
+        ),
+        (
+            json!({"principal":" owner", "database_path":"agent_pool.sqlite3"}),
+            "agent_pool.principal must be",
+        ),
+        (
+            json!({"principal":"owner\n", "database_path":"agent_pool.sqlite3"}),
+            "agent_pool.principal must be",
+        ),
+        (
+            json!({"principal":"owner", "database_path":""}),
+            "agent_pool.database_path must not be empty",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":179}),
+            "agent_pool.membership_ttl_seconds must be between",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":604801}),
+            "agent_pool.membership_ttl_seconds must be between",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "membership_ttl_seconds":null}),
+            "config schema invalid",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":null}),
+            "config schema invalid",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_allocation":null}),
+            "config schema invalid",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_allocation":"unknown"}),
+            "config schema invalid",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_allocation":true}),
+            "config schema invalid",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":[]}),
+            "agent_pool.agent_name_dictionary must not be empty",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["Caesar", "Caesar"]}),
+            "agent_pool.agent_name_dictionary entries must be unique",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["global"]}),
+            "agent_pool.agent_name_dictionary entries must be unique usable",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["admin"]}),
+            "agent_pool.agent_name_dictionary entries must be unique usable",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":[" Caesar"]}),
+            "agent_pool.agent_name_dictionary entries must be unique usable",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["Caesar\n"]}),
+            "agent_pool.agent_name_dictionary entries must be unique usable",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "agent_name_dictionary":["x".repeat(129)]}),
+            "agent_pool.agent_name_dictionary entries must be unique usable",
+        ),
+        (
+            json!({"principal":"owner", "database_path":"agent_pool.sqlite3", "unknown":"SECRET_SENTINEL"}),
+            "config schema invalid",
+        ),
     ] {
         let mut value = config();
         value["agent_pool"] = agent_pool;
-        rejected(&value.to_string(), &[]);
+        rejected(&value.to_string(), &[], expected_error);
     }
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("config.json");
@@ -236,51 +366,112 @@ fn rejects_legacy_environment_and_invalid_policy() {
         "CHATGPT_EXEC_SCOPED_GRADLE_AUTH_ROOT",
         "CHATGPT_EXEC_SCOPED_GRADLE_GITHUB_TOKEN",
     ] {
-        rejected(&config().to_string(), &[(name, "SECRET_SENTINEL")]);
-        rejected(&config().to_string(), &[(name, "")]);
+        rejected(
+            &config().to_string(),
+            &[(name, "SECRET_SENTINEL")],
+            "startup environment",
+        );
+        rejected(&config().to_string(), &[(name, "")], "startup environment");
     }
     let rule =
         json!({"tool":"exec_command", "workdir_under":".", "set_from_env":{"TARGET":"SOURCE"}});
     let base = json!({"inherit":[], "rules":[rule.clone()]});
     let mut policies = vec![
-        json!({"inherit":["SOURCE"], "rules":[]}),
-        json!({"inherit":["1BAD"], "rules":[]}),
-        json!({"inherit":["SOURCE", "SOURCE"], "rules":[]}),
-        json!({"inherit":["CHATGPT_EXEC_SESSION"], "rules":[]}),
-        json!({"inherit":["SOURCE"], "rules":[rule.clone()]}),
-        json!({"inherit":["TARGET"], "rules":[rule.clone()]}),
-        json!({"inherit":[], "rules":[rule.clone(),rule.clone()]}),
+        (
+            json!({"inherit":["SOURCE"], "rules":[]}),
+            "child_env reference SOURCE",
+            false,
+        ),
+        (
+            json!({"inherit":["1BAD"], "rules":[]}),
+            "child_env contains an invalid variable name",
+            true,
+        ),
+        (
+            json!({"inherit":["SOURCE", "SOURCE"], "rules":[]}),
+            "child_env.inherit contains duplicate names",
+            true,
+        ),
+        (
+            json!({"inherit":["CHATGPT_EXEC_SESSION"], "rules":[]}),
+            "child_env conflicts with the reserved",
+            true,
+        ),
+        (
+            json!({"inherit":["SOURCE"], "rules":[rule.clone()]}),
+            "child_env inherit/source/destination sets must not overlap",
+            true,
+        ),
+        (
+            json!({"inherit":["TARGET"], "rules":[rule.clone()]}),
+            "child_env inherit/source/destination sets must not overlap",
+            true,
+        ),
+        (
+            json!({"inherit":[], "rules":[rule.clone(),rule.clone()]}),
+            "child_env has duplicate destination definitions",
+            true,
+        ),
     ];
-    for (key, bad) in [
-        ("tool", json!("unknown")),
-        ("workdir_under", json!("missing")),
-        ("workdir_under", json!("")),
-        ("set_from_env", json!({})),
-        ("set_from_env", json!({"SOURCE":"SOURCE"})),
-        ("set_from_env", json!({"CHATGPT_EXEC_SESSION":"SOURCE"})),
-        ("set_from_env", json!({"TARGET":"CHATGPT_EXEC_SESSION"})),
-        ("required", json!(false)),
+    for (key, bad, expected_error) in [
+        ("tool", json!("unknown"), "config schema invalid"),
+        (
+            "workdir_under",
+            json!("missing"),
+            "child_env.workdir_under canonicalize failed",
+        ),
+        (
+            "workdir_under",
+            json!(""),
+            "child_env.workdir_under must not be empty",
+        ),
+        (
+            "set_from_env",
+            json!({}),
+            "child_env rule set_from_env must not be empty",
+        ),
+        (
+            "set_from_env",
+            json!({"SOURCE":"SOURCE"}),
+            "child_env inherit/source/destination sets must not overlap",
+        ),
+        (
+            "set_from_env",
+            json!({"CHATGPT_EXEC_SESSION":"SOURCE"}),
+            "child_env conflicts with the reserved",
+        ),
+        (
+            "set_from_env",
+            json!({"TARGET":"CHATGPT_EXEC_SESSION"}),
+            "child_env conflicts with the reserved",
+        ),
+        ("required", json!(false), "config schema invalid"),
     ] {
         let mut policy = base.clone();
         policy["rules"][0][key] = bad;
-        policies.push(policy);
+        policies.push((policy, expected_error, true));
     }
-    for policy in policies {
+    for (policy, expected_error, reject_with_credentials) in policies {
         let mut value = config();
         value["child_env"] = policy;
-        rejected(&value.to_string(), &[]);
+        rejected(&value.to_string(), &[], expected_error);
         // Also reject structural errors when referenced credentials are available.
-        if value["child_env"] != json!({"inherit":["SOURCE"], "rules":[]}) {
+        if reject_with_credentials {
             rejected(
                 &value.to_string(),
                 &[("SOURCE", "SECRET_SENTINEL"), ("TARGET", "SECRET_SENTINEL")],
+                expected_error,
             );
         }
     }
     let mut value = config();
     value["child_env"] = base;
-    rejected(&value.to_string(), &[]);
-    rejected(&value.to_string(), &[("SOURCE", "")]);
+    rejected(&value.to_string(), &[], "child_env reference SOURCE");
+    rejected(
+        &value.to_string(),
+        &[("SOURCE", "")],
+        "child_env reference SOURCE",
+    );
 }
 
 #[test]

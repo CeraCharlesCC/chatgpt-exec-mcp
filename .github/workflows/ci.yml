@@ -22,6 +22,12 @@ jobs:
           rustup override set 1.93.1
       - name: Fetch locked dependencies
         run: cargo fetch --locked
+      - name: Require optional fixture tools used by vendor tests
+        run: |
+          test -x /usr/bin/python3
+          python3 --version
+          command -v setsid
+          setsid true
       - name: Test and lint
         run: |
           cargo test --workspace --all-targets --locked --offline

@@ -37,6 +37,14 @@ async fn offered_receipt_wakes_sender_without_a_reply_and_is_not_recursive() {
         .finish_tool_turn("owner", Some("b"), recipient.as_ref())
         .await
         .unwrap();
+    assert_eq!(first.messages.len(), 1);
+    assert_eq!(first.messages[0].message, "do work");
+    assert_eq!(
+        Some(&first.messages[0].message_id),
+        sent.message_id.as_ref()
+    );
+    assert_eq!(first.messages[0].from, "alice");
+    assert_eq!(first.messages[0].to, "bob");
     assert_eq!(first.messages, repeated.messages);
     let received = waiter.await.unwrap();
     assert_eq!(received.reason, PoolWaitReason::Receipt);
