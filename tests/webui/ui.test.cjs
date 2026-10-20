@@ -231,6 +231,138 @@ test('admin inbox cursor navigation reaches older unread messages and preserves 
   assert.equal(await page.locator('#inbox .ack').innerText(), 'ACKed');
 });
 
+test('activity pages keep only 200 events and survive polling, filtering, and Older/Newer navigation', async t => {
+  const data = fixture();
+  const sample = data.events[0];
+  const event = id => ({...sample, id, kind: 'custom.event', timestamp_ms: sample.timestamp_ms + id,
+    agents: [], detail: {sequence: id}});
+  data.events = Array.from({length: 200}, (_, i) => event(i + 401));
+  data.events_has_more = true;
+  data.events_next_before_id = 401;
+  const {page, poll} = await open(t, data);
+  const secondPage = Array.from({length: 200}, (_, i) => event(i + 201));
+  secondPage[0] = {...sample, id: 201, timestamp_ms: sample.timestamp_ms + 201};
+  secondPage[1] = {...fixture().events[1], id: 202, timestamp_ms: sample.timestamp_ms + 202,
+    detail: {...fixture().events[1].detail, start_event_id: 201}};
+  secondPage[2] = {...fixture().events[2], id: 203, timestamp_ms: sample.timestamp_ms + 203};
+  const thirdPage = Array.from({length: 200}, (_, i) => event(i + 1));
+  const requests = [];
+  await page.route('**/_admin/api/events*', route => {
+    const params = new URL(route.request().url()).searchParams;
+    const cursor = Number(params.get('before_id'));
+    requests.push({cursor, limit: params.get('limit')});
+    if (cursor === 401) return route.fulfill({json: {events: secondPage, next_before_id: 201, has_more: true}});
+    if (cursor === 201) return route.fulfill({json: {events: thirdPage, next_before_id: null, has_more: false}});
+    throw new Error(`unexpected cursor ${cursor}`);
+  });
+
+  assert.equal(await page.locator('#events > [data-key]').count(), 200);
+  assert.equal(await page.locator('#activityOlder').isEnabled(), true);
+  assert.equal(await page.locator('#activityNewer').isDisabled(), true);
+  await page.locator('#activityOlder').click();
+  await page.waitForFunction(() => !state.activityLoading && state.activityPageIndex === 1);
+  assert.equal(await page.locator('#activityPageLabel').innerText(), 'Page 2');
+  assert.equal(await page.locator('#events > [data-key]').count(), 200);
+  assert.equal(await page.locator('[data-key="activity:event:201"]').count(), 1);
+  assert.equal(await page.locator('[data-key="activity:event:401"]').count(), 0);
+  assert.equal(await page.evaluate(() => state.data.events.length), 200);
+
+  // Normal polling updates the live sidebar without fetching or replacing the
+  // archived page, even when new activity arrives on the latest page.
+  data.events = [...data.events.slice(1), event(601)];
+  data.admin_messages.push({...data.admin_messages[0], message_id: 'inbox-later', message: 'live inbox'});
+  for (let i = 0; i < 3; i++) await poll();
+  assert.equal(await page.locator('[data-key="activity:event:601"]').count(), 0);
+  assert.equal(await page.locator('[data-key="activity:event:201"]').count(), 1);
+  assert.equal(await page.locator('#inbox [data-key="inbox-later"]').count(), 1);
+  assert.deepEqual(requests, [{cursor: 401, limit: '200'}]);
+
+  await page.locator('#activityOlder').click();
+  await page.waitForFunction(() => !state.activityLoading && state.activityPageIndex === 2);
+  assert.equal(await page.locator('#events > [data-key]').count(), 200);
+  assert.equal(await page.locator('#activityOlder').isDisabled(), true);
+  assert.equal(await page.locator('#activityNewer').isEnabled(), true);
+  await page.locator('[data-view="logs"]').click();
+  assert.equal(await page.locator('#events .logline').count(), 200);
+  await page.locator('#activityNewer').click();
+  await page.waitForFunction(() => !state.activityLoading && state.activityPageIndex === 1);
+  assert.equal(await page.locator('#events .logline').count(), 200);
+  await page.locator('[data-view="activity"]').click();
+  await page.check('#groupTools');
+  assert.equal(await page.locator('[data-key="activity:event:group:201"]').count(), 1);
+  await page.selectOption('#activityFilter', 'messages');
+  assert.ok(await page.locator('#events .message-body').count() >= 1, 'page filters still work');
+  await page.selectOption('#activityFilter', 'all');
+  await page.locator('#activityNewer').click();
+  await page.waitForFunction(() => !state.activityLoading && state.activityPageIndex === 0);
+  assert.equal(await page.locator('[data-key="activity:event:601"]').count(), 1);
+  assert.equal(await page.locator('#events > [data-key]').count(), 200);
+  assert.deepEqual(requests, [{cursor: 401, limit: '200'}, {cursor: 201, limit: '200'},
+    {cursor: 401, limit: '200'}]);
+});
+
+test('stale snapshot cannot replace an older activity page', async t => {
+  const data = fixture();
+  data.events_has_more = true;
+  data.events_next_before_id = 1;
+  const {page} = await open(t, data);
+  await page.route('**/_admin/api/events*', route => route.fulfill({json: {
+    events: [{...data.events[0], id: 1, detail: {tool: 'exec_command', arguments: {cmd: 'old'}}}],
+    next_before_id: null, has_more: false,
+  }}));
+  let release, markRequested;
+  const gate = new Promise(resolve => { release = resolve; });
+  const requested = new Promise(resolve => { markRequested = resolve; });
+  await page.route('**/_admin/api/snapshot*', async route => {
+    markRequested();
+    await gate;
+    return route.fulfill({json: data});
+  });
+  await page.evaluate(() => { window.pendingRefresh = refresh(); });
+  await requested;
+  await page.locator('#activityOlder').click();
+  await page.waitForFunction(() => !state.activityLoading && state.activityPageIndex === 1);
+  assert.equal(await page.locator('#events > [data-key]').count(), 1);
+  release();
+  await page.evaluate(() => window.pendingRefresh);
+  assert.equal(await page.locator('#activityPageLabel').innerText(), 'Page 2');
+  assert.equal(await page.locator('#events > [data-key]').count(), 1);
+});
+
+test('CLEAR discards an in-flight archived activity response and resets pagination', async t => {
+  const data = fixture();
+  data.events_has_more = true;
+  data.events_next_before_id = 1;
+  const {page} = await open(t, data);
+  let release, markRequested;
+  const gate = new Promise(resolve => { release = resolve; });
+  const requested = new Promise(resolve => { markRequested = resolve; });
+  await page.route('**/_admin/api/events*', async route => {
+    markRequested();
+    await gate;
+    await route.fulfill({json: {events: [{...data.events[0], id: 1}], next_before_id: null, has_more: false}});
+  });
+  await page.locator('#activityOlder').click();
+  await requested;
+  assert.equal(await page.locator('#activityPageLabel').innerText(), 'Page 2 · loading…');
+  await page.route('**/_admin/api/clear', route => {
+    data.events = [];
+    data.events_has_more = false;
+    data.events_next_before_id = null;
+    data.admin_messages = [];
+    return route.fulfill({json: {cleared_events: 11, cleared_admin_messages: 1}});
+  });
+  await page.locator('#menuToggle').click();
+  await page.locator('#clearCover').click();
+  await page.locator('#clearHistory').click();
+  await page.waitForFunction(() => !state.clearing && state.activityPageIndex === 0);
+  release();
+  await page.waitForFunction(() => !state.activityLoading);
+  assert.equal(await page.locator('#events > [data-key]').count(), 0);
+  assert.equal(await page.locator('#activityPagination').isHidden(), true);
+  assert.deepEqual(await page.evaluate(() => state.activityCursors), [null]);
+});
+
 test('failed admin ACKs leave messages unread and allow a retry', async t => {
   const {page, data, poll} = await open(t);
   const button = page.locator('#inbox .ack');

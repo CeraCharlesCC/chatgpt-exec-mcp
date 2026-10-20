@@ -29,6 +29,8 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
+zstd = { version = "0.14", default-features = false }
 tokio = { version = "1", features = [
     "io-std",
     "io-util",
@@ -43,7 +45,6 @@ tokio = { version = "1", features = [
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]

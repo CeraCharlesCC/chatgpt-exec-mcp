@@ -85,6 +85,11 @@ function updateMessage(node, html) {
 }
 export function renderEvents(state) {
   const root = $('#events'), events = state.data?.events || [];
+  $('#activityPagination').hidden = !state.data ||
+    (state.activityPageIndex === 0 && state.activityNextBeforeId === null);
+  $('#activityPageLabel').textContent = `Page ${state.activityPageIndex + 1}${state.activityLoading ? ' · loading…' : ''}`;
+  $('#activityNewer').disabled = state.activityLoading || state.activityPageIndex === 0;
+  $('#activityOlder').disabled = state.activityLoading || state.activityNextBeforeId === null;
   const grouping = state.group && state.format && state.view === 'activity' && state.filter === 'all';
   $('#groupTools').disabled = !state.format || state.view !== 'activity' || state.filter !== 'all';
   const starts = new Map(events.filter(e => e.kind === 'tool.start').map(e => [e.id, e]));
@@ -92,7 +97,7 @@ export function renderEvents(state) {
   const conversationRows = messages(events, finishes, state.data?.pools || [], state.data?.admin_messages || []);
   renderFilters(state, events, starts, finishes, conversationRows);
   if (interacting(root)) return;
-  const viewKey = JSON.stringify([state.view, state.filter, state.pool, state.agent, state.session, state.format, grouping]);
+  const viewKey = JSON.stringify([state.view, state.filter, state.pool, state.agent, state.session, state.format, grouping, state.activityPageIndex, state.activityCursors[state.activityPageIndex]]);
   if (root._viewKey !== viewKey) root.scrollTop = 0;
   root._viewKey = viewKey;
   const conversation = state.view === 'activity' && state.filter === 'messages';
@@ -121,12 +126,14 @@ export function renderEvents(state) {
   }
   syncList(root, rows, item => `${state.view}:${conversation ? 'message:' : 'event:'}${item.key || item.id}`,
     conversation ? messageMarkup : grouping ? item => groupMarkup(item, state) : item => eventMarkup(item, state),
-    state.pool || state.agent || state.session || state.filter !== 'all' ? 'No entries match these filters' : 'No activity yet',
+    state.activityLoading ? 'Loading activity…' : state.pool || state.agent || state.session || state.filter !== 'all' ? 'No entries match these filters' : 'No activity yet',
     state.view === 'logs' ? 'logline' : '', conversation ? updateMessage : updateEvent);
   $('#filterCount').textContent = `${shown.length} / ${all.length} ${conversation ? 'messages' : 'events'}${grouping ? ` · ${rows.length} cards` : ''}`;
 }
 
-export function bindActivity({state, render, selectPool, toast}) {
+export function bindActivity({state, render, selectPool, toast, changeActivityPage}) {
+  $('#activityNewer').onclick = () => changeActivityPage(-1);
+  $('#activityOlder').onclick = () => changeActivityPage(1);
   $('#activityFilter').onchange = event => { state.filter = event.target.value; clearSelection(); renderEvents(state); };
   $('#activityPool').onchange = event => selectPool(event.target.value);
   $('#activityAgent').onchange = event => { state.agent = event.target.value; clearSelection(); renderEvents(state); };

@@ -1,6 +1,6 @@
 import { $, clearSelection, setPointerTarget, clearPointerTarget, hasPointerTarget } from './dom.js';
 import { state } from './state.js';
-import { fetchSnapshot, setCsrfToken, sendAdminMessage, terminateAgent, ackAdminMessage, clearAdminHistory } from './api.js';
+import { fetchSnapshot, fetchEvents, setCsrfToken, sendAdminMessage, terminateAgent, ackAdminMessage, clearAdminHistory } from './api.js';
 import { toast, setCover, connection, bindMenu } from './views/menu.js';
 import { renderEvents, bindActivity } from './views/activity.js';
 import { renderPools, bindPools } from './views/pools.js';
@@ -11,6 +11,8 @@ async function clearHistory() {
   state.clearing = true;
   // Discard any snapshot requested before the clear, and pause polling until it finishes.
   state.refreshEpoch++;
+  // A decompression request may still be in flight when CLEAR completes.
+  state.activityEpoch++;
   $('#clearCover').disabled = true;
   $('#clearControl').classList.add('pressing');
   setCover(false, state);
@@ -26,12 +28,22 @@ async function clearHistory() {
     state.inboxCursors = [null];
     state.inboxPageIndex = 0;
     state.inboxLoading = false;
+    state.activityCursors = [null];
+    state.activityPageIndex = 0;
+    state.activityNextBeforeId = null;
+    state.activityLoading = false;
     state.refreshPending = false;
     clearSelection();
     render();
     $('#clearHint').textContent = 'History cleared.';
     toast('Activity, MCP log and admin inbox cleared');
   } catch (e) {
+    // A failed clear still invalidated in-flight page loads; reload the latest
+    // activity on the next snapshot rather than retaining a loading indicator.
+    state.activityCursors = [null];
+    state.activityPageIndex = 0;
+    state.activityNextBeforeId = null;
+    state.activityLoading = false;
     $('#clearHint').textContent = 'Clear failed. Lift the cover to retry.';
     toast(e.message, true);
   } finally {
@@ -102,6 +114,60 @@ function changePage(direction) {
   if (state.refreshing) state.refreshPending = true;
   else void refresh();
 }
+
+async function changeActivityPage(direction) {
+  if (state.clearing || state.activityLoading || !state.data) return;
+  const previous = {
+    cursors: state.activityCursors,
+    index: state.activityPageIndex,
+    next: state.activityNextBeforeId,
+    events: state.data.events,
+  };
+  if (direction === 1 && state.activityNextBeforeId !== null) {
+    state.activityCursors = state.activityCursors.slice(0, state.activityPageIndex + 1);
+    state.activityCursors.push(state.activityNextBeforeId);
+    state.activityPageIndex++;
+  } else if (direction === -1 && state.activityPageIndex > 0) {
+    state.activityPageIndex--;
+  } else return;
+
+  // Keep just the selected page in browser state, even while loading.
+  state.data.events = [];
+  state.activityNextBeforeId = null;
+  state.activityLoading = true;
+  const epoch = ++state.activityEpoch;
+  // A snapshot from before this click must not paint over the new page.
+  state.refreshEpoch++;
+  clearSelection();
+  renderEvents(state);
+  if (state.activityPageIndex === 0) {
+    // The current page comes from the lightweight snapshot endpoint.
+    if (state.refreshing) state.refreshPending = true;
+    else void refresh();
+    return;
+  }
+
+  try {
+    const response = await fetchEvents(state.activityCursors[state.activityPageIndex]);
+    if (!response.ok) throw new Error(await response.text());
+    const page = await response.json();
+    if (epoch !== state.activityEpoch || state.clearing) return;
+    if (!Array.isArray(page.events)) throw new Error('Invalid activity page response');
+    state.data.events = page.events.slice(-200);
+    state.activityNextBeforeId = page.has_more ? page.next_before_id ?? null : null;
+    state.activityLoading = false;
+    renderEvents(state);
+  } catch (error) {
+    if (epoch !== state.activityEpoch || state.clearing) return;
+    state.activityCursors = previous.cursors;
+    state.activityPageIndex = previous.index;
+    state.activityNextBeforeId = previous.next;
+    state.data.events = previous.events;
+    state.activityLoading = false;
+    renderEvents(state);
+    toast(error.message, true);
+  }
+}
 async function refresh() {
   // Never let a slow poll overlap another request and overwrite newer data.
   if (state.refreshing || state.clearing) return;
@@ -112,6 +178,15 @@ async function refresh() {
     if (!r.ok) throw new Error(await r.text());
     const data = await r.json();
     if (epoch !== state.refreshEpoch) return;
+    if (state.activityPageIndex === 0) {
+      data.events = (data.events || []).slice(-200);
+      const hasMore = data.events_has_more ?? data.events.length === 200;
+      state.activityNextBeforeId = hasMore ? data.events_next_before_id ?? data.events[0]?.id ?? null : null;
+      state.activityLoading = false;
+    } else {
+      // Poll live pool/inbox data without replacing the selected archive page.
+      data.events = state.data?.events || [];
+    }
     setCsrfToken(data.csrf_token);
     state.data = data;
     state.inboxLoading = false;
@@ -121,6 +196,7 @@ async function refresh() {
   } catch (e) {
     if (epoch !== state.refreshEpoch) return;
     state.inboxLoading = false;
+    if (state.activityPageIndex === 0) state.activityLoading = false;
     connection(false);
     $('#status').textContent = 'disconnected';
     toast(e.message, true);
@@ -135,7 +211,7 @@ async function refresh() {
 bindMenu({state, clearHistory});
 bindPools({state, terminate, selectPool});
 bindInbox({ackMessage, changePage});
-bindActivity({state, render, selectPool, toast});
+bindActivity({state, render, selectPool, toast, changeActivityPage});
 $('#send').onclick = send;
 function selectPool(pool) {
   clearSelection();

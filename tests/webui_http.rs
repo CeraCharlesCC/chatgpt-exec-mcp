@@ -67,6 +67,26 @@ impl Dashboard {
         response.json().await.unwrap()
     }
 
+    async fn events_page(&self, before_id: Option<u64>, limit: Option<usize>) -> Value {
+        let mut query = Vec::new();
+        if let Some(before_id) = before_id {
+            query.push(("before_id", before_id.to_string()));
+        }
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        let response = self
+            .client
+            .get(format!("{}/_admin/api/events", self.url))
+            .query(&query)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        response.json().await.unwrap()
+    }
+
     async fn post(&self, endpoint: &str, body: Value, status: StatusCode) -> Value {
         let token = self.snapshot().await["csrf_token"]
             .as_str()
@@ -359,6 +379,198 @@ async fn disabled_pool_snapshot_keeps_activity_and_rejects_controls() {
     assert_eq!(server.snapshot().await["events"], json!([]));
     let next_id = activity.emit("tool.start", "info", None, vec![], json!({}));
     assert_eq!(next_id, 2, "clearing must not reuse event IDs");
+}
+
+#[tokio::test]
+async fn activity_history_paginates_across_archive_and_memory_without_gaps() {
+    let activity = Arc::new(ActivityHub::new(500));
+    for id in 1..=2635 {
+        assert_eq!(
+            activity.emit("tool.finish", "info", None, vec![], json!({"sequence": id})),
+            id
+        );
+        // Mimic sustained activity rather than an instantaneous producer that
+        // intentionally overflows the archive's bounded pending-task queue.
+        if id % 250 == 0 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    }
+    let server = Dashboard::start(WebUiState::without_pool(activity.clone())).await;
+    let snapshot = server.snapshot().await;
+    let recent = snapshot["events"].as_array().unwrap();
+    assert_eq!(
+        recent.len(),
+        200,
+        "snapshots must never send over 200 events"
+    );
+    assert_eq!(recent[0]["id"], 2436);
+    assert_eq!(recent[199]["id"], 2635);
+    assert_eq!(snapshot["events_has_more"], true);
+    assert_eq!(snapshot["events_next_before_id"], 2436);
+
+    // The independent history endpoint must support a configurable page size,
+    // and even its first page must not return more than 200 rows.
+    let latest = server.events_page(None, None).await;
+    assert_eq!(latest["events"].as_array().unwrap().len(), 200);
+    let small = server.events_page(Some(2436), Some(5)).await;
+    let small_ids: Vec<u64> = small["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(small_ids, [2431, 2432, 2433, 2434, 2435]);
+    assert_eq!(small["next_before_id"], 2431);
+    assert_eq!(small["has_more"], true);
+
+    let mut newest_to_oldest = recent
+        .iter()
+        .rev()
+        .map(|event| event["id"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    let mut before_id = snapshot["events_next_before_id"].as_u64();
+    let mut page_count = 0;
+    while let Some(cursor) = before_id {
+        page_count += 1;
+        assert!(page_count <= 15, "pagination cursor did not terminate");
+        let page = server.events_page(Some(cursor), None).await;
+        let ids = page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["id"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!ids.is_empty());
+        assert!(ids.len() <= 200);
+        assert!(ids.iter().all(|&id| id < cursor));
+        assert!(ids.windows(2).all(|pair| pair[0] + 1 == pair[1]));
+        if page["has_more"] == true {
+            assert_eq!(page["next_before_id"], ids[0]);
+            before_id = Some(ids[0]);
+        } else {
+            assert!(page["next_before_id"].is_null());
+            before_id = None;
+        }
+        newest_to_oldest.extend(ids.into_iter().rev());
+    }
+
+    assert!(page_count >= 11, "older compressed chunks were not exposed");
+    assert!((2250..=2500).contains(&newest_to_oldest.len()));
+    assert_eq!(newest_to_oldest[0], 2635);
+    assert!(
+        newest_to_oldest
+            .windows(2)
+            .all(|pair| pair[0] == pair[1] + 1)
+    );
+
+    // CLEAR must invalidate both the RAM page and any pending/finished archive.
+    assert_eq!(
+        server.post("clear", json!({}), StatusCode::OK).await["cleared_events"],
+        newest_to_oldest.len()
+    );
+    assert_eq!(server.snapshot().await["events"], json!([]));
+    assert_eq!(server.events_page(None, None).await["events"], json!([]));
+    assert_eq!(
+        activity.emit("tool.start", "info", None, vec![], json!({})),
+        2636
+    );
+    assert_eq!(
+        server.events_page(None, None).await["events"][0]["id"],
+        2636
+    );
+}
+
+#[tokio::test]
+async fn unpaced_activity_burst_keeps_a_contiguous_bounded_suffix() {
+    const BURST: u64 = 3500;
+    let activity = Arc::new(ActivityHub::new(500));
+    // Deliberately outpace zstd: dropping pending chunks is allowed to keep
+    // MCP operations responsive, but history must not have internal holes.
+    for id in 1..=BURST {
+        activity.emit("tool.start", "info", None, vec![], json!({"sequence": id}));
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let server = Dashboard::start(WebUiState::without_pool(activity.clone())).await;
+    let mut newest_first = Vec::new();
+    let mut before_id = None;
+    for page_count in 0..15 {
+        let page = server.events_page(before_id, None).await;
+        let ids = page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["id"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!ids.is_empty(), "page {page_count} is unexpectedly empty");
+        assert!(ids.len() <= 200, "page {page_count} exceeds browser cap");
+        assert!(ids.windows(2).all(|pair| pair[0] + 1 == pair[1]));
+        if let Some(cursor) = before_id {
+            assert!(ids.iter().all(|&id| id < cursor));
+        }
+        newest_first.extend(ids.iter().rev().copied());
+        if page["has_more"] != true {
+            assert!(page["next_before_id"].is_null());
+            break;
+        }
+        assert_eq!(page["next_before_id"], ids[0]);
+        before_id = Some(ids[0]);
+        assert!(page_count < 14, "pagination never reached the oldest event");
+    }
+    assert_eq!(newest_first.first().copied(), Some(BURST));
+    assert!(!newest_first.is_empty() && newest_first.len() <= 2500);
+    assert!(
+        newest_first.windows(2).all(|pair| pair[0] == pair[1] + 1),
+        "dropping pending archives must not leave gaps behind a newer suffix"
+    );
+    assert_eq!(
+        server.post("clear", json!({}), StatusCode::OK).await["cleared_events"],
+        newest_first.len()
+    );
+    assert_eq!(server.events_page(None, None).await["events"], json!([]));
+}
+
+#[tokio::test]
+async fn history_endpoint_rejects_invalid_cursors_page_sizes_and_query_fields() {
+    let activity = Arc::new(ActivityHub::new(500));
+    for id in 1..=200 {
+        activity.emit("tool.start", "info", None, vec![], json!({"id":id}));
+    }
+    let server = Dashboard::start(WebUiState::without_pool(activity)).await;
+    let snapshot = server.snapshot().await;
+    assert_eq!(snapshot["events"].as_array().unwrap().len(), 200);
+    assert_eq!(snapshot["events_has_more"], false);
+    assert!(snapshot["events_next_before_id"].is_null());
+    let beyond = server.events_page(Some(1), Some(1)).await;
+    assert_eq!(beyond["events"], json!([]));
+    assert_eq!(beyond["has_more"], false);
+
+    for suffix in [
+        "?before_id=0",
+        "?before_id=-1",
+        "?before_id=not-a-number",
+        "?before_id=18446744073709551616",
+        "?limit=0",
+        "?limit=201",
+        "?limit=-1",
+        "?limit=1.5",
+        "?unrecognized=1",
+    ] {
+        let response = server
+            .client
+            .get(format!("{}/_admin/api/events{suffix}", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{suffix}");
+    }
+    let response = server
+        .client
+        .get(format!("{}/_admin/api/events", server.url))
+        .header("host", "example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -701,7 +913,7 @@ async fn clear_removes_all_history_and_only_the_current_accounts_admin_inbox() {
         )
         .await;
     let before = server.snapshot().await;
-    assert_eq!(before["events"].as_array().unwrap().len(), 400);
+    assert_eq!(before["events"].as_array().unwrap().len(), 200);
     assert_eq!(before["admin_messages"].as_array().unwrap().len(), 200);
     assert_eq!(
         server.post("clear", json!({}), StatusCode::OK).await,

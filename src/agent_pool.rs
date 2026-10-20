@@ -174,7 +174,7 @@ impl Communications {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AgentIdentity {
     pub pool: String,
     pub agent: String,

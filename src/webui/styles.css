@@ -321,6 +321,11 @@ input:focus,select:focus,textarea:focus {
 }
 .inbox-pagination button:disabled {opacity:.45;cursor:default}
 .inbox-pagination span {font-size:12px;color:var(--muted)}
+.activity-pagination:not([hidden]) {
+  padding:7px 10px;
+  border-top:1px solid var(--border);
+  background:var(--panel2)
+}
 .message {
   border:1px solid var(--border);
   border-radius:8px;

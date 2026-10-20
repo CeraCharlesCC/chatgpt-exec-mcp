@@ -100,12 +100,28 @@ struct SnapshotResponse {
     admin_messages: Vec<AdminMessage>,
     admin_messages_next_cursor: Option<String>,
     events: Vec<ActivityEvent>,
+    events_next_before_id: Option<u64>,
+    events_has_more: bool,
 }
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InboxQuery {
     cursor: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventsQuery {
+    before_id: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct EventsResponse {
+    events: Vec<ActivityEvent>,
+    next_before_id: Option<u64>,
+    has_more: bool,
 }
 
 #[derive(Deserialize)]
@@ -156,6 +172,7 @@ pub fn router(state: WebUiState) -> Router {
         .route("/", get(index))
         .route("/_admin/assets/{*path}", get(asset))
         .route("/_admin/api/snapshot", get(snapshot))
+        .route("/_admin/api/events", get(events))
         .route("/_admin/api/send", post(send))
         .route("/_admin/api/ack", post(ack))
         .route("/_admin/api/clear", post(clear))
@@ -270,6 +287,15 @@ async fn snapshot(
         .map(|(name, agents)| PoolSnapshot { name, agents })
         .collect();
 
+    // Sampling one extra *in-memory* event identifies an older page without
+    // decompressing archived chunks on the normal polling path.
+    let mut events = state.activity.snapshot(201);
+    let events_has_more = events.len() > 200;
+    if events_has_more {
+        events.remove(0);
+    }
+    let events_next_before_id = events_has_more.then(|| events[0].id);
+
     json_response(
         StatusCode::OK,
         &SnapshotResponse {
@@ -280,7 +306,44 @@ async fn snapshot(
             pools,
             admin_messages: page.messages,
             admin_messages_next_cursor: page.next_cursor,
-            events: state.activity.snapshot(400),
+            events,
+            events_next_before_id,
+            events_has_more,
+        },
+    )
+}
+
+async fn events(
+    State(state): State<WebUiState>,
+    headers: HeaderMap,
+    Query(query): Query<EventsQuery>,
+) -> Result<Response, WebError> {
+    validate_admin_host(&headers)?;
+    if query.before_id == Some(0) {
+        return Err(WebError::new(
+            StatusCode::BAD_REQUEST,
+            "before_id must be positive",
+        ));
+    }
+    let limit = query.limit.unwrap_or(200);
+    if !(1..=200).contains(&limit) {
+        return Err(WebError::new(
+            StatusCode::BAD_REQUEST,
+            "limit must be between 1 and 200",
+        ));
+    }
+    let hub = state.activity.clone();
+    // A history page may decompress a chunk or touch disk. Do not block a
+    // Tokio worker while it loads; snapshots never enter this path.
+    let page = tokio::task::spawn_blocking(move || hub.page(query.before_id, limit))
+        .await
+        .map_err(|_| WebError::new(StatusCode::INTERNAL_SERVER_ERROR, "could not load events"))?;
+    json_response(
+        StatusCode::OK,
+        &EventsResponse {
+            events: page.events,
+            next_before_id: page.next_before_id,
+            has_more: page.has_more,
         },
     )
 }

@@ -129,7 +129,9 @@ Use `/readyz` to check local readiness.
 With Unix Streamable HTTP enabled, `--webui-listen 127.0.0.1:19162` enables the
 optional debug WebUI. The address must be loopback. The WebUI port serves only
 the human administration surface; `/mcp` remains on the private Unix socket.
-Recent activity is kept in memory and is reset when core restarts.
+Recent activity history keeps up to 500 recent events in memory. On reaching 500,
+the oldest 250 move to an asynchronous, level-1 zstd-compressed temporary
+chunk (up to eight 250-event chunks).
 
 The Admin inbox provides an ACK button for each message. ACKed messages stay
 visible, including after a browser reload, until history is cleared or core
