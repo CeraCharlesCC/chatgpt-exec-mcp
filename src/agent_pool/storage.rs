@@ -26,9 +26,13 @@ const MAX_BATCH_COUNT: usize = 32;
 const MAX_BATCH_BYTES: usize = 128 * 1024;
 const MAX_MESSAGE_BYTES: usize = 65_536;
 const MAX_ADMIN_MESSAGES: i64 = 1_000;
+// Keep routine reads free of global cleanup. The detached maintenance loop
+// works in small transactions and releases its connection when the store dies.
+const EXPIRY_BATCH_SIZE: i64 = 128;
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(super) struct PoolStorage {
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
     lease_ttl_ms: i64,
     agent_names: Arc<[String]>,
     name_allocation: AgentNameAllocation,
@@ -114,6 +118,12 @@ impl PoolStorage {
 
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
+        let had_orphan_trigger: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+              WHERE type='trigger' AND name='inbox_reclaim_message')",
+            [],
+            |row| row.get(0),
+        )?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
@@ -135,6 +145,9 @@ impl PoolStorage {
                ON members(principal,pool,session);
              CREATE INDEX IF NOT EXISTS member_session_lookup
                ON members(principal,session,expires);
+             CREATE INDEX IF NOT EXISTS member_expiry ON members(expires);
+             CREATE INDEX IF NOT EXISTS member_pool_expiry
+               ON members(principal,pool,expires);
              CREATE TABLE IF NOT EXISTS messages (
                id TEXT PRIMARY KEY,
                principal TEXT NOT NULL,
@@ -153,6 +166,14 @@ impl PoolStorage {
              );
              CREATE INDEX IF NOT EXISTS inbox_member_cursor ON inbox(member_id,cursor);
              CREATE INDEX IF NOT EXISTS inbox_message_id ON inbox(message_id);
+             -- A message is durable until its last recipient has retired the
+             -- inbox row. Reclaim it on that specific deletion, not by scanning
+             -- all messages on every unrelated read.
+             CREATE TRIGGER IF NOT EXISTS inbox_reclaim_message AFTER DELETE ON inbox BEGIN
+               DELETE FROM messages WHERE id=OLD.message_id AND NOT EXISTS (
+                 SELECT 1 FROM inbox WHERE message_id=OLD.message_id
+               );
+             END;
              CREATE TABLE IF NOT EXISTS admin_messages (
                id TEXT PRIMARY KEY,
                principal TEXT NOT NULL,
@@ -242,9 +263,44 @@ impl PoolStorage {
             "UPDATE members SET offered_cursor=NULL WHERE offered_cursor IS NOT NULL",
             [],
         )?;
+        // One-time migration cleanup for orphan rows left by an older binary.
+        // Subsequent inbox changes reclaim messages incrementally via trigger,
+        // so reopening an already migrated DB must not rescan every message.
+        if !had_orphan_trigger {
+            prune_messages(&transaction)
+                .map_err(|_| anyhow::anyhow!("unable to prune orphan messages"))?;
+        }
         transaction.commit()?;
+        let connection = Arc::new(Mutex::new(connection));
+        let maintenance_connection = Arc::downgrade(&connection);
+        if let Err(error) = std::thread::Builder::new()
+            .name("pool-sqlite-maintenance".to_owned())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(MAINTENANCE_INTERVAL);
+                    let Some(connection) = maintenance_connection.upgrade() else {
+                        break;
+                    };
+                    let Ok(mut connection) = connection.lock() else {
+                        break;
+                    };
+                    let Ok(transaction) = connection.transaction() else {
+                        continue;
+                    };
+                    // A failed tick rolls back and retries at the next tick;
+                    // no open transaction or lock survives the sleep interval.
+                    if cleanup(&transaction, now_ms()).is_ok() {
+                        let _ = transaction.commit();
+                    }
+                }
+            })
+        {
+            // If the OS refuses another thread, writes still retire bounded
+            // expiries and pool_members resolves its own expiry revisions.
+            eprintln!("agent pool periodic maintenance unavailable: {error}");
+        }
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection,
             lease_ttl_ms,
             agent_names: agent_names.into(),
             name_allocation,
@@ -295,11 +351,12 @@ impl PoolStorage {
                 let mut statement = transaction
                     .prepare(
                         "SELECT id,offered_cursor FROM members
-                     WHERE principal=?1 AND session=?2 AND offered_cursor IS NOT NULL",
+                     WHERE principal=?1 AND session=?2 AND offered_cursor IS NOT NULL
+                       AND expires>?3",
                     )
                     .map_err(|_| storage_error())?;
                 statement
-                    .query_map(params![principal, session], |row| {
+                    .query_map(params![principal, session, now], |row| {
                         Ok((row.get(0)?, row.get(1)?))
                     })
                     .map_err(|_| storage_error())?
@@ -339,11 +396,10 @@ impl PoolStorage {
         transaction
             .execute(
                 "UPDATE members SET expires=?3,last_seen=?4
-                 WHERE principal=?1 AND session=?2",
+                 WHERE principal=?1 AND session=?2 AND expires>?4",
                 params![principal, session, now + self.lease_ttl_ms, now],
             )
             .map_err(|_| storage_error())?;
-        prune_messages(&transaction)?;
         transaction.commit().map_err(|_| storage_error())?;
         Ok(())
     }
@@ -373,7 +429,6 @@ impl PoolStorage {
         let now = now_ms();
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|_| storage_error())?;
-        cleanup(&transaction, now)?;
 
         let rows: Vec<(i64, i64, PeerMessage)> = {
             let mut statement = transaction
@@ -526,7 +581,6 @@ impl PoolStorage {
         let now = now_ms();
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|_| storage_error())?;
-        cleanup(&transaction, now)?;
         let identities = {
             let mut statement = transaction
                 .prepare(
@@ -555,7 +609,6 @@ impl PoolStorage {
         let now = now_ms();
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|_| storage_error())?;
-        cleanup(&transaction, now)?;
         let members = {
             let mut statement = transaction
                 .prepare(
@@ -610,7 +663,6 @@ impl PoolStorage {
         let now = now_ms();
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|_| storage_error())?;
-        cleanup(&transaction, now)?;
         let mut messages = {
             let mut statement = transaction.prepare(
                 "SELECT id,pool,sender,body,in_reply_to,created,acknowledged FROM admin_messages
@@ -803,17 +855,7 @@ impl PoolStorage {
         message: MemberMessage<'_>,
         targets: &[(i64, String)],
     ) -> Result<(Option<String>, Vec<String>), McpError> {
-        let pending: i64 = transaction
-            .query_row(
-                "SELECT (SELECT COUNT(*) FROM inbox) + (SELECT COUNT(*) FROM delivery_receipts)
-                     + (SELECT COUNT(*) FROM admin_messages WHERE acknowledged=0)",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| storage_error())?;
-        if pending + targets.len() as i64 > MAX_PENDING {
-            return Err(invalid("agent pool inbox is full; retry later"));
-        }
+        ensure_pending_capacity(transaction, targets.len(), message.created_ms)?;
         let recipients = targets
             .iter()
             .map(|(_, agent)| agent.clone())
@@ -870,11 +912,10 @@ impl PoolStorage {
         cleanup(&transaction, now)?;
         let deleted = transaction
             .execute(
-                "DELETE FROM members WHERE principal=?1 AND pool=?2 AND agent=?3",
-                params![principal, pool, agent],
+                "DELETE FROM members WHERE principal=?1 AND pool=?2 AND agent=?3 AND expires>?4",
+                params![principal, pool, agent, now],
             )
             .map_err(|_| storage_error())?;
-        prune_messages(&transaction)?;
         transaction.commit().map_err(|_| storage_error())?;
         Ok(deleted > 0)
     }
@@ -893,7 +934,10 @@ impl PoolStorage {
         let now = now_ms();
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|_| storage_error())?;
-        cleanup(&transaction, now)?;
+        // Waiting callers must observe expiry as a membership revision, even
+        // when no unrelated tool call commits or broadcasts a notification.
+        // This is pool-local and bounded; ordinary reads never prune messages.
+        expire_pool_members_batch(&transaction, principal, &args.pool, now)?;
         let members = {
             let mut statement = transaction
                 .prepare(
@@ -1010,7 +1054,6 @@ impl PoolStorage {
                 params![principal, pool, session],
             )
             .map_err(|_| storage_error())?;
-        prune_messages(&transaction)?;
         transaction.commit().map_err(|_| storage_error())?;
         Ok(PoolSendResult::default())
     }
@@ -1041,12 +1084,21 @@ impl PoolStorage {
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|_| storage_error())?;
         cleanup(&transaction, now)?;
+        // An expiry batch might be filled with unrelated pools. Never revive
+        // a stale session or leave its unique constraint blocking a new join.
+        transaction
+            .execute(
+                "DELETE FROM members WHERE principal=?1 AND pool=?2 AND session=?3
+                   AND expires<=?4",
+                params![principal, pool, session, now],
+            )
+            .map_err(|_| storage_error())?;
 
         let bound: Option<(i64, String)> = transaction
             .query_row(
                 "SELECT id,agent FROM members
-                 WHERE principal=?1 AND pool=?2 AND session=?3",
-                params![principal, pool, session],
+                 WHERE principal=?1 AND pool=?2 AND session=?3 AND expires>?4",
+                params![principal, pool, session, now],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
@@ -1067,7 +1119,7 @@ impl PoolStorage {
                     .as_ref()
                     .and_then(|cursors| cursors.get(&cursor_key).copied());
                 let (index, agent) =
-                    self.allocate_agent_name(&transaction, principal, pool, last_index)?;
+                    self.allocate_agent_name(&transaction, principal, pool, last_index, now)?;
                 transaction
                     .execute(
                         "INSERT INTO members(principal,pool,agent,session,expires,last_seen,generation)
@@ -1100,17 +1152,7 @@ impl PoolStorage {
             .map_err(|_| storage_error())?;
 
         if target == ADMIN_AGENT {
-            let pending: i64 = transaction
-                .query_row(
-                    "SELECT (SELECT COUNT(*) FROM inbox) + (SELECT COUNT(*) FROM delivery_receipts)
-                        + (SELECT COUNT(*) FROM admin_messages WHERE acknowledged=0)",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|_| storage_error())?;
-            if pending >= MAX_PENDING {
-                return Err(invalid("agent pool inbox is full; retry later"));
-            }
+            ensure_pending_capacity(&transaction, 1, now)?;
             let message_id = format!("msg_{}", Uuid::new_v4());
             transaction
                 .execute(
@@ -1191,22 +1233,29 @@ impl PoolStorage {
         principal: &str,
         pool: &str,
         last_index: Option<usize>,
+        now: i64,
     ) -> Result<(usize, String), McpError> {
         let start = last_index.map_or(0, |index| (index + 1) % self.agent_names.len());
         for offset in 0..self.agent_names.len() {
             let index = (start + offset) % self.agent_names.len();
             let candidate = &self.agent_names[index];
-            let occupied = transaction
+            let occupied: Option<(i64, i64)> = transaction
                 .query_row(
-                    "SELECT 1 FROM members WHERE principal=?1 AND pool=?2 AND agent=?3",
+                    "SELECT id,expires FROM members WHERE principal=?1 AND pool=?2 AND agent=?3",
                     params![principal, pool, candidate],
-                    |_| Ok(()),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
-                .map_err(|_| storage_error())?
-                .is_some();
-            if !occupied {
-                return Ok((index, candidate.clone()));
+                .map_err(|_| storage_error())?;
+            match occupied {
+                None => return Ok((index, candidate.clone())),
+                Some((member_id, expires)) if expires <= now => {
+                    transaction
+                        .execute("DELETE FROM members WHERE id=?1", [member_id])
+                        .map_err(|_| storage_error())?;
+                    return Ok((index, candidate.clone()));
+                }
+                Some(_) => {}
             }
         }
         Err(invalid("agent name dictionary is exhausted for this pool"))
@@ -1214,10 +1263,77 @@ impl PoolStorage {
 }
 
 fn cleanup(connection: &Connection, now: i64) -> Result<(), McpError> {
+    expire_members_batch(connection, now)?;
+    Ok(())
+}
+
+fn expire_members_batch(connection: &Connection, now: i64) -> Result<usize, McpError> {
+    // The expiry index permits one bounded pass per maintenance tick or write.
+    // Membership revision triggers and cascading inbox/message cleanup occur
+    // atomically as the expired rows are removed.
     connection
-        .execute("DELETE FROM members WHERE expires<=?1", [now])
+        .execute(
+            "DELETE FROM members WHERE id IN (
+               SELECT id FROM members WHERE expires<=?1
+               ORDER BY expires,id LIMIT ?2
+             )",
+            params![now, EXPIRY_BATCH_SIZE],
+        )
+        .map_err(|_| storage_error())
+}
+
+fn expire_pool_members_batch(
+    connection: &Connection,
+    principal: &str,
+    pool: &str,
+    now: i64,
+) -> Result<(), McpError> {
+    let has_expired: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM members
+             WHERE principal=?1 AND pool=?2 AND expires<=?3)",
+            params![principal, pool, now],
+            |row| row.get(0),
+        )
         .map_err(|_| storage_error())?;
-    prune_messages(connection)
+    if has_expired {
+        connection
+            .execute(
+                "DELETE FROM members WHERE id IN (
+                   SELECT id FROM members WHERE principal=?1 AND pool=?2 AND expires<=?3
+                   ORDER BY expires,id LIMIT ?4
+                 )",
+                params![principal, pool, now, EXPIRY_BATCH_SIZE],
+            )
+            .map_err(|_| storage_error())?;
+    }
+    Ok(())
+}
+
+fn ensure_pending_capacity(
+    connection: &Connection,
+    additional: usize,
+    now: i64,
+) -> Result<(), McpError> {
+    loop {
+        let pending: i64 = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM inbox) + (SELECT COUNT(*) FROM delivery_receipts)
+                     + (SELECT COUNT(*) FROM admin_messages WHERE acknowledged=0)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| storage_error())?;
+        if pending.saturating_add(additional as i64) <= MAX_PENDING {
+            return Ok(());
+        }
+        // Routine writes do a single bounded expiry batch. Only when stale
+        // inbox rows would incorrectly reject a valid send do we keep draining
+        // batches until capacity returns or no expired memberships remain.
+        if expire_members_batch(connection, now)? == 0 {
+            return Err(invalid("agent pool inbox is full; retry later"));
+        }
+    }
 }
 
 fn prune_messages(connection: &Connection) -> Result<(), McpError> {
@@ -1238,4 +1354,300 @@ fn agent_conflict() -> McpError {
         "Agent name is already active for another session in this pool",
         Some(json!({"reason":"agent_conflict"})),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn storage() -> (tempfile::TempDir, PoolStorage) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let storage = PoolStorage::open(
+            &directory.path().join("pool.sqlite3"),
+            Duration::from_secs(60),
+            vec!["alice".into(), "bob".into()],
+            AgentNameAllocation::FirstAvailable,
+        )
+        .unwrap();
+        (directory, storage)
+    }
+
+    fn insert_member(storage: &PoolStorage, pool: &str, session: &str, expires: i64) -> i64 {
+        let connection = storage.connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO members(principal,pool,agent,session,expires,last_seen,generation)
+                 VALUES('owner',?1,?2,?3,?4,?5,'gen')",
+                params![pool, session, session, expires, now_ms()],
+            )
+            .unwrap();
+        connection.last_insert_rowid()
+    }
+
+    #[test]
+    fn unrelated_expired_members_are_not_deleted_by_read_lookups() {
+        let (_directory, storage) = storage();
+        let expired_id = insert_member(&storage, "other", "alice", now_ms() - 1);
+        let selected_id = insert_member(&storage, "selected", "bob", now_ms() - 1);
+
+        assert!(
+            storage
+                .identities_for_session("owner", Some("alice"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(storage.admin_members("owner").unwrap().is_empty());
+        assert!(
+            storage
+                .admin_messages_page("owner", 10, None)
+                .unwrap()
+                .0
+                .messages
+                .is_empty()
+        );
+        assert!(
+            storage
+                .collect_tool_comms("owner", Some("alice"), None)
+                .unwrap()
+                .is_empty()
+        );
+
+        let before_revision: i64 = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM pool_revisions WHERE principal='owner' AND pool='selected'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let state = storage
+            .members_state(
+                "owner",
+                &PoolMembersArgs {
+                    pool: "selected".into(),
+                },
+                None,
+            )
+            .unwrap();
+        assert!(state.result.agents.is_empty());
+        assert_eq!(state.membership_revision, before_revision + 1);
+
+        let connection = storage.connection().unwrap();
+        assert!(
+            !connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM members WHERE id=?1)",
+                    [selected_id],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM members WHERE id=?1)",
+                    [expired_id],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn removing_last_inbox_recipient_immediately_reclaims_message() {
+        let (_directory, storage) = storage();
+        let alice = insert_member(&storage, "work", "alice", now_ms() + 60_000);
+        let bob = insert_member(&storage, "work", "bob", now_ms() + 60_000);
+        let connection = storage.connection().unwrap();
+        connection.execute("INSERT INTO messages(id,principal,pool,sender,target,body,created) VALUES('message','owner','work','alice','global','hello',?1)", [now_ms()]).unwrap();
+        for member_id in [alice, bob] {
+            connection
+                .execute(
+                    "INSERT INTO inbox(member_id,message_id) VALUES(?1,'message')",
+                    [member_id],
+                )
+                .unwrap();
+        }
+        connection
+            .execute("DELETE FROM inbox WHERE member_id=?1", [alice])
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE id='message'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        connection
+            .execute("DELETE FROM inbox WHERE member_id=?1", [bob])
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE id='message'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn expiration_cleanup_uses_index_without_scanning_members() {
+        let (_directory, storage) = storage();
+        let connection = storage.connection().unwrap();
+        let plan: Vec<String> = connection
+            .prepare("EXPLAIN QUERY PLAN SELECT id FROM members WHERE expires<=?1 ORDER BY expires LIMIT ?2")
+            .unwrap()
+            .query_map(params![now_ms(), 128], |row| row.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter().any(|detail| detail.contains("member_expiry")),
+            "expected expiration index, query plan: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("SCAN members")),
+            "unexpected full scan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn expiry_cleanup_is_bounded_and_advances_revision_across_batches() {
+        let (_directory, storage) = storage();
+        let now = now_ms();
+        let total = EXPIRY_BATCH_SIZE + 5;
+        for number in 0..total {
+            insert_member(&storage, "backlog", &format!("stale-{number}"), now - 1);
+        }
+        let connection = storage.connection().unwrap();
+        assert_eq!(
+            expire_members_batch(&connection, now).unwrap() as i64,
+            EXPIRY_BATCH_SIZE
+        );
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM members WHERE pool='backlog'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 5);
+        assert_eq!(expire_members_batch(&connection, now).unwrap(), 5);
+        assert_eq!(expire_members_batch(&connection, now).unwrap(), 0);
+        let revision: i64 = connection
+            .query_row(
+                "SELECT revision FROM pool_revisions WHERE principal='owner' AND pool='backlog'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision, 2 * total);
+    }
+
+    #[test]
+    fn expired_name_and_session_can_rejoin_behind_an_expiry_backlog() {
+        let (_directory, storage) = storage();
+        let now = now_ms();
+        for number in 0..EXPIRY_BATCH_SIZE {
+            insert_member(
+                &storage,
+                "backlog",
+                &format!("stale-{number}"),
+                now - 10_000,
+            );
+        }
+        insert_member(&storage, "work", "alice", now - 1);
+        let join = || PoolSendArgs {
+            pool: "work".into(),
+            target: Some("global".into()),
+            message: Some("join".into()),
+            in_reply_to: None,
+            action: None,
+        };
+        // A new session needs to reclaim an expired dictionary name after the
+        // bounded maintenance batch spent all its budget on unrelated pools.
+        let first = storage.send("owner", join(), Some("fresh")).unwrap();
+        assert_eq!(first.assigned_agent.as_deref(), Some("alice"));
+        // A reused session must also evict an expired same-session row before
+        // allocating. Otherwise the member_session unique key still blocks it.
+        insert_member(&storage, "other", "bob", now - 1);
+        for number in 0..EXPIRY_BATCH_SIZE {
+            insert_member(
+                &storage,
+                "backlog2",
+                &format!("stale-{number}"),
+                now - 10_000,
+            );
+        }
+        let second = storage
+            .send(
+                "owner",
+                PoolSendArgs {
+                    pool: "other".into(),
+                    ..join()
+                },
+                Some("bob"),
+            )
+            .unwrap();
+        assert_eq!(second.assigned_agent.as_deref(), Some("alice"));
+        let connection = storage.connection().unwrap();
+        let active: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM members WHERE session IN ('fresh','bob') AND expires>?1",
+                [now],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 2);
+    }
+
+    #[test]
+    fn idle_housekeeping_reclaims_expired_members_without_read_traffic() {
+        let (_directory, storage) = storage();
+        let expired_id = insert_member(&storage, "idle", "alice", now_ms() - 1);
+        {
+            let connection = storage.connection().unwrap();
+            connection
+                .execute("INSERT INTO messages(id,principal,pool,sender,target,body,created) VALUES('idle-message','owner','idle','bob','alice','unread',?1)", [now_ms()])
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO inbox(member_id,message_id) VALUES(?1,'idle-message')",
+                    [expired_id],
+                )
+                .unwrap();
+        }
+        // No storage calls occur during this interval: the worker is genuinely
+        // periodic, not a deferred cleanup callback on the next read.
+        std::thread::sleep(MAINTENANCE_INTERVAL + Duration::from_secs(1));
+        let connection = storage.connection().unwrap();
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM members WHERE pool='idle'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+        let orphan_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE id='idle-message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_count, 0);
+    }
 }

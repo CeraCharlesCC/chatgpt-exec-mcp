@@ -5,6 +5,9 @@ import { toast, setCover, connection, bindMenu } from './views/menu.js';
 import { renderEvents, bindActivity } from './views/activity.js';
 import { renderPools, bindPools } from './views/pools.js';
 import { renderInbox, bindInbox } from './views/inbox.js';
+import { hasPendingSends } from './model/events.js';
+
+const correlatedEvents = data => Array.isArray(data?.correlated_events) ? data.correlated_events.slice(0, 200) : [];
 
 async function clearHistory() {
   if (state.clearing || $('#clearCover').getAttribute('aria-expanded') !== 'true') return;
@@ -22,6 +25,7 @@ async function clearHistory() {
     if (!r.ok) throw new Error(await r.text());
     if (state.data) {
       state.data.events = [];
+      state.data.correlated_events = [];
       state.data.admin_messages = [];
       state.data.admin_messages_next_cursor = null;
     }
@@ -122,6 +126,7 @@ async function changeActivityPage(direction) {
     index: state.activityPageIndex,
     next: state.activityNextBeforeId,
     events: state.data.events,
+    correlated: state.data.correlated_events,
   };
   if (direction === 1 && state.activityNextBeforeId !== null) {
     state.activityCursors = state.activityCursors.slice(0, state.activityPageIndex + 1);
@@ -133,6 +138,7 @@ async function changeActivityPage(direction) {
 
   // Keep just the selected page in browser state, even while loading.
   state.data.events = [];
+  state.data.correlated_events = [];
   state.activityNextBeforeId = null;
   state.activityLoading = true;
   const epoch = ++state.activityEpoch;
@@ -154,6 +160,7 @@ async function changeActivityPage(direction) {
     if (epoch !== state.activityEpoch || state.clearing) return;
     if (!Array.isArray(page.events)) throw new Error('Invalid activity page response');
     state.data.events = page.events.slice(-200);
+    state.data.correlated_events = correlatedEvents(page);
     state.activityNextBeforeId = page.has_more ? page.next_before_id ?? null : null;
     state.activityLoading = false;
     renderEvents(state);
@@ -163,9 +170,35 @@ async function changeActivityPage(direction) {
     state.activityPageIndex = previous.index;
     state.activityNextBeforeId = previous.next;
     state.data.events = previous.events;
+    state.data.correlated_events = previous.correlated;
     state.activityLoading = false;
     renderEvents(state);
     toast(error.message, true);
+  }
+}
+
+async function reconcileArchivedActivity(refreshEpoch) {
+  // A delayed completion can arrive while a reader stays on an older page.
+  // Re-fetch only that page while it contains an unresolved send; this is one
+  // bounded lookup, never a download of unrelated history.
+  if (state.activityPageIndex === 0 || state.activityLoading ||
+    !hasPendingSends(state.data?.events || [], state.data?.correlated_events)) return;
+  const index = state.activityPageIndex, activityEpoch = state.activityEpoch;
+  const cursor = state.activityCursors[index];
+  if (cursor == null) return;
+  try {
+    const response = await fetchEvents(cursor);
+    if (!response.ok) return;
+    const page = await response.json();
+    if (refreshEpoch !== state.refreshEpoch || activityEpoch !== state.activityEpoch ||
+      state.clearing || state.activityPageIndex !== index || !Array.isArray(page.events)) return;
+    state.data.events = page.events.slice(-200);
+    state.data.correlated_events = correlatedEvents(page);
+    state.activityNextBeforeId = page.has_more ? page.next_before_id ?? null : null;
+    renderEvents(state);
+  } catch {
+    // Transient archival lookup failures leave the current page intact; retry
+    // on a later snapshot without clearing the reader's position or scroll.
   }
 }
 async function refresh() {
@@ -180,12 +213,14 @@ async function refresh() {
     if (epoch !== state.refreshEpoch) return;
     if (state.activityPageIndex === 0) {
       data.events = (data.events || []).slice(-200);
+      data.correlated_events = correlatedEvents(data);
       const hasMore = data.events_has_more ?? data.events.length === 200;
       state.activityNextBeforeId = hasMore ? data.events_next_before_id ?? data.events[0]?.id ?? null : null;
       state.activityLoading = false;
     } else {
       // Poll live pool/inbox data without replacing the selected archive page.
       data.events = state.data?.events || [];
+      data.correlated_events = state.data?.correlated_events || [];
     }
     setCsrfToken(data.csrf_token);
     state.data = data;
@@ -193,6 +228,7 @@ async function refresh() {
     connection(true);
     $('#status').textContent = `v${state.data.version} · up ${Math.floor(state.data.uptime_seconds / 60)}m`;
     render();
+    await reconcileArchivedActivity(epoch);
   } catch (e) {
     if (epoch !== state.refreshEpoch) return;
     state.inboxLoading = false;

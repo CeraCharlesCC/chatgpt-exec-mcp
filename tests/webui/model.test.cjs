@@ -1,9 +1,9 @@
 const {test, before} = require('node:test');
 const assert = require('node:assert/strict');
 
-let eventPools, isMessageEvent, eventIdentities, messages, coalesceMessages;
+let eventPools, isMessageEvent, eventIdentities, pageEventContext, messages, coalesceMessages;
 before(async () => {
-  ({eventPools, isMessageEvent, eventIdentities} = await import('../../src/webui/model/events.js'));
+  ({eventPools, isMessageEvent, eventIdentities, pageEventContext} = await import('../../src/webui/model/events.js'));
   ({messages, coalesceMessages} = await import('../../src/webui/model/messages.js'));
 });
 
@@ -181,4 +181,126 @@ test('event models correlate start and finish pools, agents, recipients and leav
   assert.equal(isMessageEvent(event(4, 'tool.start', {
     tool: 'pool_send', arguments: {pool: 'alpha', action: 'leave', message: 'not sent'},
   }), starts), false);
+});
+
+test('page correlation enriches selected sends without projecting off-page events or unrelated deliveries', () => {
+  const start = event(10, 'tool.start', {
+    tool: 'pool_send', arguments: {pool: 'beta', target: 'Bob', message: 'cross-page message'},
+  }, {session: 'sender-session'});
+  const finish = event(11, 'tool.finish', {
+    tool: 'pool_send', start_event_id: 10,
+    result: {value: {assigned_agent: 'Alice', message_id: 'msg-10', recipients: ['Bob']}},
+  });
+  const unrelated = event(12, 'tool.finish', {result: {peer_messages: [{
+    pool: 'beta', from: 'Ghost', to: 'Bob', message_id: 'ghost', message: 'not on this page',
+  }]}});
+
+  for (const [selected, counterparts] of [
+    [[start], [finish, unrelated]],
+    [[finish], [start, unrelated]],
+  ]) {
+    const context = pageEventContext(selected, counterparts);
+    assert.deepEqual(context.messageEvents.map(e => e.id),
+      selected[0] === start ? [start.id] : [finish.id, start.id],
+      'the selected finish may pull its off-page start, but off-page finishes are context only');
+    assert.equal(context.starts.get(start.id)?.id, start.id);
+    assert.equal(context.finishes.get(start.id)?.id, finish.id);
+    const rows = messages(context.messageEvents, context.finishes, [], []);
+    assert.deepEqual(rows.map(row => row.message), ['cross-page message']);
+    assert.match(rows[0].status, /Queued for 1 recipient/);
+  }
+});
+
+test('v1 lifecycle sends are authoritative and finish-only events render without legacy detail or a correlated start', () => {
+  const typedStart = event(40, 'tool.start', {
+    tool: 'pool_send', arguments: {pool: 'wrong', target: 'Nobody', message: 'spoofed legacy detail'},
+  }, {schema_version: 1, session: 'sender', lifecycle: {
+    type: 'message_send', phase: 'start', tool: 'pool_send',
+    message: {pool: 'beta', target: 'Bob', body: 'typed body', in_reply_to: 'thread', status: 'sending'},
+  }});
+  const typedFinish = event(41, 'tool.finish', {
+    start_event_id: 999, result: {value: {message_id: 'wrong', recipients: ['Nobody']}},
+  }, {schema_version: 1, session: 'recipient', lifecycle: {
+    type: 'message_send', phase: 'finish', tool: 'pool_send', start_event_id: 40,
+    message: {pool: 'beta', target: 'Bob', body: 'typed body', in_reply_to: 'thread',
+      from: 'Alice', message_id: 'correct', recipients: ['Bob'], status: 'queued'},
+  }});
+
+  const finishOnly = pageEventContext([typedFinish], []);
+  const shown = messages(finishOnly.messageEvents, finishOnly.finishes, [], [], finishOnly.starts);
+  assert.equal(shown.length, 1);
+  assert.equal(shown[0].key, 'send:40');
+  assert.equal(shown[0].message, 'typed body');
+  assert.equal(shown[0].from, 'Alice');
+  assert.equal(shown[0].message_id, 'correct');
+  assert.equal(shown[0].status, 'Queued for 1 recipient(s)');
+  assert.equal(shown[0].in_reply_to, 'thread');
+  assert.deepEqual([...eventPools(typedFinish, finishOnly.starts)], ['beta']);
+  assert.deepEqual(new Set(eventIdentities(typedFinish, finishOnly.starts, finishOnly.finishes)
+    .map(a => a.agent)), new Set(['Alice', 'Bob']));
+
+  const startOnly = pageEventContext([typedStart], [typedFinish]);
+  assert.deepEqual(messages(startOnly.messageEvents, startOnly.finishes, [], [], startOnly.starts)
+    .map(m => m.status), ['Queued for 1 recipient(s)']);
+  assert.deepEqual([...eventPools(typedStart, startOnly.starts)], ['beta']);
+
+  const failed = event(42, 'tool.error', {result: {value: {recipients: ['Nobody']}}}, {
+    schema_version: 1, lifecycle: {type: 'message_send', phase: 'error', tool: 'pool_send',
+      start_event_id: 40, message: {pool: 'beta', target: 'Bob', body: 'typed body',
+        status: 'failed', error: 'recipient unavailable'}},
+  });
+  const failedRows = messages([failed], new Map([[40, failed]]), [], []);
+  assert.equal(failedRows[0].status, 'Failed: recipient unavailable');
+  assert.equal(failedRows[0].message, 'typed body');
+
+  const legacyLookingV1 = event(50, 'tool.start', {
+    tool: 'pool_send', arguments: {pool: 'wrong', target: 'Nobody', message: 'not authoritative'},
+  }, {schema_version: 1, lifecycle: {type: 'tool', phase: 'start', tool: 'pool_send'}});
+  assert.equal(isMessageEvent(legacyLookingV1, new Map()), false);
+  assert.deepEqual(messages([legacyLookingV1], new Map(), [], []), []);
+});
+
+test('v1 typed peer messages and receipts supersede legacy detail for messages and filters', () => {
+  const typedPeer = {pool: 'beta', message_id: 'received', from: 'Alice', to: 'Bob', message: 'typed received'};
+  const legacyPeer = {pool: 'wrong', message_id: 'old', from: 'Ghost', to: 'Nobody', message: 'legacy received'};
+  const e = event(61, 'tool.finish', {
+    tool: 'pool_wait', result: {messages: [legacyPeer],
+      delivery_receipts: [{pool: 'wrong', to: 'Nobody'}]},
+  }, {schema_version: 1, session: 'bob-session', lifecycle: {
+    type: 'tool', phase: 'finish', tool: 'pool_wait', start_event_id: 60,
+    peer_messages: [typedPeer], delivery_receipts: [{pool: 'beta', to: 'Cara'}],
+  }});
+  assert.deepEqual(messages([e], new Map(), [], []).map(m => m.message), ['typed received']);
+  assert.deepEqual([...eventPools(e, new Map())], ['beta']);
+  assert.deepEqual(new Set(eventIdentities(e, new Map(), new Map()).map(x => x.agent)),
+    new Set(['Alice', 'Bob', 'Cara']));
+  const noTypedPeers = {...e, lifecycle: {...e.lifecycle, peer_messages: [], delivery_receipts: []}};
+  assert.equal(isMessageEvent(noTypedPeers, new Map()), false);
+  assert.deepEqual(messages([noTypedPeers], new Map(), [], []), []);
+});
+
+test('v1 non-message pool tools and leave events retain pool filters without parsing legacy arguments', () => {
+  const waitStart = event(70, 'tool.start', {arguments: {pool: 'wrong'}}, {
+    schema_version: 1, lifecycle: {type: 'tool', phase: 'start', tool: 'pool_wait', pool: 'beta'},
+  });
+  const waitFinish = event(71, 'tool.finish', {start_event_id: 999}, {
+    schema_version: 1, lifecycle: {type: 'tool', phase: 'finish', tool: 'pool_wait',
+      start_event_id: 70, pool: 'beta'},
+  });
+  const leave = event(72, 'tool.start', {tool: 'pool_send', arguments: {
+    pool: 'wrong', action: 'leave', message: 'not a send',
+  }}, {schema_version: 1, lifecycle: {type: 'tool', phase: 'start', tool: 'pool_send', pool: 'gamma'}});
+  assert.deepEqual([...eventPools(waitStart, new Map())], ['beta']);
+  assert.deepEqual([...eventPools(waitFinish, new Map())], ['beta']);
+  assert.deepEqual([...eventPools(leave, new Map())], ['gamma']);
+  assert.equal(isMessageEvent(leave, new Map()), false);
+  assert.deepEqual(messages([leave], new Map(), [], []), []);
+
+  // Admin messages have no tool lifecycle even when emitted with schema v1;
+  // their detail payload is still the agreed source of pool identity.
+  const admin = event(73, 'admin.message.send', {
+    pool: 'old-admin-pool', target: 'global', message: 'announcement', delivery_count: 0,
+  }, {schema_version: 1});
+  assert.deepEqual([...eventPools(admin, new Map())], ['old-admin-pool']);
+  assert.equal(messages([admin], new Map(), [], [])[0].pool, 'old-admin-pool');
 });

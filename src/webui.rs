@@ -100,6 +100,7 @@ struct SnapshotResponse {
     admin_messages: Vec<AdminMessage>,
     admin_messages_next_cursor: Option<String>,
     events: Vec<ActivityEvent>,
+    correlated_events: Vec<ActivityEvent>,
     events_next_before_id: Option<u64>,
     events_has_more: bool,
 }
@@ -120,6 +121,7 @@ struct EventsQuery {
 #[derive(Serialize)]
 struct EventsResponse {
     events: Vec<ActivityEvent>,
+    correlated_events: Vec<ActivityEvent>,
     next_before_id: Option<u64>,
     has_more: bool,
 }
@@ -262,11 +264,13 @@ async fn snapshot(
         Ok(context) => (
             context
                 .store()
-                .admin_members(context.principal())
+                .admin_members_async(context.principal())
+                .await
                 .map_err(pool_error)?,
             context
                 .store()
-                .admin_messages_page(context.principal(), 200, query.cursor.as_deref())
+                .admin_messages_page_async(context.principal(), 200, query.cursor.as_deref())
+                .await
                 .map_err(pool_error)?,
         ),
         Err(_) => (
@@ -287,14 +291,9 @@ async fn snapshot(
         .map(|(name, agents)| PoolSnapshot { name, agents })
         .collect();
 
-    // Sampling one extra *in-memory* event identifies an older page without
-    // decompressing archived chunks on the normal polling path.
-    let mut events = state.activity.snapshot(201);
-    let events_has_more = events.len() > 200;
-    if events_has_more {
-        events.remove(0);
-    }
-    let events_next_before_id = events_has_more.then(|| events[0].id);
+    // Snapshot pages and their bounded correlation metadata only touch RAM;
+    // no archive chunks are decompressed during normal polling.
+    let activity_page = state.activity.snapshot_page(200);
 
     json_response(
         StatusCode::OK,
@@ -306,9 +305,10 @@ async fn snapshot(
             pools,
             admin_messages: page.messages,
             admin_messages_next_cursor: page.next_cursor,
-            events,
-            events_next_before_id,
-            events_has_more,
+            events: activity_page.events,
+            correlated_events: activity_page.correlated_events,
+            events_next_before_id: activity_page.next_before_id,
+            events_has_more: activity_page.has_more,
         },
     )
 }
@@ -342,6 +342,7 @@ async fn events(
         StatusCode::OK,
         &EventsResponse {
             events: page.events,
+            correlated_events: page.correlated_events,
             next_before_id: page.next_before_id,
             has_more: page.has_more,
         },
@@ -359,13 +360,14 @@ async fn send(
     let context = state.pool_context()?;
     let result = context
         .store()
-        .admin_send(
+        .admin_send_async(
             context.principal(),
             &request.pool,
             &request.target,
             &request.message,
             request.in_reply_to.as_deref(),
         )
+        .await
         .map_err(pool_error)?;
     let agents = result
         .recipients
@@ -403,7 +405,8 @@ async fn ack(
     let context = state.pool_context()?;
     let acknowledged = context
         .store()
-        .admin_ack(context.principal(), &request.message_id)
+        .admin_ack_async(context.principal(), &request.message_id)
+        .await
         .map_err(pool_error)?;
     json_response(StatusCode::OK, &AckResponse { acknowledged })
 }
@@ -419,7 +422,8 @@ async fn clear(
     let cleared_admin_messages = match state.pool.as_ref() {
         Some(context) => context
             .store()
-            .admin_clear_messages(context.principal())
+            .admin_clear_messages_async(context.principal())
+            .await
             .map_err(pool_error)?,
         None => 0,
     };
@@ -444,7 +448,8 @@ async fn terminate(
     let context = state.pool_context()?;
     let terminated = context
         .store()
-        .admin_terminate(context.principal(), &request.pool, &request.agent)
+        .admin_terminate_async(context.principal(), &request.pool, &request.agent)
+        .await
         .map_err(pool_error)?;
     state.activity.emit(
         "admin.membership.terminate",

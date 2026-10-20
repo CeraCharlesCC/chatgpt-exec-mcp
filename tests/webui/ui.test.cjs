@@ -245,6 +245,10 @@ test('activity pages keep only 200 events and survive polling, filtering, and Ol
   secondPage[1] = {...fixture().events[1], id: 202, timestamp_ms: sample.timestamp_ms + 202,
     detail: {...fixture().events[1].detail, start_event_id: 201}};
   secondPage[2] = {...fixture().events[2], id: 203, timestamp_ms: sample.timestamp_ms + 203};
+  // Keep this pagination fixture settled: unresolved archived sends are tested
+  // separately and legitimately trigger a bounded correlation re-fetch.
+  secondPage[3] = {...fixture().events[3], id: 204, timestamp_ms: sample.timestamp_ms + 204,
+    detail: {...fixture().events[3].detail, start_event_id: 203}};
   const thirdPage = Array.from({length: 200}, (_, i) => event(i + 1));
   const requests = [];
   await page.route('**/_admin/api/events*', route => {
@@ -299,6 +303,204 @@ test('activity pages keep only 200 events and survive polling, filtering, and Ol
   assert.equal(await page.locator('#events > [data-key]').count(), 200);
   assert.deepEqual(requests, [{cursor: 401, limit: '200'}, {cursor: 201, limit: '200'},
     {cursor: 401, limit: '200'}]);
+});
+
+test('a delayed off-page finish updates a selected send without adding raw events or replacing the message body', async t => {
+  const data = fixture();
+  const [start, finish] = data.events.slice(2, 4);
+  data.events = [start];
+  data.correlated_events = [];
+  const {page, poll} = await open(t, data);
+  await page.selectOption('#activityFilter', 'messages');
+  const card = page.locator('[data-key="activity:message:send:3"]');
+  assert.match(await card.locator('.message-status').innerText(), /Sending/);
+  const body = card.locator('.message-body');
+  await body.evaluate(node => { node.scrollTop = 20; });
+
+  data.correlated_events = [finish];
+  await poll();
+  assert.match(await card.locator('.message-status').innerText(), /Queued for 1 recipient/);
+  assert.equal(await body.textContent(), start.detail.arguments.message);
+  assert.equal(await page.evaluate(() => state.data.events.length), 1);
+  assert.deepEqual(await page.evaluate(() => state.data.correlated_events.map(e => e.id)), [4]);
+  await page.selectOption('#activityPool', 'beta');
+  await page.selectOption('#activityAgent', 'Bob');
+  await page.selectOption('#activitySession', 'chat-beta');
+  assert.equal(await card.count(), 1, 'correlated finish provides recipient filter identity');
+  await page.selectOption('#activityAgent', '');
+  await page.selectOption('#activitySession', '');
+  await page.selectOption('#activityFilter', 'all');
+  await page.check('#groupTools');
+  assert.equal(await page.locator('[data-key="activity:event:group:3"]').count(), 1);
+  assert.match(await page.locator('.tool-group summary').innerText(), /In progress/);
+  await page.click('[data-view="logs"]');
+  assert.equal(await page.locator('#events .logline').count(), 1, 'correlated finish never becomes a raw log event');
+  assert.equal(await page.locator('[data-key="logs:event:4"]').count(), 0);
+});
+
+test('a finish-only page projects the off-page legacy send, while older page uses off-page completion', async t => {
+  const data = fixture();
+  const [start, finish] = data.events.slice(2, 4);
+  const unrelated = {...data.events[5], id: 99};
+  data.events = [finish];
+  data.correlated_events = [start, unrelated];
+  data.events_has_more = true;
+  data.events_next_before_id = 4;
+  const {page} = await open(t, data);
+  await page.route('**/_admin/api/events*', route => route.fulfill({json: {
+    events: [start], correlated_events: [finish, unrelated], next_before_id: null, has_more: false,
+  }}));
+  await page.selectOption('#activityFilter', 'messages');
+  const card = page.locator('[data-key="activity:message:send:3"]');
+  assert.equal(await card.count(), 1, 'finish-only page still displays original message');
+  assert.match(await card.innerText(), /first send/);
+  assert.match(await card.innerText(), /Queued for 1 recipient/);
+  assert.equal(await page.locator('#events .message-body', {hasText: 'beta incoming'}).count(), 0,
+    'unrelated correlated deliveries do not appear on this page');
+  await page.selectOption('#activityPool', 'beta');
+  await page.selectOption('#activityAgent', 'Bob');
+  assert.equal(await card.count(), 1, 'finish inherits off-page start pool and recipient');
+  await page.selectOption('#activityAgent', '');
+  await page.click('[data-view="logs"]');
+  assert.equal(await page.locator('#events .logline').count(), 1);
+  assert.equal(await page.locator('[data-key="logs:event:3"]').count(), 0);
+
+  await page.locator('#activityOlder').click();
+  await page.waitForFunction(() => !state.activityLoading && state.activityPageIndex === 1);
+  assert.deepEqual(await page.evaluate(() => state.data.events.map(e => e.id)), [3]);
+  await page.click('[data-view="activity"]');
+  await page.selectOption('#activityFilter', 'messages');
+  assert.equal(await card.count(), 1, 'start-only page projects completion from the other page');
+  assert.match(await card.innerText(), /Queued for 1 recipient/);
+  await page.click('[data-view="logs"]');
+  assert.equal(await page.locator('#events .logline').count(), 1);
+  assert.equal(await page.locator('[data-key="logs:event:4"]').count(), 0);
+});
+
+test('an archived pending send reconciles a delayed finish on polling without navigation or idle refetches', async t => {
+  const data = fixture();
+  const [start, finish] = data.events.slice(2, 4);
+  data.events = [{...data.events[0], id: 500, kind: 'unrelated.event'}];
+  data.correlated_events = [];
+  data.events_has_more = true;
+  data.events_next_before_id = 500;
+  const {page, poll} = await open(t, data);
+  let completed = false, archiveRequests = 0;
+  await page.route('**/_admin/api/events*', route => {
+    archiveRequests++;
+    return route.fulfill({json: {
+      events: [start], correlated_events: completed ? [finish] : [],
+      next_before_id: null, has_more: false,
+    }});
+  });
+  await page.locator('#activityOlder').click();
+  await page.waitForFunction(() => !state.activityLoading && state.activityPageIndex === 1);
+  await page.selectOption('#activityFilter', 'messages');
+  const card = page.locator('[data-key="activity:message:send:3"]');
+  assert.match(await card.locator('.message-status').innerText(), /Sending/);
+
+  completed = true;
+  await poll();
+  await page.waitForFunction(() => document.querySelector('[data-key="activity:message:send:3"] .message-status')?.textContent.includes('Queued'));
+  assert.equal(await page.locator('#activityPageLabel').innerText(), 'Page 2');
+  assert.ok(archiveRequests >= 2, 'poll fetched only the selected archived page to resolve pending send');
+  const requestsWhenResolved = archiveRequests;
+  await poll();
+  assert.equal(archiveRequests, requestsWhenResolved, 'resolved archived page no longer needs polling');
+  assert.deepEqual(await page.evaluate(() => state.data.events.map(e => e.id)), [3]);
+  await page.click('[data-view="logs"]');
+  assert.equal(await page.locator('#events .logline').count(), 1);
+});
+
+test('v1 finish-only messages and receives use typed lifecycle fields instead of misleading detail', async t => {
+  const data = fixture();
+  const typedFinish = {
+    ...data.events[3], schema_version: 1,
+    detail: {tool: 'pool_send', start_event_id: 1000,
+      result: {value: {assigned_agent: 'Ghost', message_id: 'wrong', recipients: ['Nobody']}}},
+    lifecycle: {type: 'message_send', phase: 'finish', tool: 'pool_send', start_event_id: 3, pool: 'beta',
+      message: {pool: 'beta', target: 'Bob', body: 'typed only <b>plain text</b>', from: 'Alice',
+        in_reply_to: 'original', message_id: 'typed-1', recipients: ['Bob'], status: 'queued'},
+      peer_messages: [{pool: 'beta', message_id: 'typed-2', from: 'Cara', to: 'Bob', message: 'typed incoming'}],
+    },
+  };
+  data.events = [typedFinish];
+  data.correlated_events = [];
+  const {page, poll} = await open(t, data);
+  await page.selectOption('#activityFilter', 'messages');
+  const card = page.locator('[data-key="activity:message:send:3"]');
+  assert.equal(await card.count(), 1);
+  assert.match(await card.innerText(), /Alice/);
+  assert.match(await card.innerText(), /typed only <b>plain text<\/b>/);
+  assert.match(await card.innerText(), /reply to original/);
+  assert.match(await card.innerText(), /Queued for 1 recipient/);
+  assert.match(await page.locator('#events').innerText(), /typed incoming/);
+  assert.doesNotMatch(await page.locator('#events').innerText(), /Ghost|Nobody|wrong/);
+  assert.equal(await page.locator('#events b').count(), 0);
+  await page.selectOption('#activityPool', 'beta');
+  await page.selectOption('#activityAgent', 'Alice');
+  assert.equal(await card.count(), 1, 'typed sender identity survives agent filter');
+  await page.selectOption('#activityAgent', 'Bob');
+  assert.equal(await card.count(), 1, 'typed recipient identity survives agent filter');
+  await page.selectOption('#activitySession', 'chat-beta');
+  assert.equal(await card.count(), 1);
+  await page.selectOption('#activitySession', '');
+
+  data.events = [{...typedFinish, kind: 'tool.error', level: 'error',
+    lifecycle: {...typedFinish.lifecycle, phase: 'error', message: {
+      ...typedFinish.lifecycle.message, status: 'failed', error: 'target no longer exists',
+    }}}];
+  await poll();
+  assert.match(await card.locator('.message-status').innerText(), /Failed: target no longer exists/);
+  await page.click('[data-view="logs"]');
+  assert.equal(await page.locator('#events .logline').count(), 1);
+});
+
+test('CLEAR discards an in-flight archived reconciliation and its paired events', async t => {
+  const data = fixture();
+  const [start, finish] = data.events.slice(2, 4);
+  data.events = [{...data.events[0], id: 500, kind: 'unrelated.event'}];
+  data.correlated_events = [];
+  data.events_has_more = true;
+  data.events_next_before_id = 500;
+  const {page} = await open(t, data);
+  let calls = 0, release, markRequested;
+  const gate = new Promise(resolve => { release = resolve; });
+  const requested = new Promise(resolve => { markRequested = resolve; });
+  await page.route('**/_admin/api/events*', async route => {
+    calls++;
+    if (calls === 1) return route.fulfill({json: {
+      events: [start], correlated_events: [], next_before_id: null, has_more: false,
+    }});
+    markRequested();
+    await gate;
+    return route.fulfill({json: {
+      events: [start], correlated_events: [finish], next_before_id: null, has_more: false,
+    }});
+  });
+  await page.locator('#activityOlder').click();
+  await page.waitForFunction(() => !state.activityLoading && state.activityPageIndex === 1);
+  await page.evaluate(() => { window.pendingRefresh = refresh(); });
+  await requested;
+  await page.route('**/_admin/api/clear', route => {
+    data.events = [];
+    data.correlated_events = [];
+    data.events_has_more = false;
+    data.events_next_before_id = null;
+    data.admin_messages = [];
+    return route.fulfill({json: {cleared_events: 10, cleared_admin_messages: 1}});
+  });
+  await page.locator('#menuToggle').click();
+  await page.locator('#clearCover').click();
+  await page.locator('#clearHistory').click();
+  await page.waitForFunction(() => !state.clearing && state.activityPageIndex === 0);
+  release();
+  await page.evaluate(() => window.pendingRefresh);
+  assert.deepEqual(await page.evaluate(() => ({
+    events: state.data.events, correlated: state.data.correlated_events,
+    page: state.activityPageIndex,
+  })), {events: [], correlated: [], page: 0});
+  assert.equal(await page.locator('#events > [data-key]').count(), 0);
 });
 
 test('stale snapshot cannot replace an older activity page', async t => {

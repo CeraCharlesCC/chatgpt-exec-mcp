@@ -133,6 +133,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let manager = ProcessManager::new(config)?;
     let reaper = manager.spawn_reaper();
     let mut server = ExecMcpServer::new(manager.clone());
+    // Diagnostics are an explicit consumer concern: stdio and MCP-only Unix
+    // listeners should not allocate history or inspect activity identities.
+    if args.webui_listen.is_some() {
+        server = server.with_activity_feed();
+    }
     if let Some((store, principal)) = agent_pool {
         server = server.with_agent_pool(store, principal);
     }

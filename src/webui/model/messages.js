@@ -1,8 +1,9 @@
-import { peerMessages } from './events.js';
+import { eventStartId, messageSend, peerMessages } from './events.js';
 
-export function messages(events, finishes, pools, adminMessages) {
+export function messages(events, finishes, pools, adminMessages, starts = new Map()) {
   const rows = [], received = new Set();
   const identities = (pools || []).flatMap(p => p.agents);
+  const selectedStarts = new Set(events.filter(e => e.kind === 'tool.start' && messageSend(e)).map(e => e.id));
   function receive(m, timestamp_ms, session, recipient) {
     const to = recipient || m.to;
     const key = JSON.stringify([m.pool, m.message_id, session || to]);
@@ -14,18 +15,34 @@ export function messages(events, finishes, pools, adminMessages) {
   }
   for (const e of events) {
     const d = e.detail || {};
-    if (e.kind === 'tool.start' && d.tool === 'pool_send' && typeof d.arguments?.message === 'string' && !d.arguments.action) {
-      const a = d.arguments, finish = finishes.get(e.id), result = finish?.detail?.result;
-      const from = result?.value?.assigned_agent ||
-        [...(finish?.agents || []), ...(e.agents || [])].find(x => x.pool === a.pool)?.agent ||
-        identities.find(x => x.pool === a.pool && x.session === e.session)?.agent || 'Agent';
-      const failed = finish?.kind === 'tool.error';
-      const agents = [from, a.target, ...(result?.value?.recipients || [])];
-      rows.push({...a, key: 'send:' + e.id, from, to: a.target, timestamp_ms: e.timestamp_ms,
-        kind: 'message.send', level: failed ? 'error' : 'info', message_id: result?.value?.message_id,
-        agents, sessions: e.session ? [e.session] : [], recipient_count: (result?.value?.recipients || []).length,
-        status: !finish ? 'Sending…' : failed ? `Failed: ${result?.error || 'Send failed'}` :
-          `Queued for ${(result?.value?.recipients || []).length} recipient(s)`});
+    const send = messageSend(e);
+    // A v1 finish is self-contained and may be the only selected page event.
+    // If its start is on the same page, render that single stable send row.
+    if (send && (e.kind === 'tool.start' ||
+      (e.schema_version === 1 && ['tool.finish', 'tool.error'].includes(e.kind) &&
+        !selectedStarts.has(eventStartId(e))))) {
+      const startId = e.kind === 'tool.start' ? e.id : eventStartId(e) ?? e.id;
+      const origin = e.kind === 'tool.start' ? e : starts.get(startId) || e;
+      const finish = e.kind === 'tool.start' ? finishes.get(e.id) : e;
+      const completed = messageSend(finish);
+      const result = finish?.schema_version === 1 ? null : finish?.detail?.result;
+      const payload = completed || send;
+      const pool = send.pool || payload.pool;
+      const recipients = completed?.recipients ?? result?.value?.recipients ?? [];
+      const from = completed?.from || send.from || result?.value?.assigned_agent ||
+        [...(finish?.agents || []), ...(e.agents || [])].find(x => x.pool === pool)?.agent ||
+        identities.find(x => x.pool === pool && x.session === origin.session)?.agent || 'Agent';
+      const status = completed?.status || (finish?.kind === 'tool.error' ? 'failed' : finish ? 'queued' : 'sending');
+      const failed = status === 'failed';
+      const agents = [from, send.target, ...recipients];
+      rows.push({...send, pool, key: 'send:' + startId, from, to: send.target,
+        timestamp_ms: origin.timestamp_ms, kind: 'message.send', level: failed ? 'error' : 'info',
+        message_id: completed?.message_id ?? result?.value?.message_id,
+        agents, sessions: [...new Set([origin.session, e.session].filter(Boolean))],
+        recipient_count: recipients.length,
+        status: status === 'sending' ? 'Sending…' : failed ?
+          `Failed: ${completed?.error || result?.error || 'Send failed'}` :
+          `Queued for ${recipients.length} recipient(s)`});
     }
     if (e.kind === 'admin.message.send') {
       const agents = ['admin', d.target, ...(e.agents || []).filter(a => a.pool === d.pool).map(a => a.agent)];

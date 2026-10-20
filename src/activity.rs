@@ -4,7 +4,7 @@
 //! read zstd chunks on demand; serialization and file I/O run on one background
 //! worker and never hold the activity mutex.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::TempDir;
 
-use crate::agent_pool::AgentIdentity;
+use crate::agent_pool::{AgentIdentity, PoolSendArgs};
 
 const RECENT_THRESHOLD: usize = 500;
 const SPILL_BATCH: usize = 250;
@@ -30,10 +30,137 @@ const MAX_SERIALIZED_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RETAINED_EVENTS: usize = 2_500;
 const MAX_PAGE_SIZE: usize = 200;
 
+/// New activity events carry an explicit schema discriminator; older archive
+/// records deserialize as version zero and keep their original `kind`/`detail`.
+const ACTIVITY_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityLifecycleType {
+    Tool,
+    MessageSend,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityPhase {
+    Start,
+    Finish,
+    Error,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityMessageStatus {
+    Sending,
+    Queued,
+    Failed,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ActivityMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipients: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ActivityMessageStatus>,
+}
+
+impl ActivityMessage {
+    /// Capture only when the diagnostic sink is enabled, without forcing
+    /// another JSON serialization or borrowing args after pool_send consumes them.
+    pub(crate) fn from_pool_send_args(args: &PoolSendArgs) -> Option<Self> {
+        if args.action.is_some() {
+            return None;
+        }
+        Some(Self {
+            pool: Some(args.pool.clone()),
+            target: Some(args.target.as_deref().unwrap_or("global").to_owned()),
+            body: Some(args.message.as_ref()?.clone()),
+            in_reply_to: args.in_reply_to.clone(),
+            ..Self::default()
+        })
+    }
+
+    fn from_start_detail(detail: &Value) -> Option<Self> {
+        let arguments = detail.get("arguments")?;
+        if arguments
+            .get("action")
+            .is_some_and(|action| !action.is_null())
+        {
+            return None;
+        }
+        let body = arguments.get("message")?.as_str()?.to_owned();
+        Some(Self {
+            pool: arguments
+                .get("pool")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            target: Some(
+                arguments
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or("global")
+                    .to_owned(),
+            ),
+            body: Some(body),
+            in_reply_to: arguments
+                .get("in_reply_to")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            ..Self::default()
+        })
+    }
+}
+
+/// Captured from tool arguments only for an opted-in activity consumer.
+/// The completion can then be rendered independently of the start row.
+#[derive(Default)]
+pub(crate) struct ActivityContext {
+    pub pool: Option<String>,
+    pub message: Option<ActivityMessage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ActivityLifecycle {
+    #[serde(rename = "type")]
+    pub event_type: ActivityLifecycleType,
+    pub phase: ActivityPhase,
+    pub tool: String,
+    /// Pool identity even when the matching start event is on another page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_event_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<ActivityMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peer_messages: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivery_receipts: Vec<Value>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ActivityEvent {
     pub id: u64,
     pub timestamp_ms: i64,
+    #[serde(default)]
+    pub schema_version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<ActivityLifecycle>,
     pub kind: String,
     pub level: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,6 +173,8 @@ pub struct ActivityEvent {
 #[derive(Debug, Serialize)]
 pub struct ActivityPage {
     pub events: Vec<ActivityEvent>,
+    /// Counterparts absent from `events`, bounded by this page's size.
+    pub correlated_events: Vec<ActivityEvent>,
     /// Exclusive cursor for the next older page, if any.
     pub next_before_id: Option<u64>,
     pub has_more: bool,
@@ -82,17 +211,88 @@ struct PendingChunk {
 }
 
 #[derive(Default)]
+struct CorrelationPair {
+    start: Option<ActivityEvent>,
+    completion: Option<ActivityEvent>,
+}
+
+#[derive(Default)]
 struct ActivityState {
     next_id: u64,
     generation: u64,
     recent: VecDeque<ActivityEvent>,
     pending: VecDeque<PendingChunk>,
     archived: VecDeque<ArchiveChunk>,
+    /// At most the bounded retained suffix, keyed by the start event ID.
+    /// Keeping these in RAM makes snapshot correlation independent of zstd I/O.
+    correlations: BTreeMap<u64, CorrelationPair>,
     archive_bytes: u64,
     shutdown: bool,
 }
 
 impl ActivityState {
+    fn oldest_retained_id(&self) -> Option<u64> {
+        self.archived
+            .front()
+            .map(|chunk| chunk.first_id)
+            .or_else(|| self.pending.front().map(|chunk| chunk.first_id))
+            .or_else(|| self.recent.front().map(|event| event.id))
+    }
+
+    fn trim_correlations(&mut self) {
+        let oldest = self.oldest_retained_id().unwrap_or(u64::MAX);
+        while self
+            .correlations
+            .first_key_value()
+            .is_some_and(|(&id, _)| id < oldest)
+            || self.correlations.len() > MAX_RETAINED_EVENTS
+        {
+            self.correlations.pop_first();
+        }
+    }
+
+    fn correlated_events(&self, events: &[ActivityEvent], limit: usize) -> Vec<ActivityEvent> {
+        let visible: HashSet<_> = events.iter().map(|event| event.id).collect();
+        let oldest = self.oldest_retained_id().unwrap_or(u64::MAX);
+        let mut seen = HashSet::new();
+        let mut matches = Vec::new();
+        for event in events {
+            let (start_id, wants_completion) = match event.kind.as_str() {
+                "tool.start" => (Some(event.id), true),
+                "tool.finish" | "tool.error" => (
+                    event
+                        .lifecycle
+                        .as_ref()
+                        .and_then(|lifecycle| lifecycle.start_event_id)
+                        .or_else(|| event.detail.get("start_event_id").and_then(Value::as_u64)),
+                    false,
+                ),
+                _ => (None, false),
+            };
+            let counterpart = start_id
+                .and_then(|id| self.correlations.get(&id))
+                .and_then(|pair| {
+                    if wants_completion {
+                        pair.completion.as_ref()
+                    } else {
+                        pair.start.as_ref()
+                    }
+                });
+            if let Some(counterpart) = counterpart
+                && counterpart.id >= oldest
+                && !visible.contains(&counterpart.id)
+                && seen.insert(counterpart.id)
+            {
+                matches.push(counterpart.clone());
+                if matches.len() >= limit {
+                    break;
+                }
+            }
+        }
+        matches.sort_by_key(|event| event.id);
+        matches
+    }
+
     fn retained_count(&self) -> usize {
         self.recent.len()
             + self
@@ -116,8 +316,150 @@ impl ActivityState {
             self.archive_bytes = self.archive_bytes.saturating_sub(oldest.file.bytes);
             evicted.push(oldest);
         }
+        self.trim_correlations();
         evicted
     }
+}
+
+/// `kind` and `detail` remain the legacy wire contract. New producers also
+/// record a typed lifecycle so consumers need not infer message state by
+/// examining adjacent events or digging through untyped tool result JSON.
+fn lifecycle_for_event(
+    kind: &str,
+    detail: &Value,
+    agents: &[AgentIdentity],
+    state: &ActivityState,
+    context: ActivityContext,
+) -> Option<ActivityLifecycle> {
+    let phase = match kind {
+        "tool.start" => ActivityPhase::Start,
+        "tool.finish" => ActivityPhase::Finish,
+        "tool.error" => ActivityPhase::Error,
+        _ => return None,
+    };
+    let tool = detail.get("tool")?.as_str()?.to_owned();
+    let start_event_id = detail.get("start_event_id").and_then(Value::as_u64);
+    let ActivityContext {
+        pool: pool_context,
+        message: message_context,
+    } = context;
+    let pool = pool_context
+        .or_else(|| {
+            message_context
+                .as_ref()
+                .and_then(|message| message.pool.clone())
+        })
+        .or_else(|| {
+            detail
+                .get("arguments")
+                .and_then(|arguments| arguments.get("pool"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            start_event_id
+                .and_then(|id| state.correlations.get(&id))
+                .and_then(|pair| pair.start.as_ref())
+                .and_then(|event| event.lifecycle.as_ref())
+                .and_then(|lifecycle| lifecycle.pool.clone())
+        });
+
+    let mut message = if tool == "pool_send" {
+        message_context.or_else(|| {
+            if phase == ActivityPhase::Start {
+                ActivityMessage::from_start_detail(detail)
+            } else {
+                start_event_id
+                    .and_then(|id| state.correlations.get(&id))
+                    .and_then(|pair| pair.start.as_ref())
+                    .and_then(|event| event.lifecycle.as_ref())
+                    .and_then(|lifecycle| lifecycle.message.clone())
+            }
+        })
+    } else {
+        None
+    };
+
+    if let Some(message) = message.as_mut() {
+        let result = detail.get("result");
+        let value = result.and_then(|result| result.get("value"));
+        // A successful first join may assign the sender's name in the result;
+        // otherwise use an already known member identity for this session.
+        if let Some(from) = value
+            .and_then(|value| value.get("assigned_agent"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                agents
+                    .iter()
+                    .find(|agent| message.pool.as_deref() == Some(agent.pool.as_str()))
+                    .map(|agent| agent.agent.as_str())
+            })
+        {
+            message.from = Some(from.to_owned());
+        }
+        if phase != ActivityPhase::Start {
+            message.message_id = value
+                .and_then(|value| value.get("message_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            message.recipients = value
+                .and_then(|value| value.get("recipients"))
+                .and_then(Value::as_array)
+                .map(|recipients| {
+                    recipients
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                });
+            if phase == ActivityPhase::Error {
+                message.error = result
+                    .and_then(|result| result.get("error"))
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        value
+                            .and_then(|value| value.get("error"))
+                            .and_then(Value::as_str)
+                    })
+                    .map(str::to_owned)
+                    .or_else(|| Some("Send failed".to_owned()));
+            }
+        }
+        message.status = Some(match phase {
+            ActivityPhase::Start => ActivityMessageStatus::Sending,
+            ActivityPhase::Finish => ActivityMessageStatus::Queued,
+            ActivityPhase::Error => ActivityMessageStatus::Failed,
+        });
+    }
+
+    let result = detail.get("result");
+    let result_value = result.and_then(|result| result.get("value"));
+    let array = |key: &str| {
+        result
+            .and_then(|result| result.get(key))
+            .or_else(|| result_value.and_then(|value| value.get(key)))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut peer_messages = array("peer_messages");
+    if peer_messages.is_empty() && tool == "pool_wait" {
+        peer_messages = array("messages");
+    }
+    Some(ActivityLifecycle {
+        event_type: if message.is_some() {
+            ActivityLifecycleType::MessageSend
+        } else {
+            ActivityLifecycleType::Tool
+        },
+        phase,
+        tool,
+        pool,
+        start_event_id,
+        message,
+        peer_messages,
+        delivery_receipts: array("delivery_receipts"),
+    })
 }
 
 #[derive(Default)]
@@ -143,6 +485,7 @@ fn lock_state(shared: &Shared) -> MutexGuard<'_, ActivityState> {
 }
 
 pub struct ActivityHub {
+    enabled: bool,
     shared: Arc<Shared>,
     capacity: usize,
     archive_dir: Option<TempDir>,
@@ -150,6 +493,25 @@ pub struct ActivityHub {
 }
 
 impl ActivityHub {
+    /// A no-op diagnostic sink for runs with no activity consumer. Callers
+    /// should check `is_enabled` before building JSON or fetching identities;
+    /// `emit` itself is also inert in case a call site does not check.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            shared: Arc::new(Shared::default()),
+            capacity: 0,
+            archive_dir: None,
+            worker: OnceLock::new(),
+        }
+    }
+
+    /// Whether diagnostics are being collected. This is immutable for a hub's
+    /// lifetime, so callers can cheaply skip diagnostic-only work.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.clamp(1, RECENT_THRESHOLD);
         // Small hubs retain their historical fixed-size ring-buffer behavior.
@@ -169,6 +531,7 @@ impl ActivityHub {
             None
         };
         Self {
+            enabled: true,
             shared: Arc::new(Shared::default()),
             capacity,
             archive_dir,
@@ -184,6 +547,32 @@ impl ActivityHub {
         agents: Vec<AgentIdentity>,
         detail: Value,
     ) -> u64 {
+        self.emit_with_context(
+            kind,
+            level,
+            session,
+            agents,
+            detail,
+            ActivityContext::default(),
+        )
+    }
+
+    /// In-flight pool calls carry their pool/message context to completion
+    /// without depending on a still-retained start event.
+    pub(crate) fn emit_with_context(
+        &self,
+        kind: impl Into<String>,
+        level: impl Into<String>,
+        session: Option<&str>,
+        agents: Vec<AgentIdentity>,
+        detail: Value,
+        context: ActivityContext,
+    ) -> u64 {
+        if !self.enabled {
+            // Zero is never a real event ID; no IDs, strings, or event state
+            // are allocated for a disabled sink.
+            return 0;
+        }
         let mut state = lock_state(&self.shared);
         // Allocation and insertion share the same lock so concurrent emitters
         // cannot put event IDs in a different order from their insertion order.
@@ -192,15 +581,41 @@ impl ActivityHub {
             .checked_add(1)
             .expect("activity event ID overflow");
         let id = state.next_id;
-        state.recent.push_back(ActivityEvent {
+        let kind = kind.into();
+        let lifecycle = lifecycle_for_event(&kind, &detail, &agents, &state, context);
+        let event = ActivityEvent {
             id,
             timestamp_ms: now_ms(),
-            kind: kind.into(),
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            lifecycle,
+            kind,
             level: level.into(),
             session: session.map(str::to_owned),
             agents,
             detail,
-        });
+        };
+        match event.kind.as_str() {
+            "tool.start"
+                if event.lifecycle.as_ref().is_some_and(|lifecycle| {
+                    lifecycle.event_type == ActivityLifecycleType::MessageSend
+                }) =>
+            {
+                state.correlations.entry(id).or_default().start = Some(event.clone());
+            }
+            "tool.finish" | "tool.error" => {
+                if let Some(start_id) = event
+                    .lifecycle
+                    .as_ref()
+                    .filter(|lifecycle| lifecycle.event_type == ActivityLifecycleType::MessageSend)
+                    .and_then(|lifecycle| lifecycle.start_event_id)
+                    && let Some(pair) = state.correlations.get_mut(&start_id)
+                {
+                    pair.completion = Some(event.clone());
+                }
+            }
+            _ => {}
+        }
+        state.recent.push_back(event);
 
         let mut spill = false;
         let mut evicted_pending = Vec::new();
@@ -266,6 +681,9 @@ impl ActivityHub {
     /// Only copy recent events. Polling and ordinary snapshots never open,
     /// decompress, or inspect the content of an archive file.
     pub fn snapshot(&self, limit: usize) -> Vec<ActivityEvent> {
+        if !self.enabled {
+            return Vec::new();
+        }
         let state = lock_state(&self.shared);
         let count = limit.min(state.recent.len());
         state
@@ -276,9 +694,47 @@ impl ActivityHub {
             .collect()
     }
 
+    /// An atomic recent-only snapshot with its linked but off-page endpoints.
+    /// Neither the page nor its correlation lookup touches compressed chunks.
+    pub fn snapshot_page(&self, limit: usize) -> ActivityPage {
+        if !self.enabled {
+            return ActivityPage {
+                events: Vec::new(),
+                correlated_events: Vec::new(),
+                next_before_id: None,
+                has_more: false,
+            };
+        }
+        let state = lock_state(&self.shared);
+        let limit = limit.clamp(1, MAX_PAGE_SIZE);
+        let count = limit.min(state.recent.len());
+        let events: Vec<_> = state
+            .recent
+            .iter()
+            .skip(state.recent.len() - count)
+            .cloned()
+            .collect();
+        let has_more = state.recent.len() > count;
+        let correlated_events = state.correlated_events(&events, limit);
+        ActivityPage {
+            next_before_id: has_more.then(|| events[0].id),
+            events,
+            correlated_events,
+            has_more,
+        }
+    }
+
     /// Fetch up to 200 events older than the exclusive ID cursor.
     /// Compressed chunks are opened only when newer RAM data is insufficient.
     pub fn page(&self, before_id: Option<u64>, limit: usize) -> ActivityPage {
+        if !self.enabled {
+            return ActivityPage {
+                events: Vec::new(),
+                correlated_events: Vec::new(),
+                next_before_id: None,
+                has_more: false,
+            };
+        }
         let limit = limit.clamp(1, MAX_PAGE_SIZE);
         let cutoff = before_id.unwrap_or(u64::MAX);
         let (generation, recent, pending, archived) = {
@@ -348,9 +804,11 @@ impl ActivityHub {
         }
 
         // A page that raced CLEAR must not surface the pre-clear generation.
-        if lock_state(&self.shared).generation != generation {
+        let state = lock_state(&self.shared);
+        if state.generation != generation {
             return ActivityPage {
                 events: Vec::new(),
+                correlated_events: Vec::new(),
                 next_before_id: None,
                 has_more: false,
             };
@@ -364,8 +822,10 @@ impl ActivityHub {
             None
         };
         newest_first.reverse();
+        let correlated_events = state.correlated_events(&newest_first, limit);
         ActivityPage {
             events: newest_first,
+            correlated_events,
             next_before_id,
             has_more,
         }
@@ -374,12 +834,16 @@ impl ActivityHub {
     /// Discard all active, pending, and archived history without reusing IDs.
     /// In-flight worker results carry a generation and cannot resurrect CLEAR.
     pub fn clear(&self) -> usize {
+        if !self.enabled {
+            return 0;
+        }
         let mut state = lock_state(&self.shared);
         state.generation = state.generation.wrapping_add(1);
         let count = state.retained_count();
         let recent = std::mem::take(&mut state.recent);
         let pending = std::mem::take(&mut state.pending);
         let archived = std::mem::take(&mut state.archived);
+        state.correlations.clear();
         state.archive_bytes = 0;
         drop(state);
         drop((recent, pending, archived)); // includes unlinking archived files
@@ -390,6 +854,9 @@ impl ActivityHub {
 
 impl Drop for ActivityHub {
     fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
         {
             let mut state = lock_state(&self.shared);
             state.shutdown = true;
@@ -586,6 +1053,77 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn disabled_sink_emits_no_history_and_allocates_no_archive() {
+        let hub = ActivityHub::disabled();
+        assert!(!hub.is_enabled());
+        assert!(hub.archive_dir.is_none());
+        assert!(hub.worker.get().is_none());
+
+        for _ in 0..1_000 {
+            assert_eq!(
+                hub.emit(
+                    "tool.start",
+                    "info",
+                    Some("session"),
+                    vec![],
+                    json!({"large":"value"})
+                ),
+                0
+            );
+        }
+        assert!(hub.snapshot(200).is_empty());
+        for before in [None, Some(1), Some(u64::MAX)] {
+            let page = hub.page(before, 200);
+            assert!(page.events.is_empty());
+            assert_eq!(page.next_before_id, None);
+            assert!(!page.has_more);
+        }
+        assert_eq!(hub.clear(), 0);
+        assert_eq!(hub.emit("after-clear", "info", None, vec![], json!({})), 0);
+        assert!(hub.worker.get().is_none());
+        let state = lock_state(&hub.shared);
+        assert_eq!(state.next_id, 0);
+        assert!(state.recent.is_empty());
+        assert!(state.pending.is_empty());
+        assert!(state.archived.is_empty());
+    }
+
+    #[test]
+    fn disabled_sink_skips_argument_conversion_and_enabled_history_is_unchanged() {
+        struct UnexpectedStringConversion;
+        impl From<UnexpectedStringConversion> for String {
+            fn from(_: UnexpectedStringConversion) -> Self {
+                panic!("disabled activity should never convert event labels")
+            }
+        }
+
+        let disabled = ActivityHub::disabled();
+        assert_eq!(
+            disabled.emit(
+                UnexpectedStringConversion,
+                UnexpectedStringConversion,
+                None,
+                vec![],
+                json!({})
+            ),
+            0
+        );
+        let enabled = ActivityHub::new(500);
+        assert!(enabled.is_enabled());
+        assert!(enabled.archive_dir.is_some());
+        emit(&enabled, 500);
+        await_archive(&enabled);
+        assert_eq!(
+            history_newest_first(&enabled),
+            (1..=500).rev().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            enabled.emit("continued", "info", None, vec![], json!({})),
+            501
+        );
+    }
 
     fn emit(hub: &ActivityHub, count: usize) {
         for n in 0..count {
@@ -866,5 +1404,225 @@ mod tests {
         drop(state);
         drop(evicted);
         assert!(bytes > 0);
+    }
+
+    #[test]
+    fn typed_message_lifecycle_preserves_legacy_fields_and_is_self_contained() {
+        let hub = ActivityHub::new(3);
+        let args: PoolSendArgs = serde_json::from_value(json!({
+            "pool":"team", "target":"Bob", "message":"hello", "in_reply_to":"m0"
+        }))
+        .unwrap();
+        let message_context = ActivityMessage::from_pool_send_args(&args).unwrap();
+        let start = hub.emit(
+            "tool.start",
+            "info",
+            Some("session"),
+            vec![],
+            json!({"tool":"pool_send", "arguments":args}),
+        );
+        let begin = hub.snapshot(1).pop().unwrap();
+        assert_eq!(begin.schema_version, 1);
+        assert_eq!(begin.detail["arguments"]["message"], "hello");
+        assert_eq!(
+            begin.lifecycle.as_ref().unwrap().event_type,
+            ActivityLifecycleType::MessageSend
+        );
+        assert_eq!(
+            begin
+                .lifecycle
+                .as_ref()
+                .unwrap()
+                .message
+                .as_ref()
+                .unwrap()
+                .status,
+            Some(ActivityMessageStatus::Sending)
+        );
+
+        // Evict the start: finish must still contain its own complete message.
+        for _ in 0..3 {
+            hub.emit("noise", "info", None, vec![], json!({}));
+        }
+        let finish = hub.emit_with_context(
+            "tool.finish",
+            "info",
+            Some("session"),
+            vec![],
+            json!({"tool":"pool_send", "start_event_id": start,
+                "result":{"value":{"assigned_agent":"Alice", "message_id":"m1",
+                    "recipients":["Bob"]}, "delivery_receipts":[{"pool":"team", "to":"Bob"}]}}),
+            ActivityContext {
+                pool: Some("team".to_owned()),
+                message: Some(message_context),
+            },
+        );
+        let event = hub.snapshot(1).pop().unwrap();
+        assert_eq!(event.id, finish);
+        assert_eq!(event.kind, "tool.finish");
+        assert_eq!(event.detail["start_event_id"], start);
+        let lifecycle = event.lifecycle.unwrap();
+        assert_eq!(lifecycle.event_type, ActivityLifecycleType::MessageSend);
+        assert_eq!(lifecycle.phase, ActivityPhase::Finish);
+        assert_eq!(lifecycle.start_event_id, Some(start));
+        assert_eq!(lifecycle.delivery_receipts.len(), 1);
+        let message = lifecycle.message.unwrap();
+        assert_eq!(message.status, Some(ActivityMessageStatus::Queued));
+        assert_eq!(message.pool.as_deref(), Some("team"));
+        assert_eq!(message.target.as_deref(), Some("Bob"));
+        assert_eq!(message.body.as_deref(), Some("hello"));
+        assert_eq!(message.in_reply_to.as_deref(), Some("m0"));
+        assert_eq!(message.from.as_deref(), Some("Alice"));
+        assert_eq!(message.message_id.as_deref(), Some("m1"));
+        assert_eq!(message.recipients, Some(vec!["Bob".to_owned()]));
+        // A completion referring to a non-retained start must not resurrect it.
+        assert!(hub.snapshot_page(3).correlated_events.is_empty());
+    }
+
+    #[test]
+    fn typed_message_error_and_tool_receives_use_explicit_lifecycle() {
+        let hub = ActivityHub::new(12);
+        let start = hub.emit("tool.start", "info", None, vec![],
+            json!({"tool":"pool_send", "arguments":{"pool":"team", "target":"Bob", "message":"hi"}}));
+        hub.emit(
+            "tool.error",
+            "error",
+            None,
+            vec![],
+            json!({"tool":"pool_send", "start_event_id":start, "result":{"error":"not allowed"}}),
+        );
+        let failed = hub.snapshot(1).pop().unwrap();
+        let lifecycle = failed.lifecycle.unwrap();
+        assert_eq!(lifecycle.phase, ActivityPhase::Error);
+        let message = lifecycle.message.unwrap();
+        assert_eq!(message.status, Some(ActivityMessageStatus::Failed));
+        assert_eq!(message.error.as_deref(), Some("not allowed"));
+        assert_eq!(message.body.as_deref(), Some("hi"));
+
+        hub.emit("tool.finish", "info", None, vec![],
+            json!({"tool":"pool_wait", "start_event_id":123,
+                "result":{"messages":[{"message_id":"m2", "pool":"team", "from":"Bob", "to":"Alice"}],
+                    "delivery_receipts":[{"message_id":"m1", "pool":"team", "to":"Bob"}]}}));
+        let lifecycle = hub.snapshot(1).pop().unwrap().lifecycle.unwrap();
+        assert_eq!(lifecycle.event_type, ActivityLifecycleType::Tool);
+        assert_eq!(lifecycle.peer_messages[0]["message_id"], "m2");
+        assert_eq!(lifecycle.delivery_receipts[0]["message_id"], "m1");
+
+        hub.emit(
+            "tool.start",
+            "info",
+            None,
+            vec![],
+            json!({"tool":"pool_send", "arguments":{"pool":"team", "action":"leave"}}),
+        );
+        assert_eq!(
+            hub.snapshot(1)[0].lifecycle.as_ref().unwrap().event_type,
+            ActivityLifecycleType::Tool
+        );
+    }
+
+    #[test]
+    fn legacy_activity_fixture_deserializes_and_retains_untyped_fields() {
+        let legacy = json!({"id":3, "timestamp_ms":42, "kind":"tool.start", "level":"info",
+            "session":"old", "agents":[], "detail":{"tool":"pool_send", "arguments":{"message":"hi"}}});
+        let parsed: ActivityEvent = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(parsed.schema_version, 0);
+        assert!(parsed.lifecycle.is_none());
+        assert_eq!(parsed.kind, "tool.start");
+        assert_eq!(parsed.detail, legacy["detail"]);
+    }
+
+    #[test]
+    fn cross_page_correlation_is_bounded_deduplicated_and_cleared() {
+        let hub = ActivityHub::new(10);
+        let start = hub.emit(
+            "tool.start",
+            "info",
+            None,
+            vec![],
+            json!({"tool":"pool_send", "arguments":{"pool":"team", "message":"a"}}),
+        );
+        for _ in 0..8 {
+            hub.emit("unrelated", "info", None, vec![], json!({}));
+        }
+        let finish = hub.emit("tool.finish", "info", None, vec![],
+            json!({"tool":"pool_send", "start_event_id": start, "result":{"value":{"recipients":[]}}}));
+        let latest = hub.snapshot_page(4);
+        assert_eq!(latest.events.len(), 4);
+        assert_eq!(
+            latest
+                .correlated_events
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![start]
+        );
+        let older = hub.page(Some(3), 2);
+        assert_eq!(
+            older.events.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            older
+                .correlated_events
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![finish]
+        );
+        let full = hub.snapshot_page(10);
+        assert!(
+            full.correlated_events.is_empty(),
+            "same-page counterparts must not be repeated"
+        );
+        assert_eq!(hub.clear(), 10);
+        assert!(hub.snapshot_page(10).correlated_events.is_empty());
+        assert!(hub.page(None, 10).correlated_events.is_empty());
+        assert!(lock_state(&hub.shared).correlations.is_empty());
+        assert_eq!(hub.emit("new", "info", None, vec![], json!({})), finish + 1);
+    }
+
+    #[test]
+    fn archived_counterparts_are_available_without_snapshot_disk_reads() {
+        let hub = ActivityHub::new(500);
+        let start = hub.emit(
+            "tool.start",
+            "info",
+            None,
+            vec![],
+            json!({"tool":"pool_send", "arguments":{"pool":"team", "message":"a"}}),
+        );
+        for _ in 0..498 {
+            hub.emit("unrelated", "info", None, vec![], json!({}));
+        }
+        let finish = hub.emit("tool.finish", "info", None, vec![],
+            json!({"tool":"pool_send", "start_event_id":start, "result":{"value":{"recipients":[]}}}));
+        await_archive(&hub);
+        assert_eq!(
+            hub.snapshot_page(200)
+                .correlated_events
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![start]
+        );
+        // Compressed start is readable by the history route, and it can link
+        // forward into the in-memory finish without paging in the browser.
+        assert_eq!(
+            hub.page(Some(2), 1)
+                .correlated_events
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![finish]
+        );
+
+        // Advance beyond the retained suffix: the old start cannot reappear.
+        for i in 0..3500 {
+            hub.emit("unrelated", "info", None, vec![], json!({"i":i}));
+        }
+        await_archive(&hub);
+        assert!(lock_state(&hub.shared).correlations.len() <= MAX_RETAINED_EVENTS);
+        assert!(hub.snapshot_page(200).correlated_events.is_empty());
     }
 }

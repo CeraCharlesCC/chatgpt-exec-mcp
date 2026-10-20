@@ -481,6 +481,77 @@ async fn activity_history_paginates_across_archive_and_memory_without_gaps() {
 }
 
 #[tokio::test]
+async fn activity_http_pages_return_only_missing_counterparts_and_clear_them() {
+    let activity = Arc::new(ActivityHub::new(500));
+    let start = activity.emit(
+        "tool.start",
+        "info",
+        Some("session"),
+        vec![],
+        json!({"tool":"pool_send", "arguments":{"pool":"team", "target":"bob", "message":"hi"}}),
+    );
+    for _ in 0..498 {
+        activity.emit("noise", "info", None, vec![], json!({}));
+    }
+    let finish = activity.emit(
+        "tool.finish",
+        "info",
+        Some("session"),
+        vec![],
+        json!({"tool":"pool_send", "start_event_id":start,
+            "result":{"value":{"assigned_agent":"alice", "message_id":"m1", "recipients":["bob"]}}}),
+    );
+    let server = Dashboard::start(WebUiState::without_pool(activity)).await;
+
+    let snapshot = server.snapshot().await;
+    assert_eq!(snapshot["events"].as_array().unwrap().len(), 200);
+    assert_eq!(snapshot["events"][199]["id"], finish);
+    assert_eq!(snapshot["correlated_events"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["correlated_events"][0]["id"], start);
+    assert_eq!(snapshot["correlated_events"][0]["schema_version"], 1);
+    assert_eq!(
+        snapshot["correlated_events"][0]["lifecycle"]["type"],
+        "message_send"
+    );
+    assert_eq!(
+        snapshot["events"][199]["lifecycle"]["message"]["status"],
+        "queued"
+    );
+    assert_eq!(
+        snapshot["events"][199]["lifecycle"]["message"]["body"],
+        "hi"
+    );
+    assert_eq!(
+        snapshot["events"][199]["lifecycle"]["message"]["from"],
+        "alice"
+    );
+
+    // A one-row page obtains one missing counterpart; links never pollute
+    // normal events, inflate the cursor, or expand into full-history loads.
+    let latest = server.events_page(None, Some(1)).await;
+    assert_eq!(latest["events"].as_array().unwrap().len(), 1);
+    assert_eq!(latest["events"][0]["id"], finish);
+    assert_eq!(latest["next_before_id"], finish);
+    assert_eq!(latest["correlated_events"].as_array().unwrap().len(), 1);
+    assert_eq!(latest["correlated_events"][0]["id"], start);
+
+    let oldest = server.events_page(Some(start + 1), Some(1)).await;
+    assert_eq!(oldest["events"][0]["id"], start);
+    assert_eq!(oldest["correlated_events"].as_array().unwrap().len(), 1);
+    assert_eq!(oldest["correlated_events"][0]["id"], finish);
+
+    assert_eq!(
+        server.post("clear", json!({}), StatusCode::OK).await["cleared_events"],
+        500
+    );
+    assert_eq!(server.snapshot().await["correlated_events"], json!([]));
+    assert_eq!(
+        server.events_page(None, Some(1)).await["correlated_events"],
+        json!([])
+    );
+}
+
+#[tokio::test]
 async fn unpaced_activity_burst_keeps_a_contiguous_bounded_suffix() {
     const BURST: u64 = 3500;
     let activity = Arc::new(ActivityHub::new(500));

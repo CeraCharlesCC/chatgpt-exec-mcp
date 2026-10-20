@@ -12,7 +12,7 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
-use crate::activity::ActivityHub;
+use crate::activity::{ActivityContext, ActivityHub, ActivityMessage};
 use crate::agent_pool::{
     AgentIdentity, AgentPoolStore, Communications, PoolMembersArgs, PoolMembersResult,
     PoolSendArgs, PoolSendResult, PoolWaitArgs, PoolWaitResult, SessionTurn,
@@ -41,7 +41,7 @@ impl ExecMcpServer {
             manager,
             tool_router,
             agent_pool: None,
-            activity: Arc::new(ActivityHub::new(500)),
+            activity: Arc::new(ActivityHub::disabled()),
             strict_http: false,
         }
     }
@@ -53,6 +53,17 @@ impl ExecMcpServer {
         self.tool_router.enable_route("pool_members");
         self.tool_router.enable_route("pool_send");
         self.tool_router.enable_route("pool_wait");
+        self
+    }
+
+    /// Enable the optional diagnostic activity feed, including its historical
+    /// 500-event in-memory window and compressed history. Without this opt-in,
+    /// MCP-only runs avoid diagnostic allocations and database identity reads.
+    /// Repeated calls preserve any already collected activity history.
+    pub fn with_activity_feed(mut self) -> Self {
+        if !self.activity.is_enabled() {
+            self.activity = Arc::new(ActivityHub::new(500));
+        }
         self
     }
 
@@ -69,46 +80,80 @@ impl ExecMcpServer {
         self.agent_pool.clone()
     }
 
-    fn activity_agents(&self, session: Option<&str>) -> Vec<AgentIdentity> {
-        self.agent_pool
-            .as_ref()
-            .and_then(|context| {
-                context
-                    .store()
-                    .identities_for_session(context.principal(), session)
-                    .ok()
-            })
+    async fn activity_agents(&self, session: Option<&str>) -> Vec<AgentIdentity> {
+        if !self.activity.is_enabled() {
+            return Vec::new();
+        }
+        let Some(context) = self.agent_pool.as_ref() else {
+            return Vec::new();
+        };
+        context
+            .store()
+            .identities_for_session_async(context.principal(), session)
+            .await
             .unwrap_or_default()
     }
 
-    fn tool_started(&self, tool: &str, session: Option<&str>, arguments: Value) -> u64 {
+    async fn tool_started(
+        &self,
+        tool: &str,
+        session: Option<&str>,
+        arguments: impl FnOnce() -> Value,
+    ) -> u64 {
+        if !self.activity.is_enabled() {
+            return 0;
+        }
         self.activity.emit(
             "tool.start",
             "info",
             session,
-            self.activity_agents(session),
-            json!({"tool": tool, "arguments": arguments}),
+            self.activity_agents(session).await,
+            json!({"tool": tool, "arguments": arguments()}),
         )
     }
 
-    fn tool_finished(
+    async fn tool_finished(
         &self,
         tool: &str,
         session: Option<&str>,
         start_event_id: u64,
         success: bool,
-        detail: Value,
+        detail: impl FnOnce() -> Value,
     ) {
-        self.activity.emit(
+        self.tool_finished_with_context(
+            tool,
+            session,
+            start_event_id,
+            success,
+            ActivityContext::default(),
+            detail,
+        )
+        .await;
+    }
+
+    async fn tool_finished_with_context(
+        &self,
+        tool: &str,
+        session: Option<&str>,
+        start_event_id: u64,
+        success: bool,
+        activity_context: ActivityContext,
+        detail: impl FnOnce() -> Value,
+    ) {
+        if !self.activity.is_enabled() {
+            return;
+        }
+        self.activity.emit_with_context(
             if success { "tool.finish" } else { "tool.error" },
             if success { "info" } else { "error" },
             session,
-            self.activity_agents(session),
+            self.activity_agents(session).await,
             json!({
                 "tool": tool,
                 "start_event_id": start_event_id,
-                "result": detail,
+                "result": detail(),
             }),
+            activity_context,
         );
     }
 
@@ -241,16 +286,18 @@ impl ExecMcpServer {
             Ok(comms) => comms,
             Err(error) => {
                 eprintln!("agent pool piggyback collection failed; preserving primary tool result");
-                self.activity.emit(
-                    "mcp.warning",
-                    "warn",
-                    session,
-                    self.activity_agents(session),
-                    json!({
-                        "message": "agent pool piggyback collection failed; preserving primary tool result",
-                        "error": error.message.to_string(),
-                    }),
-                );
+                if self.activity.is_enabled() {
+                    self.activity.emit(
+                        "mcp.warning",
+                        "warn",
+                        session,
+                        self.activity_agents(session).await,
+                        json!({
+                            "message": "agent pool piggyback collection failed; preserving primary tool result",
+                            "error": error.message.to_string(),
+                        }),
+                    );
+                }
                 Communications::default()
             }
         }
@@ -264,19 +311,36 @@ impl ExecMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session = Self::session(&context);
-        let started = self.tool_started(
-            "pool_members",
-            session.as_deref(),
-            serde_json::to_value(&args).unwrap_or(Value::Null),
-        );
+        let activity_context = if self.activity.is_enabled() {
+            ActivityContext {
+                pool: Some(args.pool.clone()),
+                ..ActivityContext::default()
+            }
+        } else {
+            ActivityContext::default()
+        };
+        let started = self
+            .tool_started("pool_members", session.as_deref(), || {
+                serde_json::to_value(&args).unwrap_or(Value::Null)
+            })
+            .await;
         let turn = self.begin_tool(session.as_deref()).await?;
         let (pool, principal) = self.agent_pool_context()?;
-        let result = pool.members(principal, args, session.as_deref());
+        let result = pool
+            .members_async(principal, args, session.as_deref())
+            .await;
         let comms = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
-        let (success, detail) = Self::pool_activity_detail(&result, &comms);
-        self.tool_finished("pool_members", session.as_deref(), started, success, detail);
+        self.tool_finished_with_context(
+            "pool_members",
+            session.as_deref(),
+            started,
+            result.is_ok(),
+            activity_context,
+            || Self::pool_activity_detail(&result, &comms).1,
+        )
+        .await;
         Self::pool_result(result, comms)
     }
 
@@ -289,28 +353,39 @@ impl ExecMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session = Self::session(&context);
-        let started = self.tool_started("pool_wait", session.as_deref(), json!(&args));
+        let activity_context = if self.activity.is_enabled() {
+            ActivityContext {
+                pool: Some(args.pool.clone()),
+                ..ActivityContext::default()
+            }
+        } else {
+            ActivityContext::default()
+        };
+        let started = self
+            .tool_started("pool_wait", session.as_deref(), || json!(&args))
+            .await;
         let (pool, principal) = self.agent_pool_context()?;
         let result = tokio::select! {
             biased;
             _ = context.ct.cancelled() => {
-                self.tool_finished("pool_wait", session.as_deref(), started, false,
-                    json!({"error": "pool_wait cancelled"}));
+                self.tool_finished_with_context("pool_wait", session.as_deref(), started, false, activity_context,
+                    || json!({"error": "pool_wait cancelled"})).await;
                 return Err(McpError::internal_error("pool_wait cancelled", None));
             },
             result = pool.wait(principal, args, session.as_deref()) => result,
         };
-        let detail = match &result {
-            Ok(value) => json!(value),
-            Err(error) => json!({"error": error.message.to_string()}),
-        };
-        self.tool_finished(
+        self.tool_finished_with_context(
             "pool_wait",
             session.as_deref(),
             started,
             result.is_ok(),
-            detail,
-        );
+            activity_context,
+            || match &result {
+                Ok(value) => json!(value),
+                Err(error) => json!({"error": error.message.to_string()}),
+            },
+        )
+        .await;
         Self::pool_result(result, Communications::default())
     }
 
@@ -324,19 +399,64 @@ impl ExecMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session = Self::session(&context);
-        let started = self.tool_started(
-            "pool_send",
-            session.as_deref(),
-            serde_json::to_value(&args).unwrap_or(Value::Null),
-        );
-        let turn = self.begin_tool(session.as_deref()).await?;
-        let (pool, principal) = self.agent_pool_context()?;
-        let result = pool.send(principal, args, session.as_deref());
+        // PoolSendArgs is consumed by send_async. Keep its message metadata
+        // only for opted-in activity so completion events are self-contained.
+        let activity_context = if self.activity.is_enabled() {
+            ActivityContext {
+                pool: Some(args.pool.clone()),
+                message: ActivityMessage::from_pool_send_args(&args),
+            }
+        } else {
+            ActivityContext::default()
+        };
+        let started = self
+            .tool_started("pool_send", session.as_deref(), || {
+                serde_json::to_value(&args).unwrap_or(Value::Null)
+            })
+            .await;
+        let turn = match self.begin_tool(session.as_deref()).await {
+            Ok(turn) => turn,
+            Err(error) => {
+                self.tool_finished_with_context(
+                    "pool_send",
+                    session.as_deref(),
+                    started,
+                    false,
+                    activity_context,
+                    || json!({"error": error.message.to_string()}),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let (pool, principal) = match self.agent_pool_context() {
+            Ok(pool) => pool,
+            Err(error) => {
+                self.tool_finished_with_context(
+                    "pool_send",
+                    session.as_deref(),
+                    started,
+                    false,
+                    activity_context,
+                    || json!({"error": error.message.to_string()}),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let result = pool.send_async(principal, args, session.as_deref()).await;
         let comms = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
-        let (success, detail) = Self::pool_activity_detail(&result, &comms);
-        self.tool_finished("pool_send", session.as_deref(), started, success, detail);
+        self.tool_finished_with_context(
+            "pool_send",
+            session.as_deref(),
+            started,
+            result.is_ok(),
+            activity_context,
+            || Self::pool_activity_detail(&result, &comms).1,
+        )
+        .await;
         Self::pool_result(result, comms)
     }
 
@@ -375,24 +495,30 @@ impl ExecMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session = Self::session(&context);
-        let started = self.tool_started(
-            "exec_command",
-            session.as_deref(),
-            json!({
-                "cmd": &args.cmd,
-                "workdir": &args.workdir,
-                "tty": args.tty,
-                "yield_time_ms": args.yield_time_ms,
-                "max_output_tokens": args.max_output_tokens,
-            }),
-        );
+        let started = self
+            .tool_started("exec_command", session.as_deref(), || {
+                json!({
+                    "cmd": &args.cmd,
+                    "workdir": &args.workdir,
+                    "tty": args.tty,
+                    "yield_time_ms": args.yield_time_ms,
+                    "max_output_tokens": args.max_output_tokens,
+                })
+            })
+            .await;
         let turn = self.begin_tool(session.as_deref()).await?;
         let response = self.manager.exec_command(args).await;
         let comms = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
-        let (success, detail) = Self::exec_activity_detail(&response, &comms);
-        self.tool_finished("exec_command", session.as_deref(), started, success, detail);
+        self.tool_finished(
+            "exec_command",
+            session.as_deref(),
+            started,
+            response.is_ok(),
+            || Self::exec_activity_detail(&response, &comms).1,
+        )
+        .await;
         Self::respond(response, comms)
     }
 
@@ -404,22 +530,28 @@ impl ExecMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session = Self::session(&context);
-        let started = self.tool_started(
-            "write_stdin",
-            session.as_deref(),
-            json!({
-                "session_id": &args.session_id,
-                "chars": &args.chars,
-                "max_output_tokens": args.max_output_tokens,
-            }),
-        );
+        let started = self
+            .tool_started("write_stdin", session.as_deref(), || {
+                json!({
+                    "session_id": &args.session_id,
+                    "chars": &args.chars,
+                    "max_output_tokens": args.max_output_tokens,
+                })
+            })
+            .await;
         let turn = self.begin_tool(session.as_deref()).await?;
         let response = self.manager.write_stdin(args).await;
         let comms = self
             .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
             .await;
-        let (success, detail) = Self::exec_activity_detail(&response, &comms);
-        self.tool_finished("write_stdin", session.as_deref(), started, success, detail);
+        self.tool_finished(
+            "write_stdin",
+            session.as_deref(),
+            started,
+            response.is_ok(),
+            || Self::exec_activity_detail(&response, &comms).1,
+        )
+        .await;
         Self::respond(response, comms)
     }
 
@@ -431,15 +563,15 @@ impl ExecMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let session = Self::session(&context);
-        let started = self.tool_started(
-            "wait_for_exit",
-            session.as_deref(),
-            json!({
-                "session_id": &args.session_id,
-                "wait_seconds": args.wait_seconds,
-                "max_output_tokens": args.max_output_tokens,
-            }),
-        );
+        let started = self
+            .tool_started("wait_for_exit", session.as_deref(), || {
+                json!({
+                    "session_id": &args.session_id,
+                    "wait_seconds": args.wait_seconds,
+                    "max_output_tokens": args.max_output_tokens,
+                })
+            })
+            .await;
         let turn = self.begin_tool(session.as_deref()).await?;
         let response = self
             .manager
@@ -450,8 +582,10 @@ impl ExecMcpServer {
                 let comms = self
                     .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
                     .await;
-                let detail = Self::exec_response_detail(&response, &comms);
-                self.tool_finished("wait_for_exit", session.as_deref(), started, true, detail);
+                self.tool_finished("wait_for_exit", session.as_deref(), started, true, || {
+                    Self::exec_response_detail(&response, &comms)
+                })
+                .await;
                 Self::success(response, comms)
             }
             Ok(None) => {
@@ -460,21 +594,19 @@ impl ExecMcpServer {
                     session.as_deref(),
                     started,
                     false,
-                    json!({"error": "wait_for_exit cancelled"}),
-                );
+                    || json!({"error": "wait_for_exit cancelled"}),
+                )
+                .await;
                 Err(McpError::internal_error("wait_for_exit cancelled", None))
             }
             Err(error) => {
                 let comms = self
                     .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
                     .await;
-                self.tool_finished(
-                    "wait_for_exit",
-                    session.as_deref(),
-                    started,
-                    false,
-                    Self::activity_with_comms(json!({"error": error.to_string()}), &comms),
-                );
+                self.tool_finished("wait_for_exit", session.as_deref(), started, false, || {
+                    Self::activity_with_comms(json!({"error": error.to_string()}), &comms)
+                })
+                .await;
                 Ok(Self::tool_error(error, comms))
             }
         }
@@ -585,5 +717,179 @@ impl ServerHandler for ExecMcpServer {
                     .with_title("Exec MCP"),
             )
             .with_instructions(self.manager.instructions())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::ExecMcpServer;
+    use crate::activity::{ActivityContext, ActivityMessage};
+    use crate::{
+        Config, ProcessManager,
+        agent_pool::{AgentPoolStore, PoolSendArgs},
+    };
+
+    fn server() -> (TempDir, ExecMcpServer) {
+        let workspace = TempDir::new().unwrap();
+        let config = workspace.path().join("config.json");
+        std::fs::write(
+            &config,
+            json!({
+                "version": 1,
+                "workspace": ".",
+                "shell": "/bin/bash",
+                "output_store_dir": "outputs",
+                "child_env": { "inherit": [], "rules": [] }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let manager = ProcessManager::new(Config::load(&config).unwrap()).unwrap();
+        (workspace, ExecMcpServer::new(manager))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disabled_activity_never_builds_diagnostic_payloads_or_reads_pool_identities() {
+        let (workspace, server) = server();
+        let pool =
+            Arc::new(AgentPoolStore::open(&workspace.path().join("private/pool.sqlite")).unwrap());
+        // A pool is enabled for actual tool behavior, but there is no reason
+        // to query its session identities for an unused diagnostic feed.
+        let server = server.with_agent_pool(pool, "owner".into());
+        let hub = server.activity_hub();
+        assert!(!hub.is_enabled());
+
+        let started = server
+            .tool_started("pool_send", Some("session"), || {
+                panic!("disabled activity must not build argument JSON")
+            })
+            .await;
+        assert_eq!(started, 0);
+        server
+            .tool_finished("pool_send", Some("session"), started, true, || {
+                panic!("disabled activity must not serialize results or build preview")
+            })
+            .await;
+        assert!(hub.snapshot(200).is_empty());
+        assert!(!hub.page(None, 200).has_more);
+    }
+
+    #[tokio::test]
+    async fn opted_in_activity_keeps_history_and_correlates_tool_events() {
+        let (_workspace, server) = server();
+        assert!(!server.activity_hub().is_enabled());
+        let server = server.with_activity_feed();
+        let hub = server.activity_hub();
+        assert!(hub.is_enabled());
+
+        let started = server
+            .tool_started("pool_members", Some("session"), || json!({"pool":"team"}))
+            .await;
+        assert_eq!(started, 1);
+        server
+            .tool_finished(
+                "pool_members",
+                Some("session"),
+                started,
+                true,
+                || json!({"value":{"agents":[]}}),
+            )
+            .await;
+        let events = hub.snapshot(200);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "tool.start");
+        assert_eq!(events[0].detail["arguments"]["pool"], "team");
+        assert_eq!(events[1].kind, "tool.finish");
+        assert_eq!(events[1].detail["start_event_id"], started);
+        assert_eq!(events[1].detail["result"]["value"]["agents"], json!([]));
+
+        let repeated_opt_in = server.with_activity_feed();
+        assert!(Arc::ptr_eq(&hub, &repeated_opt_in.activity_hub()));
+        assert_eq!(repeated_opt_in.activity_hub().snapshot(200).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn typed_pool_lifecycles_are_self_contained_without_retaining_generic_tool_pairs() {
+        let (_workspace, server) = server();
+        let server = server.with_activity_feed();
+        let hub = server.activity_hub();
+
+        let members_start = server
+            .tool_started("pool_members", Some("session"), || json!({"pool":"team"}))
+            .await;
+        server
+            .tool_finished_with_context(
+                "pool_members",
+                Some("session"),
+                members_start,
+                true,
+                ActivityContext {
+                    pool: Some("team".into()),
+                    ..ActivityContext::default()
+                },
+                || json!({"value":{"agents":[]}}),
+            )
+            .await;
+        let members_finish = hub.snapshot(1).pop().unwrap();
+        assert_eq!(
+            members_finish.lifecycle.unwrap().pool.as_deref(),
+            Some("team")
+        );
+
+        // Message context is captured before the async pool operation moves
+        // its input, and a final event can be interpreted on its own.
+        let args: PoolSendArgs = serde_json::from_value(json!({
+            "pool":"team", "target":"bob", "message":"a message"
+        }))
+        .unwrap();
+        let start = server
+            .tool_started("pool_send", Some("session"), || json!(&args))
+            .await;
+        server.tool_finished_with_context(
+            "pool_send", Some("session"), start, true,
+            ActivityContext { pool: Some(args.pool.clone()), message: ActivityMessage::from_pool_send_args(&args) },
+            || json!({"value":{"message_id":"m1", "assigned_agent":"alice", "recipients":["bob"]},
+                "peer_messages":[{"pool":"team","message_id":"m2","from":"bob","to":"alice"}]}),
+        ).await;
+        let sent = hub.snapshot(1).pop().unwrap();
+        let typed = sent.lifecycle.unwrap();
+        assert_eq!(typed.pool.as_deref(), Some("team"));
+        assert_eq!(typed.start_event_id, Some(start));
+        assert_eq!(typed.peer_messages.len(), 1);
+        let message = typed.message.unwrap();
+        assert_eq!(message.body.as_deref(), Some("a message"));
+        assert_eq!(message.from.as_deref(), Some("alice"));
+        assert_eq!(message.message_id.as_deref(), Some("m1"));
+
+        // Leaving a pool is a tool lifecycle, not an outgoing message.
+        let leave: PoolSendArgs =
+            serde_json::from_value(json!({"pool":"team", "action":"leave"})).unwrap();
+        let leave_start = server
+            .tool_started("pool_send", Some("session"), || json!(&leave))
+            .await;
+        server
+            .tool_finished_with_context(
+                "pool_send",
+                Some("session"),
+                leave_start,
+                true,
+                ActivityContext {
+                    pool: Some(leave.pool.clone()),
+                    message: ActivityMessage::from_pool_send_args(&leave),
+                },
+                || json!({"value":{"recipients":[]}}),
+            )
+            .await;
+        let leave_event = hub.snapshot(1).pop().unwrap();
+        assert_eq!(
+            leave_event.lifecycle.as_ref().unwrap().pool.as_deref(),
+            Some("team")
+        );
+        assert!(leave_event.lifecycle.unwrap().message.is_none());
     }
 }

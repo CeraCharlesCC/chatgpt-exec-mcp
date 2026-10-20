@@ -26,14 +26,18 @@ pub async fn serve_unix(
     let socket = SocketGuard::new(path)?;
     let server = server.with_http_protocol();
     let activity = server.activity_hub();
-    activity.emit(
-        "mcp.listen",
-        "info",
-        None,
-        Vec::new(),
-        serde_json::json!({"unix_socket": path.display().to_string(), "mcp_path": "/mcp"}),
-    );
-    let webui_state = WebUiState::new(server.admin_context(), Arc::clone(&activity));
+    if activity.is_enabled() {
+        activity.emit(
+            "mcp.listen",
+            "info",
+            None,
+            Vec::new(),
+            serde_json::json!({"unix_socket": path.display().to_string(), "mcp_path": "/mcp"}),
+        );
+    }
+    // No dashboard state or routes are needed for an MCP-only listener.
+    let webui_state =
+        webui_listen.map(|_| WebUiState::new(server.admin_context(), Arc::clone(&activity)));
 
     let mut config = StreamableHttpServerConfig::default();
     config.legacy_session_mode = false;
@@ -47,7 +51,7 @@ pub async fn serve_unix(
     let mut router = axum::Router::new()
         .route("/readyz", axum::routing::get(|| async { "ready" }))
         .nest_service("/mcp", service);
-    if webui_listen.is_some() {
+    if let Some(webui_state) = &webui_state {
         router = router.merge(webui::router(webui_state.clone()));
     }
 
@@ -56,13 +60,15 @@ pub async fn serve_unix(
             let listener = tokio::net::TcpListener::bind(address)
                 .await
                 .with_context(|| format!("bind WebUI listener {address} failed"))?;
-            activity.emit(
-                "mcp.webui.listen",
-                "info",
-                None,
-                Vec::new(),
-                serde_json::json!({"address": address.to_string()}),
-            );
+            if activity.is_enabled() {
+                activity.emit(
+                    "mcp.webui.listen",
+                    "info",
+                    None,
+                    Vec::new(),
+                    serde_json::json!({"address": address.to_string()}),
+                );
+            }
             Some(listener)
         }
         None => None,
@@ -81,6 +87,7 @@ pub async fn serve_unix(
 
     let result = if let Some(webui_listener) = webui_listener {
         let webui_cancellation = cancellation.clone();
+        let webui_state = webui_state.expect("WebUI state exists when a WebUI listener was bound");
         let webui_server = axum::serve(webui_listener, webui::router(webui_state))
             .with_graceful_shutdown(async move {
                 webui_cancellation.cancelled().await;

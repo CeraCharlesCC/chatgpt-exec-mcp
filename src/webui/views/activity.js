@@ -1,5 +1,5 @@
 import { $, esc, interacting, syncList, time, syncOptions, clearSelection } from '../dom.js';
-import { eventPools, isMessageEvent, eventIdentities } from '../model/events.js';
+import { eventPools, isMessageEvent, eventIdentities, pageEventContext } from '../model/events.js';
 import { messages } from '../model/messages.js';
 import { toolDetail, handleCodeAction } from './tool-output.js';
 
@@ -92,9 +92,9 @@ export function renderEvents(state) {
   $('#activityOlder').disabled = state.activityLoading || state.activityNextBeforeId === null;
   const grouping = state.group && state.format && state.view === 'activity' && state.filter === 'all';
   $('#groupTools').disabled = !state.format || state.view !== 'activity' || state.filter !== 'all';
-  const starts = new Map(events.filter(e => e.kind === 'tool.start').map(e => [e.id, e]));
-  const finishes = new Map(events.filter(e => e.detail?.start_event_id).map(e => [e.detail.start_event_id, e]));
-  const conversationRows = messages(events, finishes, state.data?.pools || [], state.data?.admin_messages || []);
+  const {starts, finishes, messageEvents} = pageEventContext(events, state.data?.correlated_events);
+  const conversationRows = messages(messageEvents, finishes, state.data?.pools || [],
+    state.data?.admin_messages || [], starts);
   renderFilters(state, events, starts, finishes, conversationRows);
   if (interacting(root)) return;
   const viewKey = JSON.stringify([state.view, state.filter, state.pool, state.agent, state.session, state.format, grouping, state.activityPageIndex, state.activityCursors[state.activityPageIndex]]);

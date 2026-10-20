@@ -9,6 +9,7 @@
 
 use std::borrow::Cow;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rmcp::ErrorData as McpError;
@@ -295,8 +296,47 @@ where
 /// Durable pool facade. Transactions and asynchronous coordination have
 /// separate owners; successful mutations notify waiters only after commit.
 pub struct AgentPoolStore {
-    storage: PoolStorage,
+    storage: Arc<PoolStorage>,
     coordinator: PoolCoordinator,
+}
+
+/// Run a complete storage operation on a blocking worker. SQLite connections
+/// and their mutex guards must never be held on Tokio's async worker threads.
+async fn blocking_storage<T: Send + 'static>(
+    storage: Arc<PoolStorage>,
+    operation: impl FnOnce(&PoolStorage) -> Result<T, McpError> + Send + 'static,
+) -> Result<T, McpError> {
+    tokio::task::spawn_blocking(move || operation(&storage))
+        .await
+        .map_err(|_| storage_error())?
+}
+
+/// A leave result has no affected-row count, so check the old membership only
+/// for leaves. No-op leaves must not masquerade as membership changes.
+fn send_with_membership_change(
+    storage: &PoolStorage,
+    principal: &str,
+    args: PoolSendArgs,
+    session: Option<&str>,
+) -> Result<(PoolSendResult, bool), McpError> {
+    let was_member = if matches!(args.action, Some(PoolAction::Leave)) {
+        storage
+            .members_state(
+                principal,
+                &PoolMembersArgs {
+                    pool: args.pool.clone(),
+                },
+                session,
+            )?
+            .result
+            .self_agent
+            .is_some()
+    } else {
+        false
+    };
+    let result = storage.send(principal, args, session)?;
+    let changed = was_member || result.assigned_agent.is_some();
+    Ok((result, changed))
 }
 
 impl AgentPoolStore {
@@ -332,7 +372,7 @@ impl AgentPoolStore {
         allocation: AgentNameAllocation,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            storage: PoolStorage::open(path, lease_ttl, agent_names, allocation)?,
+            storage: Arc::new(PoolStorage::open(path, lease_ttl, agent_names, allocation)?),
             coordinator: PoolCoordinator::new(),
         })
     }
@@ -344,7 +384,7 @@ impl AgentPoolStore {
         session: Option<&str>,
     ) -> Result<Option<SessionTurn>, McpError> {
         self.coordinator
-            .start_tool(&self.storage, principal, session)
+            .start_tool(Arc::clone(&self.storage), principal, session)
             .await
     }
 
@@ -356,7 +396,7 @@ impl AgentPoolStore {
         turn: Option<&SessionTurn>,
     ) -> Result<Communications, McpError> {
         self.coordinator
-            .finish_tool_turn(&self.storage, principal, session, turn, None)
+            .finish_tool_turn(Arc::clone(&self.storage), principal, session, turn, None)
             .await
     }
 
@@ -368,8 +408,31 @@ impl AgentPoolStore {
         self.storage.identities_for_session(principal, session)
     }
 
+    /// Async server call sites use this form rather than locking SQLite on a
+    /// Tokio worker. The synchronous facade remains for setup and test users.
+    pub async fn identities_for_session_async(
+        &self,
+        principal: &str,
+        session: Option<&str>,
+    ) -> Result<Vec<AgentIdentity>, McpError> {
+        let principal = principal.to_owned();
+        let session = session.map(str::to_owned);
+        blocking_storage(Arc::clone(&self.storage), move |storage| {
+            storage.identities_for_session(&principal, session.as_deref())
+        })
+        .await
+    }
+
     pub fn admin_members(&self, principal: &str) -> Result<Vec<AdminMember>, McpError> {
         self.storage.admin_members(principal)
+    }
+
+    pub async fn admin_members_async(&self, principal: &str) -> Result<Vec<AdminMember>, McpError> {
+        let principal = principal.to_owned();
+        blocking_storage(Arc::clone(&self.storage), move |storage| {
+            storage.admin_members(&principal)
+        })
+        .await
     }
 
     pub fn admin_messages(
@@ -393,14 +456,57 @@ impl AgentPoolStore {
         Ok(page)
     }
 
+    pub async fn admin_messages_page_async(
+        &self,
+        principal: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<AdminMessagesPage, McpError> {
+        let principal = principal.to_owned();
+        let cursor = cursor.map(str::to_owned);
+        let notifications = self.coordinator.notification_sender();
+        let (page, _) = blocking_storage(Arc::clone(&self.storage), move |storage| {
+            let result = storage.admin_messages_page(&principal, limit, cursor.as_deref())?;
+            if result.1 {
+                notifications.committed_change();
+            }
+            Ok(result)
+        })
+        .await?;
+        // Notification is emitted in the blocking task after the commit,
+        // even if the requesting HTTP handler is cancelled before resume.
+        Ok(page)
+    }
+
     /// Keep acknowledged admin messages visible until the store is reopened.
     pub fn admin_ack(&self, principal: &str, message_id: &str) -> Result<bool, McpError> {
         self.storage.admin_ack(principal, message_id)
     }
 
+    pub async fn admin_ack_async(
+        &self,
+        principal: &str,
+        message_id: &str,
+    ) -> Result<bool, McpError> {
+        let principal = principal.to_owned();
+        let message_id = message_id.to_owned();
+        blocking_storage(Arc::clone(&self.storage), move |storage| {
+            storage.admin_ack(&principal, &message_id)
+        })
+        .await
+    }
+
     /// Remove all admin inbox messages for this account, including unread ones.
     pub fn admin_clear_messages(&self, principal: &str) -> Result<usize, McpError> {
         self.storage.admin_clear_messages(principal)
+    }
+
+    pub async fn admin_clear_messages_async(&self, principal: &str) -> Result<usize, McpError> {
+        let principal = principal.to_owned();
+        blocking_storage(Arc::clone(&self.storage), move |storage| {
+            storage.admin_clear_messages(&principal)
+        })
+        .await
     }
 
     pub fn admin_send(
@@ -418,6 +524,30 @@ impl AgentPoolStore {
         Ok(result)
     }
 
+    pub async fn admin_send_async(
+        &self,
+        principal: &str,
+        pool: &str,
+        target: &str,
+        message: &str,
+        in_reply_to: Option<&str>,
+    ) -> Result<PoolSendResult, McpError> {
+        let principal = principal.to_owned();
+        let pool = pool.to_owned();
+        let target = target.to_owned();
+        let message = message.to_owned();
+        let in_reply_to = in_reply_to.map(str::to_owned);
+        let notifications = self.coordinator.notification_sender();
+        let result = blocking_storage(Arc::clone(&self.storage), move |storage| {
+            let result =
+                storage.admin_send(&principal, &pool, &target, &message, in_reply_to.as_deref())?;
+            notifications.committed_change();
+            Ok(result)
+        })
+        .await?;
+        Ok(result)
+    }
+
     pub fn admin_terminate(
         &self,
         principal: &str,
@@ -425,7 +555,35 @@ impl AgentPoolStore {
         agent: &str,
     ) -> Result<bool, McpError> {
         let result = self.storage.admin_terminate(principal, pool, agent)?;
-        self.coordinator.committed_change();
+        if result {
+            self.coordinator
+                .committed_membership_change(principal, pool);
+        } else {
+            self.coordinator.committed_change();
+        }
+        Ok(result)
+    }
+
+    pub async fn admin_terminate_async(
+        &self,
+        principal: &str,
+        pool: &str,
+        agent: &str,
+    ) -> Result<bool, McpError> {
+        let principal = principal.to_owned();
+        let pool = pool.to_owned();
+        let agent = agent.to_owned();
+        let notifications = self.coordinator.notification_sender();
+        let result = blocking_storage(Arc::clone(&self.storage), move |storage| {
+            let result = storage.admin_terminate(&principal, &pool, &agent)?;
+            if result {
+                notifications.committed_membership_change(&principal, &pool);
+            } else {
+                notifications.committed_change();
+            }
+            Ok(result)
+        })
+        .await?;
         Ok(result)
     }
 
@@ -441,15 +599,41 @@ impl AgentPoolStore {
             .result)
     }
 
+    pub async fn members_async(
+        &self,
+        principal: &str,
+        args: PoolMembersArgs,
+        session: Option<&str>,
+    ) -> Result<PoolMembersResult, McpError> {
+        let principal = principal.to_owned();
+        let session = session.map(str::to_owned);
+        blocking_storage(Arc::clone(&self.storage), move |storage| {
+            Ok(storage
+                .members_state(&principal, &args, session.as_deref())?
+                .result)
+        })
+        .await
+    }
+
     pub async fn wait(
         &self,
         principal: &str,
         args: PoolWaitArgs,
         session: Option<&str>,
     ) -> Result<PoolWaitResult, McpError> {
+        // This observer starts before any SQLite await: a fast join+leave
+        // cannot disappear before the first off-thread revision snapshot.
+        let membership = self.coordinator.observe_membership(principal, &args.pool);
         let turn = self.start_tool(principal, session).await?;
         self.coordinator
-            .wait(&self.storage, principal, args, session, turn.as_ref())
+            .wait(
+                Arc::clone(&self.storage),
+                principal,
+                args,
+                session,
+                turn.as_ref(),
+                membership,
+            )
             .await
     }
 
@@ -459,8 +643,39 @@ impl AgentPoolStore {
         args: PoolSendArgs,
         session: Option<&str>,
     ) -> Result<PoolSendResult, McpError> {
-        let result = self.storage.send(principal, args, session)?;
-        self.coordinator.committed_change();
+        let pool = args.pool.clone();
+        let (result, membership_changed) =
+            send_with_membership_change(&self.storage, principal, args, session)?;
+        if membership_changed {
+            self.coordinator
+                .committed_membership_change(principal, &pool);
+        } else {
+            self.coordinator.committed_change();
+        }
+        Ok(result)
+    }
+
+    pub async fn send_async(
+        &self,
+        principal: &str,
+        args: PoolSendArgs,
+        session: Option<&str>,
+    ) -> Result<PoolSendResult, McpError> {
+        let principal = principal.to_owned();
+        let session = session.map(str::to_owned);
+        let pool = args.pool.clone();
+        let notifications = self.coordinator.notification_sender();
+        let result = blocking_storage(Arc::clone(&self.storage), move |storage| {
+            let (result, membership_changed) =
+                send_with_membership_change(storage, &principal, args, session.as_deref())?;
+            if membership_changed {
+                notifications.committed_membership_change(&principal, &pool);
+            } else {
+                notifications.committed_change();
+            }
+            Ok(result)
+        })
+        .await?;
         Ok(result)
     }
 }
@@ -507,6 +722,122 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn contended_pool_database_does_not_stall_tokio_timers() {
+        let (_directory, store) = store();
+        let storage = std::sync::Arc::new(store);
+        let database = std::sync::Arc::clone(&storage);
+        let (ready, locked) = std::sync::mpsc::sync_channel(1);
+        let holder = std::thread::spawn(move || {
+            let _connection = database.storage.connection().unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        locked.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // A concurrent SQLite query may wait for the connection, but must
+        // not prevent unrelated tasks on a single Tokio worker from running.
+        let blocked = storage.start_tool("owner", Some("contended-session"));
+        let result = tokio::time::timeout(Duration::from_millis(40), blocked).await;
+        holder.join().unwrap();
+        assert!(result.is_err(), "the database wait blocked the Tokio timer");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_storage_future_still_notifies_after_committed_send() {
+        let (_directory, store) = store();
+        let store = Arc::new(store);
+        store
+            .send("owner", send("p", "global", "joined"), Some("a"))
+            .unwrap();
+        store
+            .send("owner", send("p", "global", "joined"), Some("b"))
+            .unwrap();
+
+        let mut changes = store.coordinator.notification_sender().subscribe();
+        let database = Arc::clone(&store);
+        let (ready, locked) = std::sync::mpsc::sync_channel(1);
+        let holder = std::thread::spawn(move || {
+            let _connection = database.storage.connection().unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        locked.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Dropping an awaiting HTTP handler does not abort an already queued
+        // blocking SQLite operation. The notification belongs to its commit,
+        // not to the awaiting task that may never resume.
+        let mut pending = Box::pin(store.send_async(
+            "owner",
+            send("p", "bob", "detached committed send"),
+            Some("a"),
+        ));
+        poll_pending(pending.as_mut()).await;
+        drop(pending);
+        holder.join().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), changes.changed())
+            .await
+            .expect("committed mutation did not notify waiters")
+            .unwrap();
+        let turn = store.start_tool("owner", Some("b")).await.unwrap();
+        let comms = store
+            .finish_tool_turn("owner", Some("b"), turn.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            comms
+                .messages
+                .iter()
+                .any(|message| message.message == "detached committed send")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_wait_ignores_message_only_noop_and_unrelated_membership_changes() {
+        let (_directory, store) = store();
+        for session in ["a", "b"] {
+            store
+                .send("owner", send("selected", "global", "join"), Some(session))
+                .unwrap();
+        }
+        // Drain Bob's join announcement and retire it before starting the wait.
+        let turn = store.start_tool("owner", Some("a")).await.unwrap();
+        store
+            .finish_tool_turn("owner", Some("a"), turn.as_ref())
+            .await
+            .unwrap();
+        drop(turn);
+
+        let mut waiter = Box::pin(store.wait("owner", waiting("selected", 5), Some("a")));
+        poll_pending(waiter.as_mut()).await;
+        store
+            .send("owner", send("other", "global", "join"), Some("other"))
+            .unwrap();
+        store
+            .send(
+                "another-account",
+                send("selected", "global", "join"),
+                Some("x"),
+            )
+            .unwrap();
+        store
+            .send("owner", leave("selected"), Some("not-a-member"))
+            .unwrap();
+        store
+            .send(
+                "owner",
+                send("selected", "alice", "message only"),
+                Some("b"),
+            )
+            .unwrap();
+
+        let result = waiter.await.unwrap();
+        assert_eq!(result.reason, PoolWaitReason::Message);
+        assert!(!result.membership_changed);
+        assert_eq!(result.messages[0].message, "message only");
+    }
 
     pub(super) fn store() -> (tempfile::TempDir, AgentPoolStore) {
         store_with_allocation(AgentNameAllocation::default())
