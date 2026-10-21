@@ -717,6 +717,16 @@ async fn pool_wait_wakes_and_pool_text_contains_each_body_once() {
         )
         .await;
     assert_eq!(removed_wait["result"]["isError"], true);
+    // The concurrent send above may already include its receipt. Complete a
+    // separate send before offering it so only the later error can collect it.
+    let receipt_source = server
+        .send("session-b", "Augustus", "error-receipt-body")
+        .await;
+    let offered = server.exec("session-a").await;
+    assert_eq!(
+        structured(&offered)["messages"][0]["message_id"],
+        structured(&receipt_source)["message_id"]
+    );
     // The offered receipt survives both structured and text error-result paths.
     let error_receipt = server
         .tool("exec_command", json!({"cmd":""}), Some("session-b"))
@@ -728,7 +738,7 @@ async fn pool_wait_wakes_and_pool_text_contains_each_body_once() {
     );
     assert_eq!(
         structured(&error_receipt)["delivery_receipts"][0]["message_id"],
-        structured(&sent)["message_id"]
+        structured(&receipt_source)["message_id"]
     );
     assert!(
         error_receipt["result"]["content"][0]["text"]
