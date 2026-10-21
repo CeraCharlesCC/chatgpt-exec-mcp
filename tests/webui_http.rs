@@ -400,16 +400,14 @@ async fn disabled_pool_snapshot_keeps_activity_and_rejects_controls() {
 #[tokio::test]
 async fn activity_history_paginates_across_archive_and_memory_without_gaps() {
     let activity = Arc::new(ActivityHub::new(500));
-    for id in 1..=2635 {
+    // Three spills fit in the four-chunk pending queue even if the archive
+    // worker has not run yet. Fixed sleeps cannot prevent overload on slow CI.
+    // History unit tests synchronize with the worker to verify archive rotation.
+    for id in 1..=1235 {
         assert_eq!(
             activity.emit("tool.finish", "info", None, vec![], json!({"sequence": id})),
             id
         );
-        // Mimic sustained activity rather than an instantaneous producer that
-        // intentionally overflows the archive's bounded pending-task queue.
-        if id % 250 == 0 {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
     }
     let server = Dashboard::start(WebUiState::without_pool(activity.clone())).await;
     let snapshot = server.snapshot().await;
@@ -419,24 +417,24 @@ async fn activity_history_paginates_across_archive_and_memory_without_gaps() {
         200,
         "snapshots must never send over 200 events"
     );
-    assert_eq!(recent[0]["id"], 2436);
-    assert_eq!(recent[199]["id"], 2635);
+    assert_eq!(recent[0]["id"], 1036);
+    assert_eq!(recent[199]["id"], 1235);
     assert_eq!(snapshot["events_has_more"], true);
-    assert_eq!(snapshot["events_next_before_id"], 2436);
+    assert_eq!(snapshot["events_next_before_id"], 1036);
 
     // The independent history endpoint must support a configurable page size,
     // and even its first page must not return more than 200 rows.
     let latest = server.events_page(None, None).await;
     assert_eq!(latest["events"].as_array().unwrap().len(), 200);
-    let small = server.events_page(Some(2436), Some(5)).await;
+    let small = server.events_page(Some(1036), Some(5)).await;
     let small_ids: Vec<u64> = small["events"]
         .as_array()
         .unwrap()
         .iter()
         .map(|event| event["id"].as_u64().unwrap())
         .collect();
-    assert_eq!(small_ids, [2431, 2432, 2433, 2434, 2435]);
-    assert_eq!(small["next_before_id"], 2431);
+    assert_eq!(small_ids, [1031, 1032, 1033, 1034, 1035]);
+    assert_eq!(small["next_before_id"], 1031);
     assert_eq!(small["has_more"], true);
 
     let mut newest_to_oldest = recent
@@ -470,14 +468,8 @@ async fn activity_history_paginates_across_archive_and_memory_without_gaps() {
         newest_to_oldest.extend(ids.into_iter().rev());
     }
 
-    assert!(page_count >= 11, "older compressed chunks were not exposed");
-    assert!((2250..=2500).contains(&newest_to_oldest.len()));
-    assert_eq!(newest_to_oldest[0], 2635);
-    assert!(
-        newest_to_oldest
-            .windows(2)
-            .all(|pair| pair[0] == pair[1] + 1)
-    );
+    assert_eq!(page_count, 6);
+    assert_eq!(newest_to_oldest, (1..=1235).rev().collect::<Vec<u64>>());
 
     // The default snapshot includes the entire retained suffix, decoding zstd
     // chunks as needed, with each event appearing exactly once in ID order.
@@ -506,11 +498,11 @@ async fn activity_history_paginates_across_archive_and_memory_without_gaps() {
     assert_eq!(server.full_snapshot().await["events"], json!([]));
     assert_eq!(
         activity.emit("tool.start", "info", None, vec![], json!({})),
-        2636
+        1236
     );
     assert_eq!(
         server.events_page(None, None).await["events"][0]["id"],
-        2636
+        1236
     );
 }
 
