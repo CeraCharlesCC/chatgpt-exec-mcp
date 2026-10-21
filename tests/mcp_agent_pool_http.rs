@@ -160,6 +160,23 @@ impl Server {
         let status = response.status();
         let body = response.text().await.unwrap();
         let value: Value = serde_json::from_str(&body).unwrap();
+        if method == "tools/call" {
+            assert_simplified_metadata(&value["result"]["structuredContent"]);
+            for content in value["result"]["content"].as_array().into_iter().flatten() {
+                let text = content["text"].as_str().unwrap_or_default();
+                for removed in [
+                    "peer_messages",
+                    "in_reply_to",
+                    "sent_at_ms",
+                    "offered_at_ms",
+                ] {
+                    assert!(
+                        !text.contains(removed),
+                        "removed metadata in tool text: {text}"
+                    );
+                }
+            }
+        }
         let expected = match value["error"]["code"].as_i64() {
             Some(-32602) => 400,
             Some(-32601) => 404,
@@ -212,6 +229,25 @@ fn structured(value: &Value) -> &Value {
     &value["result"]["structuredContent"]
 }
 
+fn assert_simplified_metadata(value: &Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                assert!(
+                    !matches!(
+                        key.as_str(),
+                        "peer_messages" | "in_reply_to" | "sent_at_ms" | "offered_at_ms"
+                    ),
+                    "removed metadata {key}: {object:?}"
+                );
+                assert_simplified_metadata(value);
+            }
+        }
+        Value::Array(values) => values.iter().for_each(assert_simplified_metadata),
+        _ => {}
+    }
+}
+
 #[tokio::test]
 async fn piggyback_agent_pool_acceptance_path() {
     agent_pool_acceptance_path(None).await;
@@ -242,6 +278,7 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
     assert!(discovery["result"]["capabilities"].get("events").is_none());
 
     let tools = server.call("tools/list", json!({}), None).await;
+    assert_simplified_metadata(&tools);
     let tools = tools["result"]["tools"].as_array().unwrap();
     for name in [
         "exec_command",
@@ -287,12 +324,7 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
                 .is_none()
         );
     }
-    for kept in [
-        "assigned_agent",
-        "message_id",
-        "recipients",
-        "peer_messages",
-    ] {
+    for kept in ["assigned_agent", "message_id", "recipients", "messages"] {
         assert!(
             send_schema["outputSchema"]["properties"]
                 .get(kept)
@@ -365,7 +397,18 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
                 .contains(&json!(required))
         );
     }
+    assert_eq!(
+        wait_schema["outputSchema"]["$defs"]["PoolWaitReason"]["enum"],
+        json!(["message", "membership_changed", "timeout"])
+    );
     for tool in tools {
+        assert_eq!(
+            tool["outputSchema"]["$defs"]["PeerMessage"],
+            send_schema["outputSchema"]["$defs"]["PeerMessage"],
+            "all tools must share one incoming message schema: {}",
+            tool["name"]
+        );
+        assert!(tool["outputSchema"]["properties"].get("messages").is_some());
         assert!(
             tool["outputSchema"]["properties"]
                 .get("delivery_receipts")
@@ -433,7 +476,7 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
         "output_encoding_loss",
         "capture_error",
         "output_ref",
-        "peer_messages",
+        "messages",
     ] {
         assert!(
             detail.get(omitted).is_none(),
@@ -478,7 +521,7 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
         .await;
     assert_eq!(structured(&debug_receive)["self_agent"], debug_agent);
     assert_eq!(
-        structured(&debug_receive)["peer_messages"][0]["message"],
+        structured(&debug_receive)["messages"][0]["message"],
         "human reply"
     );
 
@@ -496,10 +539,7 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
     assert_eq!(structured(&tiberius)["recipients"], json!(["Augustus"]));
 
     let join_offer = server.exec("session-a").await;
-    assert_eq!(
-        structured(&join_offer)["peer_messages"][0]["from"],
-        "Tiberius"
-    );
+    assert_eq!(structured(&join_offer)["messages"][0]["from"], "Tiberius");
     assert!(
         join_offer["result"]["content"][0]["text"]
             .as_str()
@@ -514,16 +554,22 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
     assert_eq!(structured(&targeted)["recipients"], json!(["Augustus"]));
     let offered = server.exec("session-a").await;
     assert_eq!(
-        structured(&offered)["peer_messages"][0]["message"],
+        structured(&offered)["messages"][0]["message"],
         "API side is updated"
     );
     let acknowledged = server.exec("session-a").await;
-    assert!(structured(&acknowledged).get("peer_messages").is_none());
+    assert!(structured(&acknowledged).get("messages").is_none());
 
+    let receipt_wait_started = Instant::now();
     let receipt = server
-        .tool("pool_wait", json!({"pool":"Imperator"}), Some("session-b"))
+        .tool(
+            "pool_wait",
+            json!({"pool":"Imperator", "wait_seconds":5}),
+            Some("session-b"),
+        )
         .await;
-    assert_eq!(structured(&receipt)["reason"], "receipt");
+    assert_eq!(structured(&receipt)["reason"], "timeout");
+    assert!(receipt_wait_started.elapsed() >= Duration::from_millis(4500));
     assert_eq!(structured(&receipt)["messages"], json!([]));
     assert_eq!(
         structured(&receipt)["delivery_receipts"][0]["status"],
@@ -588,10 +634,7 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
         .tool("exec_command", json!({"cmd":""}), Some("session-a"))
         .await;
     assert_eq!(errored["result"]["isError"], true);
-    assert_eq!(
-        structured(&errored)["peer_messages"][0]["message"],
-        "error-path"
-    );
+    assert_eq!(structured(&errored)["messages"][0]["message"], "error-path");
 
     // Pending inbox rows remain durable across a core restart.
     let _ = server.exec("session-a").await;
@@ -602,7 +645,7 @@ async fn agent_pool_acceptance_path(allocation: Option<&str>) {
     server.start().await;
     let durable = server.exec("session-a").await;
     assert_eq!(
-        structured(&durable)["peer_messages"][0]["message"],
+        structured(&durable)["messages"][0]["message"],
         "survives restart"
     );
     // A resumed session keeps its membership under either allocation policy.
@@ -641,12 +684,11 @@ async fn pool_wait_wakes_and_pool_text_contains_each_body_once() {
     assert_eq!(structured(&sent)["recipients"], json!(["Augustus"]));
     assert_eq!(structured(&received)["reason"], "message");
     assert_eq!(structured(&received)["membership_changed"], false);
-    assert!(structured(&received).get("peer_messages").is_none());
     let peers = structured(&received)["messages"].as_array().unwrap();
     assert_eq!(peers.len(), 1);
     assert_eq!(peers[0]["to"], "Augustus");
     assert_eq!(peers[0]["target"], "Augustus");
-    assert!(peers[0]["sent_at_ms"].as_i64().unwrap() > 0);
+    assert!(peers[0].get("sent_at_ms").is_none());
     let text = received["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(text.matches("unique-wait-body").count(), 1);
     let acknowledged = server
@@ -656,7 +698,7 @@ async fn pool_wait_wakes_and_pool_text_contains_each_body_once() {
             Some("session-a"),
         )
         .await;
-    assert!(structured(&acknowledged).get("peer_messages").is_none());
+    assert!(structured(&acknowledged).get("messages").is_none());
     for value in [json!(0), json!(4), json!(46), json!(null), json!(10.5)] {
         let invalid = server
             .tool(
@@ -694,6 +736,12 @@ async fn pool_wait_wakes_and_pool_text_contains_each_body_once() {
             .unwrap()
             .contains("offered to Augustus")
     );
+    assert!(
+        !error_receipt["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("offered to Augustus at ")
+    );
 
     let wait = server.tool("pool_wait", json!({"pool":"Imperator"}), Some("session-a"));
     let leave = async {
@@ -711,4 +759,112 @@ async fn pool_wait_wakes_and_pool_text_contains_each_body_once() {
         .tool("pool_wait", json!({"pool":"Imperator"}), None)
         .await;
     assert_eq!(no_session["result"]["isError"], true);
+}
+
+#[tokio::test]
+async fn receipt_during_wait_stays_pending_and_accompanies_the_next_message() {
+    let server = Server::new().await;
+    server.send("session-a", "global", "join-a").await;
+    server.send("session-b", "global", "join-b").await;
+    server.exec("session-a").await;
+    let sent = server.send("session-a", "Tiberius", "please check").await;
+
+    let mut wait = Box::pin(server.tool(
+        "pool_wait",
+        json!({"pool":"Imperator", "wait_seconds":5}),
+        Some("session-a"),
+    ));
+    let offer = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let received = server.exec("session-b").await;
+        assert_eq!(
+            structured(&received)["messages"][0]["message"],
+            "please check"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    tokio::select! {
+        response = wait.as_mut() => panic!("receipt alone completed pool_wait: {response}"),
+        _ = offer => {}
+    }
+    let reply = server.send("session-b", "Augustus", "checked").await;
+    let received = tokio::time::timeout(Duration::from_secs(2), wait)
+        .await
+        .unwrap();
+    assert_eq!(structured(&received)["reason"], "message");
+    assert_eq!(
+        structured(&received)["messages"][0]["message_id"],
+        structured(&reply)["message_id"]
+    );
+    assert_eq!(
+        structured(&received)["delivery_receipts"][0]["message_id"],
+        structured(&sent)["message_id"]
+    );
+    let acknowledged = server.exec("session-a").await;
+    assert!(structured(&acknowledged).get("messages").is_none());
+    assert!(structured(&acknowledged).get("delivery_receipts").is_none());
+}
+
+#[tokio::test]
+async fn ordinary_tools_share_the_incoming_message_contract() {
+    let server = Server::new().await;
+    server.send("session-a", "global", "join-a").await;
+    server.send("session-b", "global", "join-b").await;
+    server.exec("session-a").await;
+    for (tool, arguments) in [
+        ("pool_members", json!({"pool":"Imperator"})),
+        (
+            "pool_send",
+            json!({"pool":"Imperator", "target":"global", "message":"outgoing"}),
+        ),
+        ("exec_command", json!({"cmd":"true"})),
+    ] {
+        let body = format!("incoming on {tool}");
+        let sent = server.send("session-b", "Augustus", &body).await;
+        let received = server.tool(tool, arguments, Some("session-a")).await;
+        assert_ne!(received["result"]["isError"], true, "{received}");
+        assert_eq!(
+            structured(&received)["messages"],
+            json!([{
+                "message_id":structured(&sent)["message_id"], "pool":"Imperator",
+                "from":"Tiberius", "to":"Augustus", "target":"Augustus", "message":body,
+            }])
+        );
+        let text = received["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text.matches(&body).count(), 1);
+    }
+    for (tool, command) in [
+        ("write_stdin", "read -r line; printf '%s' \"$line\""),
+        ("wait_for_exit", "sleep 1"),
+    ] {
+        let process = server
+            .tool(
+                "exec_command",
+                json!({
+                    "cmd":command, "yield_time_ms":10,
+                }),
+                Some("session-a"),
+            )
+            .await;
+        let process_id = structured(&process)["session_id"].as_str().unwrap();
+        let arguments = if tool == "write_stdin" {
+            json!({"session_id":process_id, "chars":"done\n"})
+        } else {
+            json!({"session_id":process_id})
+        };
+        let body = format!("incoming on {tool}");
+        let sent = server.send("session-b", "Augustus", &body).await;
+        let received = server.tool(tool, arguments, Some("session-a")).await;
+        assert_ne!(received["result"]["isError"], true, "{received}");
+        assert_eq!(
+            structured(&received)["messages"],
+            json!([{
+                "message_id":structured(&sent)["message_id"], "pool":"Imperator",
+                "from":"Tiberius", "to":"Augustus", "target":"Augustus", "message":body,
+            }])
+        );
+        if tool == "wait_for_exit" {
+            assert_eq!(structured(&received)["exit_code"], 0);
+        }
+    }
 }

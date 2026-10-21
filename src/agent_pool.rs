@@ -28,8 +28,9 @@ pub use coordinator::SessionTurn;
 use coordinator::{ChangeNotifier, PoolCoordinator};
 pub use protocol::{
     AdminMember, AdminMessage, AdminMessagesPage, AgentIdentity, Communications, DeliveryReceipt,
-    PeerMessage, PoolAction, PoolMembersArgs, PoolMembersResult, PoolSendArgs, PoolSendResult,
-    PoolWaitArgs, PoolWaitReason, PoolWaitResult, ReceiptStatus,
+    MessageRecord, PeerMessage, PoolAction, PoolMembersArgs, PoolMembersResult, PoolSendArgs,
+    PoolSendResult, PoolWaitArgs, PoolWaitOutcome, PoolWaitReason, PoolWaitResult, ReceiptRecord,
+    ReceiptStatus,
 };
 use storage::{MutationEffect, PoolStorage};
 
@@ -65,7 +66,6 @@ fn notify_after_commit(
     effect: MutationEffect,
 ) {
     match effect {
-        MutationEffect::None => {}
         MutationEffect::Wake => notifier.committed_change(),
         MutationEffect::MembershipChanged => notifier.committed_membership_change(
             principal,
@@ -131,7 +131,14 @@ impl AgentPoolStore {
         turn: Option<&SessionTurn>,
     ) -> Result<Communications, McpError> {
         self.coordinator
-            .finish_tool_turn(Arc::clone(&self.storage), principal, session, turn, None)
+            .finish_tool_turn(
+                Arc::clone(&self.storage),
+                principal,
+                session,
+                turn,
+                None,
+                true,
+            )
             .await
     }
 
@@ -184,14 +191,7 @@ impl AgentPoolStore {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<AdminMessagesPage, McpError> {
-        let mutation = self.storage.admin_messages_page(principal, limit, cursor)?;
-        notify_after_commit(
-            &self.coordinator.notification_sender(),
-            principal,
-            None,
-            mutation.effect,
-        );
-        Ok(mutation.value)
+        self.storage.admin_messages_page(principal, limit, cursor)
     }
 
     pub async fn admin_messages_page_async(
@@ -202,16 +202,10 @@ impl AgentPoolStore {
     ) -> Result<AdminMessagesPage, McpError> {
         let principal = principal.to_owned();
         let cursor = cursor.map(str::to_owned);
-        let notifications = self.coordinator.notification_sender();
-        let page = blocking_storage(Arc::clone(&self.storage), move |storage| {
-            let mutation = storage.admin_messages_page(&principal, limit, cursor.as_deref())?;
-            notify_after_commit(&notifications, &principal, None, mutation.effect);
-            Ok(mutation.value)
+        blocking_storage(Arc::clone(&self.storage), move |storage| {
+            storage.admin_messages_page(&principal, limit, cursor.as_deref())
         })
-        .await?;
-        // Notification is emitted in the blocking task after the commit,
-        // even if the requesting HTTP handler is cancelled before resume.
-        Ok(page)
+        .await
     }
 
     /// Keep acknowledged admin messages visible until the store is reopened.
@@ -251,11 +245,8 @@ impl AgentPoolStore {
         pool: &str,
         target: &str,
         message: &str,
-        in_reply_to: Option<&str>,
     ) -> Result<PoolSendResult, McpError> {
-        let mutation = self
-            .storage
-            .admin_send(principal, pool, target, message, in_reply_to)?;
+        let mutation = self.storage.admin_send(principal, pool, target, message)?;
         notify_after_commit(
             &self.coordinator.notification_sender(),
             principal,
@@ -271,17 +262,14 @@ impl AgentPoolStore {
         pool: &str,
         target: &str,
         message: &str,
-        in_reply_to: Option<&str>,
     ) -> Result<PoolSendResult, McpError> {
         let principal = principal.to_owned();
         let pool = pool.to_owned();
         let target = target.to_owned();
         let message = message.to_owned();
-        let in_reply_to = in_reply_to.map(str::to_owned);
         let notifications = self.coordinator.notification_sender();
         let result = blocking_storage(Arc::clone(&self.storage), move |storage| {
-            let mutation =
-                storage.admin_send(&principal, &pool, &target, &message, in_reply_to.as_deref())?;
+            let mutation = storage.admin_send(&principal, &pool, &target, &message)?;
             notify_after_commit(&notifications, &principal, Some(&pool), mutation.effect);
             Ok(mutation.value)
         })
@@ -357,7 +345,7 @@ impl AgentPoolStore {
         principal: &str,
         args: PoolWaitArgs,
         session: Option<&str>,
-    ) -> Result<PoolWaitResult, McpError> {
+    ) -> Result<PoolWaitOutcome, McpError> {
         // This observer starts before any SQLite await: a fast join+leave
         // cannot disappear before the first off-thread revision snapshot.
         let membership = self.coordinator.observe_membership(principal, &args.pool);

@@ -198,9 +198,7 @@ impl PoolStorage {
             Some(session) => transaction
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM inbox i JOIN members m ON m.id=i.member_id
-                 WHERE m.principal=?1 AND m.session=?2 AND m.expires>?3 AND m.pool=?4)
-                     OR EXISTS(SELECT 1 FROM delivery_receipts r JOIN members m ON m.id=r.member_id
-                       WHERE m.principal=?1 AND m.session=?2 AND m.expires>?3 AND r.pool=?4)",
+                 WHERE m.principal=?1 AND m.session=?2 AND m.expires>?3 AND m.pool=?4)",
                     params![principal, session, now, args.pool],
                     |row| row.get(0),
                 )
@@ -216,7 +214,7 @@ impl PoolStorage {
             result: PoolMembersResult {
                 agents: members.iter().map(|(_, agent, _)| agent.clone()).collect(),
                 self_agent,
-                peer_messages: None,
+                messages: None,
                 delivery_receipts: None,
             },
             membership_revision,
@@ -234,7 +232,7 @@ impl PoolStorage {
         validate_name(&args.pool, "pool")?;
         match args.action {
             Some(PoolAction::Leave) => {
-                if args.target.is_some() || args.message.is_some() || args.in_reply_to.is_some() {
+                if args.target.is_some() || args.message.is_some() {
                     return Err(invalid("action=leave accepts only pool and action"));
                 }
                 self.leave_pool(principal, &args.pool, session)
@@ -246,14 +244,7 @@ impl PoolStorage {
                 let message = args
                     .message
                     .ok_or_else(|| invalid("pool_send requires message for send"))?;
-                self.send_message(
-                    principal,
-                    &args.pool,
-                    target,
-                    message,
-                    args.in_reply_to,
-                    session,
-                )
+                self.send_message(principal, &args.pool, target, message, session)
             }
         }
     }
@@ -302,16 +293,12 @@ impl PoolStorage {
         pool: &str,
         target: String,
         message: String,
-        in_reply_to: Option<String>,
         session: Option<&str>,
     ) -> Result<Mutation<PoolSendResult>, McpError> {
         validate_name(principal, "principal")?;
         validate_name(&target, "target")?;
         if message.is_empty() || message.len() > MAX_MESSAGE_BYTES {
             return Err(invalid("message must contain 1 to 65536 bytes"));
-        }
-        if let Some(reply) = &in_reply_to {
-            validate_name(reply, "in_reply_to")?;
         }
         let session = session.ok_or_else(|| {
             invalid("pool_send requires openai/session metadata to bind the sender")
@@ -393,15 +380,14 @@ impl PoolStorage {
             let message_id = format!("msg_{}", Uuid::new_v4());
             transaction
                 .execute(
-                    "INSERT INTO admin_messages(id,principal,pool,sender,body,in_reply_to,created,sender_member_id)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    "INSERT INTO admin_messages(id,principal,pool,sender,body,created,sender_member_id)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7)",
                     params![
                         message_id,
                         principal,
                         pool,
                         sender,
                         message,
-                        in_reply_to,
                         now,
                         sender_id
                     ],
@@ -430,7 +416,7 @@ impl PoolStorage {
                     assigned_agent,
                     message_id: Some(message_id),
                     recipients: vec![ADMIN_AGENT.to_owned()],
-                    peer_messages: None,
+                    messages: None,
                     delivery_receipts: None,
                 },
                 effect,
@@ -454,7 +440,6 @@ impl PoolStorage {
                 sender_member_id: Some(sender_id),
                 target: &target,
                 body: &message,
-                in_reply_to: in_reply_to.as_deref(),
                 created_ms: now,
             },
             &targets,
@@ -473,7 +458,7 @@ impl PoolStorage {
                 assigned_agent,
                 message_id,
                 recipients,
-                peer_messages: None,
+                messages: None,
                 delivery_receipts: None,
             },
             effect,

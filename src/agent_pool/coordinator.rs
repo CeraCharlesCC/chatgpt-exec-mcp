@@ -11,7 +11,7 @@ use tokio::sync::watch;
 
 use super::storage::{MembersState, PoolStorage};
 use super::{
-    Communications, PoolMembersArgs, PoolWaitArgs, PoolWaitReason, PoolWaitResult,
+    Communications, PoolMembersArgs, PoolWaitArgs, PoolWaitOutcome, PoolWaitReason,
     blocking_storage, invalid, now_ms, storage_error, validate_name, validate_session,
 };
 
@@ -176,6 +176,7 @@ impl PoolCoordinator {
         session: Option<&str>,
         turn: Option<&SessionTurn>,
         pool: Option<&str>,
+        receipt_only_ready: bool,
     ) -> Result<Communications, McpError> {
         let (Some(session), Some(turn)) = (session, turn) else {
             return Ok(Communications::default());
@@ -186,18 +187,19 @@ impl PoolCoordinator {
         let principal = principal.to_owned();
         let session = session.to_owned();
         let pool = pool.map(str::to_owned);
-        let notifications = self.notification_sender();
-        let comms = blocking_storage(storage, move |storage| {
-            let comms = storage.collect_tool_comms(&principal, Some(&session), pool.as_deref())?;
-            // A queued offered receipt must wake waiters even if the caller
-            // drops the awaiting future after this transaction commits.
-            if !comms.messages.is_empty() {
-                notifications.committed_change();
+        blocking_storage(storage, move |storage| {
+            if receipt_only_ready {
+                storage.collect_tool_comms(&principal, Some(&session), pool.as_deref())
+            } else {
+                storage.collect_tool_comms_if_ready(
+                    &principal,
+                    Some(&session),
+                    pool.as_deref(),
+                    false,
+                )
             }
-            Ok(comms)
         })
-        .await?;
-        Ok(comms)
+        .await
     }
 
     pub(super) async fn wait(
@@ -208,7 +210,7 @@ impl PoolCoordinator {
         session: Option<&str>,
         turn: Option<&SessionTurn>,
         membership_observer: (Arc<AtomicUsize>, usize),
-    ) -> Result<PoolWaitResult, McpError> {
+    ) -> Result<PoolWaitOutcome, McpError> {
         let session =
             session.ok_or_else(|| invalid("pool_wait requires openai/session metadata"))?;
         validate_session(session)?;
@@ -227,13 +229,16 @@ impl PoolCoordinator {
             let mut membership_changed = state.membership_revision != initial_revision
                 || membership_epoch.load(Ordering::Acquire) != initial_epoch;
             if state.pending || membership_changed || tokio::time::Instant::now() >= deadline {
-                let comms = self
+                let receipt_only_ready =
+                    membership_changed || tokio::time::Instant::now() >= deadline;
+                let mut comms = self
                     .finish_tool_turn(
                         Arc::clone(&storage),
                         principal,
                         Some(session),
                         turn,
                         Some(&members.pool),
+                        receipt_only_ready,
                     )
                     .await?;
                 // Collection may observe expiry or overlap a membership commit.
@@ -241,10 +246,28 @@ impl PoolCoordinator {
                 state = read_members_state(&storage, principal, &members, session).await?;
                 membership_changed |= state.membership_revision != initial_revision
                     || membership_epoch.load(Ordering::Acquire) != initial_epoch;
+                if !receipt_only_ready
+                    && comms.messages.is_empty()
+                    && (membership_changed || tokio::time::Instant::now() >= deadline)
+                {
+                    // A membership change or deadline reached during the first
+                    // collection can now complete this wait and offer receipts.
+                    comms = self
+                        .finish_tool_turn(
+                            Arc::clone(&storage),
+                            principal,
+                            Some(session),
+                            turn,
+                            Some(&members.pool),
+                            true,
+                        )
+                        .await?;
+                    state = read_members_state(&storage, principal, &members, session).await?;
+                    membership_changed |= state.membership_revision != initial_revision
+                        || membership_epoch.load(Ordering::Acquire) != initial_epoch;
+                }
                 let reason = if !comms.messages.is_empty() {
                     PoolWaitReason::Message
-                } else if !comms.delivery_receipts.is_empty() {
-                    PoolWaitReason::Receipt
                 } else if membership_changed {
                     PoolWaitReason::MembershipChanged
                 } else if tokio::time::Instant::now() >= deadline {
@@ -254,7 +277,7 @@ impl PoolCoordinator {
                     state = read_members_state(&storage, principal, &members, session).await?;
                     continue;
                 };
-                return Ok(PoolWaitResult {
+                return Ok(PoolWaitOutcome {
                     reason,
                     messages: comms.messages,
                     membership_changed,

@@ -10,9 +10,7 @@ use serde_json::{Value, json};
 
 use super::{ExecMcpServer, response};
 use crate::activity::{ActivityContext, ActivityEmissionContext, ActivityMessageStatus};
-use crate::agent_pool::{
-    Communications, DeliveryReceipt, PeerMessage, PoolMembersResult, PoolSendResult, SessionTurn,
-};
+use crate::agent_pool::{Communications, PoolSendResult, SessionTurn};
 use crate::tools::ExecResponse;
 
 pub(super) struct ToolCall<'a> {
@@ -22,32 +20,6 @@ pub(super) struct ToolCall<'a> {
     started: u64,
     turn: Option<SessionTurn>,
     activity: ActivityContext,
-}
-
-// The operation's own typed messages are separate from piggyback deliveries.
-// They are already serialized into pool result values; keep the original
-// on-wire response untouched while using both sources for lifecycle events.
-pub(super) trait EmbeddedCommunications {
-    fn messages(&self) -> Option<&Vec<PeerMessage>>;
-    fn receipts(&self) -> Option<&Vec<DeliveryReceipt>>;
-}
-
-impl EmbeddedCommunications for PoolMembersResult {
-    fn messages(&self) -> Option<&Vec<PeerMessage>> {
-        self.peer_messages.as_ref()
-    }
-    fn receipts(&self) -> Option<&Vec<DeliveryReceipt>> {
-        self.delivery_receipts.as_ref()
-    }
-}
-
-impl EmbeddedCommunications for PoolSendResult {
-    fn messages(&self) -> Option<&Vec<PeerMessage>> {
-        self.peer_messages.as_ref()
-    }
-    fn receipts(&self) -> Option<&Vec<DeliveryReceipt>> {
-        self.delivery_receipts.as_ref()
-    }
 }
 
 impl<'a> ToolCall<'a> {
@@ -131,35 +103,12 @@ impl<'a> ToolCall<'a> {
         error
     }
 
-    pub(super) async fn finish_pool<T: Serialize + EmbeddedCommunications>(
+    pub(super) async fn finish_pool<T: Serialize>(
         mut self,
         result: Result<T, McpError>,
     ) -> Result<CallToolResult, McpError> {
         let comms = self.collect().await;
-        let event_comms = if self.server.activity.is_enabled() {
-            let result_value = result.as_ref().ok();
-            Some(Communications {
-                messages: if !comms.messages.is_empty() {
-                    comms.messages.clone()
-                } else {
-                    result_value
-                        .and_then(EmbeddedCommunications::messages)
-                        .cloned()
-                        .unwrap_or_default()
-                },
-                delivery_receipts: if !comms.delivery_receipts.is_empty() {
-                    comms.delivery_receipts.clone()
-                } else {
-                    result_value
-                        .and_then(EmbeddedCommunications::receipts)
-                        .cloned()
-                        .unwrap_or_default()
-                },
-            })
-        } else {
-            None
-        };
-        self.record(result.is_ok(), event_comms.as_ref(), || {
+        self.record(result.is_ok(), Some(&comms), || {
             ExecMcpServer::pool_activity_detail(&result, &comms).1
         })
         .await;
@@ -219,7 +168,7 @@ impl<'a> ToolCall<'a> {
     ) -> Result<CallToolResult, McpError> {
         let comms = self.collect().await;
         self.record(false, Some(&comms), || {
-            response::with_comms(json!({"error": error.to_string()}), &comms)
+            response::with_internal_comms(json!({"error": error.to_string()}), &comms)
         })
         .await;
         Ok(response::tool_error(error, comms))

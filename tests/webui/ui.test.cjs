@@ -62,10 +62,10 @@ function fixture() {
     events: [
       event(1, 'tool.start', {tool: 'exec_command', arguments: {cmd: lines}}, [identity('alpha', 'Alice')]),
       event(2, 'tool.finish', {tool: 'exec_command', start_event_id: 1, result: {output: lines}}, [identity('alpha', 'Alice')]),
-      event(3, 'tool.start', {tool: 'pool_send', arguments: {pool: 'beta', target: 'Bob', message: 'first send <b>plain text</b>', in_reply_to: 'earlier'}}, [], 'chat-beta'),
+      event(3, 'tool.start', {tool: 'pool_send', arguments: {pool: 'beta', target: 'Bob', message: 'first send <b>plain text</b>'}}, [], 'chat-beta'),
       event(4, 'tool.finish', {tool: 'pool_send', start_event_id: 3, result: {value: {assigned_agent: 'Alice', message_id: 'sent-1', recipients: ['Bob']}}}, [identity('beta', 'Alice')], 'chat-beta'),
-      event(5, 'tool.finish', {tool: 'exec_command', result: {peer_messages: [peer]}}, [identity('alpha', 'Alice'), identity('beta', 'Alice')], 'chat-beta'),
-      event(6, 'tool.finish', {tool: 'exec_command', result: {peer_messages: [peer]}}, [identity('beta', 'Alice')], 'chat-beta'),
+      event(5, 'tool.finish', {tool: 'exec_command', result: {messages: [peer]}}, [identity('alpha', 'Alice'), identity('beta', 'Alice')], 'chat-beta'),
+      event(6, 'tool.finish', {tool: 'exec_command', result: {messages: [peer]}}, [identity('beta', 'Alice')], 'chat-beta'),
       event(7, 'tool.start', {tool: 'pool_send', arguments: {pool: 'old-pool', action: 'leave'}}, [], 'old-chat'),
       event(8, 'tool.finish', {tool: 'pool_send', start_event_id: 7, result: {value: {}}}, [], 'old-chat'),
       event(9, 'admin.message.send', {pool: 'beta', target: 'global', message: 'admin broadcast', message_id: 'admin-1', delivery_count: 2}, [identity('beta', 'Alice'), identity('beta', 'Bob')], null),
@@ -456,8 +456,8 @@ test('v1 finish-only messages and receives use typed lifecycle fields instead of
       result: {value: {assigned_agent: 'Ghost', message_id: 'wrong', recipients: ['Nobody']}}},
     lifecycle: {type: 'message_send', phase: 'finish', tool: 'pool_send', start_event_id: 3, pool: 'beta',
       message: {pool: 'beta', target: 'Bob', body: 'typed only <b>plain text</b>', from: 'Alice',
-        in_reply_to: 'original', message_id: 'typed-1', recipients: ['Bob'], status: 'queued'},
-      peer_messages: [{pool: 'beta', message_id: 'typed-2', from: 'Cara', to: 'Bob', message: 'typed incoming'}],
+        message_id: 'typed-1', recipients: ['Bob'], status: 'queued'},
+      messages: [{pool: 'beta', message_id: 'typed-2', from: 'Cara', to: 'Bob', message: 'typed incoming'}],
     },
   };
   data.events = [typedFinish];
@@ -468,7 +468,6 @@ test('v1 finish-only messages and receives use typed lifecycle fields instead of
   assert.equal(await card.count(), 1);
   assert.match(await card.innerText(), /Alice/);
   assert.match(await card.innerText(), /typed only <b>plain text<\/b>/);
-  assert.match(await card.innerText(), /reply to original/);
   assert.match(await card.innerText(), /Queued for 1 recipient/);
   assert.match(await page.locator('#events').innerText(), /typed incoming/);
   assert.doesNotMatch(await page.locator('#events').innerText(), /Ghost|Nobody|wrong/);
@@ -671,7 +670,6 @@ test('messages show sent/received text, deduplicate deliveries and exclude pool 
   const text = await page.locator('#events').innerText();
   assert.match(text, /Alice → Bob/);
   assert.match(text, /first send <b>plain text<\/b>/);
-  assert.match(text, /reply to earlier/);
   assert.match(text, /Failed: unknown target/);
   assert.match(text, /beta incoming\nsecond line/);
   assert.match(text, /Former agent → admin/);
@@ -747,7 +745,7 @@ test('four intervening messages merge, while five or six keep delivery separate'
     data.events.push({
       id: 30, kind: 'tool.finish', level: 'info', timestamp_ms: now + 30,
       agents: [{pool: 'beta', agent: 'Bob'}], session: 'chat-bob',
-      detail: {tool: 'pool_members', result: {peer_messages: [{
+      detail: {tool: 'pool_members', result: {messages: [{
         pool: 'beta', message_id: 'sent-1', from: 'Alice', to: 'Bob', message: data.events[0].detail.arguments.message,
       }]}},
     });
@@ -770,7 +768,7 @@ test('a nearby broadcast tracks partial offers, deduplicates repeats and retains
   const offer = (id, to, session) => ({
     id, kind: 'tool.finish', level: 'info', timestamp_ms: data.events[10].timestamp_ms + id,
     agents: [{pool: 'beta', agent: to}], session,
-    detail: {tool: 'pool_members', result: {peer_messages: [{
+    detail: {tool: 'pool_members', result: {messages: [{
       pool: 'beta', message_id: 'admin-1', from: 'admin', to, target: 'global', message: 'admin broadcast',
     }]}},
   });
@@ -822,7 +820,7 @@ test('broadcast offers remain visible per recipient session, including old snaps
   const makeOffer = (id, to, session, recipient) => ({
     id, kind: 'tool.finish', level: 'info', timestamp_ms: Date.now() + id, session,
     agents: [{pool: 'beta', agent: recipient}],
-    detail: {tool: 'pool_members', result: {peer_messages: [{
+    detail: {tool: 'pool_members', result: {messages: [{
       pool: 'beta', message_id: 'broadcast', from: 'admin', to, target: 'global', message: 'shared broadcast',
     }]}},
   });

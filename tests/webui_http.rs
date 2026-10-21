@@ -139,7 +139,6 @@ fn send_args(target: Option<&str>, message: Option<&str>) -> PoolSendArgs {
         pool: "team".into(),
         target: target.map(str::to_owned),
         message: message.map(str::to_owned),
-        in_reply_to: None,
         action: None,
     }
 }
@@ -1024,7 +1023,7 @@ async fn clear_removes_all_history_and_only_the_current_accounts_admin_inbox() {
     let members = store.admin_members("account-a").unwrap();
     let agent = &members.iter().find(|m| m.pool == "team").unwrap().agent;
     store
-        .admin_send("account-a", "team", agent, "pending delivery", None)
+        .admin_send("account-a", "team", agent, "pending delivery")
         .unwrap();
     let activity = Arc::new(ActivityHub::new(500));
     for _ in 0..450 {

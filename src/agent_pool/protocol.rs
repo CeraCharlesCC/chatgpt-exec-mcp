@@ -20,7 +20,7 @@ pub struct PoolWaitArgs {
     /// Pool to observe; messages and receipts are restricted to this pool.
     #[schemars(length(min = 1, max = MAX_NAME_CHARS))]
     pub pool: String,
-    /// Maximum wait; returns early for messages, offered receipts, or membership changes.
+    /// Maximum wait; returns early for messages or membership changes.
     #[serde(
         default = "default_pool_wait_seconds",
         deserialize_with = "deserialize_pool_wait_seconds"
@@ -34,7 +34,6 @@ pub struct PoolWaitArgs {
 #[schemars(crate = "rmcp::schemars")]
 pub enum PoolWaitReason {
     Message,
-    Receipt,
     MembershipChanged,
     Timeout,
 }
@@ -48,6 +47,31 @@ pub struct PoolWaitResult {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schemars(default)]
     pub delivery_receipts: Vec<DeliveryReceipt>,
+}
+
+/// Internal wait data retains timestamps for activity events and the WebUI.
+#[derive(Debug, Serialize)]
+pub struct PoolWaitOutcome {
+    pub reason: PoolWaitReason,
+    pub messages: Vec<MessageRecord>,
+    pub membership_changed: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub delivery_receipts: Vec<ReceiptRecord>,
+}
+
+impl From<&PoolWaitOutcome> for PoolWaitResult {
+    fn from(outcome: &PoolWaitOutcome) -> Self {
+        Self {
+            reason: outcome.reason,
+            messages: outcome.messages.iter().map(PeerMessage::from).collect(),
+            membership_changed: outcome.membership_changed,
+            delivery_receipts: outcome
+                .delivery_receipts
+                .iter()
+                .map(DeliveryReceipt::from)
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -76,17 +100,6 @@ pub struct PoolSendArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub message: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_non_null_string",
-        skip_serializing_if = "Option::is_none"
-    )]
-    #[schemars(
-        with = "String",
-        length(min = 1, max = MAX_NAME_CHARS),
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub in_reply_to: Option<String>,
     /// Omit to send; leave removes this membership (pool and action only).
     #[serde(
         default,
@@ -104,6 +117,19 @@ pub enum PoolAction {
     Leave,
 }
 
+/// Durable message data retained for activity events and the WebUI.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MessageRecord {
+    pub message_id: String,
+    pub pool: String,
+    pub from: String,
+    pub to: String,
+    pub target: String,
+    pub sent_at_ms: i64,
+    pub message: String,
+}
+
+/// Shared agent-facing message shape across every tool response.
 #[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
 #[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
 pub struct PeerMessage {
@@ -113,13 +139,33 @@ pub struct PeerMessage {
     pub to: String,
     /// Original send target.
     pub target: String,
-    pub sent_at_ms: i64,
     pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "String", default)]
-    pub in_reply_to: Option<String>,
 }
 
+impl From<&MessageRecord> for PeerMessage {
+    fn from(record: &MessageRecord) -> Self {
+        Self {
+            message_id: record.message_id.clone(),
+            pool: record.pool.clone(),
+            from: record.from.clone(),
+            to: record.to.clone(),
+            target: record.target.clone(),
+            message: record.message.clone(),
+        }
+    }
+}
+
+/// Durable receipt data retained for activity events and the WebUI.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ReceiptRecord {
+    pub message_id: String,
+    pub pool: String,
+    pub to: String,
+    pub status: ReceiptStatus,
+    pub offered_at_ms: i64,
+}
+
+/// Shared agent-facing receipt shape across every tool response.
 #[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
 #[schemars(crate = "rmcp::schemars", deny_unknown_fields)]
 pub struct DeliveryReceipt {
@@ -127,7 +173,17 @@ pub struct DeliveryReceipt {
     pub pool: String,
     pub to: String,
     pub status: ReceiptStatus,
-    pub offered_at_ms: i64,
+}
+
+impl From<&ReceiptRecord> for DeliveryReceipt {
+    fn from(record: &ReceiptRecord) -> Self {
+        Self {
+            message_id: record.message_id.clone(),
+            pool: record.pool.clone(),
+            to: record.to.clone(),
+            status: record.status,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
@@ -139,8 +195,8 @@ pub enum ReceiptStatus {
 
 #[derive(Clone, Debug, Default)]
 pub struct Communications {
-    pub messages: Vec<PeerMessage>,
-    pub delivery_receipts: Vec<DeliveryReceipt>,
+    pub messages: Vec<MessageRecord>,
+    pub delivery_receipts: Vec<ReceiptRecord>,
 }
 
 impl Communications {
@@ -170,8 +226,6 @@ pub struct AdminMessage {
     pub pool: String,
     pub from: String,
     pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub in_reply_to: Option<String>,
     pub created_ms: i64,
     pub acknowledged: bool,
 }
@@ -193,7 +247,7 @@ pub struct PoolMembersResult {
     pub self_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<PeerMessage>", default)]
-    pub peer_messages: Option<Vec<PeerMessage>>,
+    pub messages: Option<Vec<PeerMessage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<DeliveryReceipt>", default)]
     pub delivery_receipts: Option<Vec<DeliveryReceipt>>,
@@ -214,7 +268,7 @@ pub struct PoolSendResult {
     pub recipients: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<PeerMessage>", default)]
-    pub peer_messages: Option<Vec<PeerMessage>>,
+    pub messages: Option<Vec<PeerMessage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<DeliveryReceipt>", default)]
     pub delivery_receipts: Option<Vec<DeliveryReceipt>>,

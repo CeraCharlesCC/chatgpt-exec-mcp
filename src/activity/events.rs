@@ -46,8 +46,6 @@ pub struct ActivityMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub in_reply_to: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
@@ -70,7 +68,6 @@ impl ActivityMessage {
             pool: Some(args.pool.clone()),
             target: Some(args.target.as_deref().unwrap_or("global").to_owned()),
             body: Some(args.message.as_ref()?.clone()),
-            in_reply_to: args.in_reply_to.clone(),
             ..Self::default()
         })
     }
@@ -97,10 +94,6 @@ impl ActivityMessage {
                     .to_owned(),
             ),
             body: Some(body),
-            in_reply_to: arguments
-                .get("in_reply_to")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
             ..Self::default()
         })
     }
@@ -135,7 +128,7 @@ pub struct ActivityLifecycle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<ActivityMessage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub peer_messages: Vec<Value>,
+    pub messages: Vec<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delivery_receipts: Vec<Value>,
 }
@@ -304,12 +297,14 @@ pub(super) fn lifecycle_for_event(
 
     // Typed communications override arbitrary legacy result JSON, including
     // when an operation intentionally produced no messages or receipts.
-    let (peer_messages, delivery_receipts) = if let Some(communications) = communications {
+    let (messages, delivery_receipts) = if let Some(communications) = communications {
         (
             communications
                 .messages
                 .iter()
-                .map(|message| serde_json::to_value(message).expect("peer message is serializable"))
+                .map(|message| {
+                    serde_json::to_value(message).expect("message record is serializable")
+                })
                 .collect(),
             communications
                 .delivery_receipts
@@ -328,11 +323,7 @@ pub(super) fn lifecycle_for_event(
                 .cloned()
                 .unwrap_or_default()
         };
-        let mut peer_messages = array("peer_messages");
-        if peer_messages.is_empty() && tool == "pool_wait" {
-            peer_messages = array("messages");
-        }
-        (peer_messages, array("delivery_receipts"))
+        (array("messages"), array("delivery_receipts"))
     };
     Some(ActivityLifecycle {
         event_type: if message.is_some() {
@@ -345,7 +336,7 @@ pub(super) fn lifecycle_for_event(
         pool,
         start_event_id,
         message,
-        peer_messages,
+        messages,
         delivery_receipts,
     })
 }

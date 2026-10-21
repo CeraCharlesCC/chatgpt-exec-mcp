@@ -138,7 +138,7 @@ async fn typed_pool_lifecycles_are_self_contained_without_retaining_generic_tool
             },
             || {
                 json!({"value":{"message_id":"m1", "assigned_agent":"alice", "recipients":["bob"]},
-            "peer_messages":[{"pool":"team","message_id":"m2","from":"bob","to":"alice"}]})
+            "messages":[{"pool":"team","message_id":"m2","from":"bob","to":"alice"}]})
             },
         )
         .await;
@@ -146,7 +146,7 @@ async fn typed_pool_lifecycles_are_self_contained_without_retaining_generic_tool
     let typed = sent.lifecycle.unwrap();
     assert_eq!(typed.pool.as_deref(), Some("team"));
     assert_eq!(typed.start_event_id, Some(start));
-    assert_eq!(typed.peer_messages.len(), 1);
+    assert_eq!(typed.messages.len(), 1);
     let message = typed.message.unwrap();
     assert_eq!(message.body.as_deref(), Some("a message"));
     assert_eq!(message.from.as_deref(), Some("alice"));

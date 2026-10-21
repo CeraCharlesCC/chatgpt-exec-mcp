@@ -51,7 +51,7 @@ impl PoolStorage {
         principal: &str,
         limit: usize,
         cursor: Option<&str>,
-    ) -> Result<Mutation<AdminMessagesPage>, McpError> {
+    ) -> Result<AdminMessagesPage, McpError> {
         validate_name(principal, "principal")?;
         // Cursor is the (timestamp, ID) of the last displayed message. IDs
         // break ties for messages created within the same millisecond.
@@ -76,11 +76,13 @@ impl PoolStorage {
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|_| storage_error())?;
         let mut messages = {
-            let mut statement = transaction.prepare(
-                "SELECT id,pool,sender,body,in_reply_to,created,acknowledged FROM admin_messages
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id,pool,sender,body,created,acknowledged FROM admin_messages
                  WHERE principal=?1 AND (?2 IS NULL OR created<?2 OR (created=?2 AND id<?3))
                  ORDER BY created DESC,id DESC LIMIT ?4",
-            ).map_err(|_| storage_error())?;
+                )
+                .map_err(|_| storage_error())?;
             statement
                 .query_map(
                     params![
@@ -95,9 +97,8 @@ impl PoolStorage {
                             pool: row.get(1)?,
                             from: row.get(2)?,
                             message: row.get(3)?,
-                            in_reply_to: row.get(4)?,
-                            created_ms: row.get(5)?,
-                            acknowledged: row.get(6)?,
+                            created_ms: row.get(4)?,
+                            acknowledged: row.get(5)?,
                         })
                     },
                 )
@@ -114,9 +115,8 @@ impl PoolStorage {
         } else {
             None
         };
-        let mut changed = false;
         for message in &messages {
-            changed |= transaction
+            transaction
                 .execute(
                     "INSERT OR IGNORE INTO delivery_receipts
                    (member_id,message_id,pool,recipient,recipient_member_id,offered_at)
@@ -126,8 +126,7 @@ impl PoolStorage {
                    AND sender.principal=?2 AND sender.expires>?3",
                     params![message.message_id, principal, now],
                 )
-                .map_err(|_| storage_error())?
-                != 0;
+                .map_err(|_| storage_error())?;
             transaction
                 .execute(
                     "UPDATE admin_messages SET offered_at=COALESCE(offered_at,?2) WHERE id=?1",
@@ -136,17 +135,10 @@ impl PoolStorage {
                 .map_err(|_| storage_error())?;
         }
         transaction.commit().map_err(|_| storage_error())?;
-        Ok(Mutation::new(
-            AdminMessagesPage {
-                messages,
-                next_cursor,
-            },
-            if changed {
-                MutationEffect::Wake
-            } else {
-                MutationEffect::None
-            },
-        ))
+        Ok(AdminMessagesPage {
+            messages,
+            next_cursor,
+        })
     }
 
     pub(in crate::agent_pool) fn admin_ack(
@@ -182,7 +174,6 @@ impl PoolStorage {
         pool: &str,
         target: &str,
         message: &str,
-        in_reply_to: Option<&str>,
     ) -> Result<Mutation<PoolSendResult>, McpError> {
         validate_name(principal, "principal")?;
         validate_name(pool, "pool")?;
@@ -192,9 +183,6 @@ impl PoolStorage {
         }
         if message.is_empty() || message.len() > MAX_MESSAGE_BYTES {
             return Err(invalid("message must contain 1 to 65536 bytes"));
-        }
-        if let Some(reply) = in_reply_to {
-            validate_name(reply, "in_reply_to")?;
         }
         let now = now_ms();
         let mut connection = self.connection()?;
@@ -211,7 +199,6 @@ impl PoolStorage {
                 sender_member_id: None,
                 target,
                 body: message,
-                in_reply_to,
                 created_ms: now,
             },
             &targets,
@@ -222,7 +209,7 @@ impl PoolStorage {
                 assigned_agent: None,
                 message_id,
                 recipients,
-                peer_messages: None,
+                messages: None,
                 delivery_receipts: None,
             },
             MutationEffect::Wake,

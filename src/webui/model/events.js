@@ -12,7 +12,7 @@ export function normalizeEvent(event) {
   const message = typed ? (lifecycle?.type === 'message_send' &&
     typeof lifecycle.message?.body === 'string' ? {
       pool: lifecycle.message.pool, target: lifecycle.message.target,
-      message: lifecycle.message.body, in_reply_to: lifecycle.message.in_reply_to,
+      message: lifecycle.message.body,
       from: lifecycle.message.from, message_id: lifecycle.message.message_id,
       recipients: lifecycle.message.recipients, error: lifecycle.message.error,
       status: lifecycle.message.status,
@@ -22,20 +22,14 @@ export function normalizeEvent(event) {
     message_id: result?.value?.message_id, error: result?.error || result?.value?.error,
     status: event.kind === 'tool.error' ? 'failed' : 'queued',
   } : null;
-  // Old pool_wait results can use `messages` rather than `peer_messages`.
-  // Follow the Rust archive fallback even if an empty peer_messages array is
-  // explicitly present; all versioned events ignore these legacy fields.
-  let legacyPeers = result?.peer_messages || result?.value?.peer_messages || [];
-  if (!legacyPeers.length && detail.tool === 'pool_wait') {
-    legacyPeers = result?.messages || result?.value?.messages || [];
-  }
   return {...event, semantic: {
     startId: typed ? lifecycle?.start_event_id : detail.start_event_id,
     tool: typed ? lifecycle?.tool : detail.tool,
     pools: event.kind === 'admin.message.send' ? [detail.pool] :
       typed ? [lifecycle?.pool] : [detail.pool, detail.arguments?.pool],
     message, completion,
-    peerMessages: typed ? lifecycle?.peer_messages || [] : legacyPeers,
+    messages: typed ? lifecycle?.messages || [] :
+      result?.messages || result?.value?.messages || [],
     deliveryReceipts: typed ? lifecycle?.delivery_receipts || [] :
       result?.delivery_receipts || result?.value?.delivery_receipts || [],
   }};
@@ -46,7 +40,7 @@ export const eventStartId = e => normalizeEvent(e)?.semantic.startId;
 export const eventTool = e => normalizeEvent(e)?.semantic.tool;
 export const messageSend = e => normalizeEvent(e)?.semantic.message || null;
 export const messageCompletion = e => normalizeEvent(e)?.semantic.completion || null;
-export const peerMessages = e => normalizeEvent(e)?.semantic.peerMessages || [];
+export const eventMessages = e => normalizeEvent(e)?.semantic.messages || [];
 export const deliveryReceipts = e => normalizeEvent(e)?.semantic.deliveryReceipts || [];
 
 export function eventPools(event, starts) {
@@ -56,7 +50,7 @@ export function eventPools(event, starts) {
   const names = [...e.semantic.pools, ...(start?.semantic.pools || []),
     messageSend(e)?.pool, messageSend(start)?.pool];
   for (const name of names) if (name) pools.add(name);
-  for (const m of peerMessages(e)) pools.add(m.pool);
+  for (const m of eventMessages(e)) pools.add(m.pool);
   for (const receipt of deliveryReceipts(e)) pools.add(receipt.pool);
   return pools;
 }
@@ -64,7 +58,7 @@ export function eventPools(event, starts) {
 export function isMessageEvent(e, starts) {
   if (e.kind === 'admin.message.send') return true;
   const start = e.kind === 'tool.start' ? e : starts.get(eventStartId(e));
-  return Boolean(messageSend(e) || messageSend(start) || peerMessages(e).length);
+  return Boolean(messageSend(e) || messageSend(start) || eventMessages(e).length);
 }
 
 export function eventIdentities(e, starts, finishes) {
@@ -83,7 +77,7 @@ export function eventIdentities(e, starts, finishes) {
     agents.push({pool: e.detail.pool, agent: 'admin'});
     if (e.detail.target !== 'global') agents.push({pool: e.detail.pool, agent: e.detail.target});
   }
-  for (const m of peerMessages(e)) {
+  for (const m of eventMessages(e)) {
     agents.push({pool: m.pool, agent: m.from}, {pool: m.pool, agent: m.to});
   }
   for (const receipt of deliveryReceipts(e)) {

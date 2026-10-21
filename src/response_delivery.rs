@@ -101,7 +101,7 @@ pub(crate) async fn prepare_response(
             output_encoding_loss: prepared.encoding_loss,
             capture_error,
             output_ref: output_ref.as_ref().map(wire_output_ref),
-            peer_messages: None,
+            messages: None,
             delivery_receipts: None,
         },
         commit_end: prepared
@@ -130,7 +130,7 @@ pub(crate) fn delivered_terminal_response(
         output_encoding_loss: false,
         capture_error: delivery.capture_error,
         output_ref: delivery.output_ref.as_ref().map(wire_output_ref),
-        peer_messages: None,
+        messages: None,
         delivery_receipts: None,
     }
 }

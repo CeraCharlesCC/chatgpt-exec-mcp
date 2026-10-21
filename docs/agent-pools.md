@@ -8,7 +8,7 @@ clients. They are optional and require an `agent_pool` configuration; see
 
 `pool_members` lists active members without joining. `pool_send` sends to one
 member or broadcasts to other current members with `global`. `pool_wait` waits
-for messages, delivery receipts, or membership changes:
+for messages or membership changes:
 
 ```text
 pool_members(pool="project")
@@ -25,23 +25,28 @@ through the dictionary. Later calls identify membership through
 
 ## Message delivery
 
-Messages arrive as `peer_messages` on later tool responses. They do not wake an
-idle chat. Each message includes `message_id`, `pool`, `from`, `to`, `target`,
-`sent_at_ms`, `message`, and optional `in_reply_to`.
+Messages arrive in the top-level `messages` field on tool responses, including
+`pool_members`, `pool_send`, `pool_wait`, and execution tools. They do not wake
+an idle chat. Every tool uses the same message fields: `message_id`, `pool`,
+`from`, `to`, `target`, and `message`. Messages are independent; refer to earlier
+conversations in plain text when needed. Delivery timestamps are retained for
+storage and the Web UI, and are omitted from agent-facing messages and receipts.
 
 `pool_wait` watches only the named pool and does not join it. `wait_seconds`
-defaults to 35 (range 5–45). Its result contains `reason` (`message`, `receipt`,
+defaults to 35 (range 5–45). Its result contains `reason` (`message`,
 `membership_changed`, or `timeout`), `messages`, and `membership_changed`.
 Changes are measured from the start of the wait; timeout is a normal result.
-Unlike other tool calls, it returns messages in `messages` rather than
-`peer_messages`. Activity in other pools does not wake it.
+Receipt-only updates do not wake or complete the wait. Pending receipts can be
+included when it completes for a message, membership change, or timeout.
+Activity in other pools does not wake it.
 
 ## Delivery receipts
 
 `pool_send` returns `recipients` to show where messages were queued. When a
 direct message is first included in the recipient's tool response, the sender
-gets a `delivery_receipts` entry with `status: "offered"` on a later tool call
-or through `pool_wait`. This means the server prepared a response, not that the
+gets a top-level `delivery_receipts` entry with `message_id`, `pool`, `to`, and
+`status: "offered"` on a later tool call or when `pool_wait` completes for another
+reason. This means the server prepared a response, not that the
 recipient received, read, or acted on it. Acceptance and completion require
 ordinary replies.
 

@@ -8,7 +8,7 @@ use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::agent_pool::{
-    Communications, DeliveryReceipt, PeerMessage, ReceiptStatus, invalid, now_ms, storage_error,
+    Communications, MessageRecord, ReceiptRecord, ReceiptStatus, invalid, now_ms, storage_error,
     validate_name, validate_session,
 };
 
@@ -22,7 +22,7 @@ impl PoolStorage {
         &self,
         principal: &str,
         session: Option<&str>,
-    ) -> Result<Vec<PeerMessage>, McpError> {
+    ) -> Result<Vec<MessageRecord>, McpError> {
         Ok(self.collect_tool_comms(principal, session, None)?.messages)
     }
 
@@ -31,6 +31,18 @@ impl PoolStorage {
         principal: &str,
         session: Option<&str>,
         pool: Option<&str>,
+    ) -> Result<Communications, McpError> {
+        self.collect_tool_comms_if_ready(principal, session, pool, true)
+    }
+
+    /// A wait may have observed a message that an overlapping tool then retired.
+    /// Leave receipts untouched when that stale observation cannot complete it.
+    pub(in crate::agent_pool) fn collect_tool_comms_if_ready(
+        &self,
+        principal: &str,
+        session: Option<&str>,
+        pool: Option<&str>,
+        receipt_only_ready: bool,
     ) -> Result<Communications, McpError> {
         validate_name(principal, "principal")?;
         let Some(session) = session else {
@@ -41,10 +53,10 @@ impl PoolStorage {
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(|_| storage_error())?;
 
-        let rows: Vec<(i64, i64, PeerMessage)> = {
+        let rows: Vec<(i64, i64, MessageRecord)> = {
             let mut statement = transaction
                 .prepare(
-                    "SELECT i.cursor,m.id,msg.id,msg.pool,msg.sender,m.agent,msg.body,msg.in_reply_to,msg.target,msg.created
+                    "SELECT i.cursor,m.id,msg.id,msg.pool,msg.sender,m.agent,msg.body,msg.target,msg.created
                      FROM inbox i
                      JOIN members m ON m.id=i.member_id
                      JOIN messages msg ON msg.id=i.message_id
@@ -60,15 +72,14 @@ impl PoolStorage {
                         Ok((
                             row.get(0)?,
                             row.get(1)?,
-                            PeerMessage {
+                            MessageRecord {
                                 message_id: row.get(2)?,
                                 pool: row.get(3)?,
                                 from: row.get(4)?,
                                 to: row.get(5)?,
                                 message: row.get(6)?,
-                                in_reply_to: row.get(7)?,
-                                target: row.get(8)?,
-                                sent_at_ms: row.get(9)?,
+                                target: row.get(7)?,
+                                sent_at_ms: row.get(8)?,
                             },
                         ))
                     },
@@ -88,7 +99,6 @@ impl PoolStorage {
                 + message.from.len()
                 + message.to.len()
                 + message.target.len()
-                + message.in_reply_to.as_ref().map_or(0, String::len)
                 + 64;
             if !messages.is_empty() && bytes.saturating_add(size) > MAX_BATCH_BYTES {
                 break;
@@ -132,6 +142,10 @@ impl PoolStorage {
                 )
                 .map_err(|_| storage_error())?;
         }
+        if messages.is_empty() && !receipt_only_ready {
+            transaction.commit().map_err(|_| storage_error())?;
+            return Ok(Communications::default());
+        }
         let receipts = {
             let mut statement = transaction
                 .prepare(
@@ -149,7 +163,7 @@ impl PoolStorage {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, i64>(1)?,
-                            DeliveryReceipt {
+                            ReceiptRecord {
                                 message_id: row.get(2)?,
                                 pool: row.get(3)?,
                                 to: row.get(4)?,
@@ -242,8 +256,8 @@ impl PoolStorage {
             let message_id = format!("msg_{}", Uuid::new_v4());
             transaction
                 .execute(
-                    "INSERT INTO messages(id,principal,pool,sender,target,body,in_reply_to,created,sender_member_id)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    "INSERT INTO messages(id,principal,pool,sender,target,body,created,sender_member_id)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
                         message_id,
                         message.principal,
@@ -251,7 +265,6 @@ impl PoolStorage {
                         message.sender,
                         message.target,
                         message.body,
-                        message.in_reply_to,
                         message.created_ms,
                         message.sender_member_id
                     ],

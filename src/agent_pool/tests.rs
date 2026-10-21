@@ -219,11 +219,11 @@ async fn wait_filters_pool_and_cancellation_keeps_unoffered_messages() {
     let mut waiter = Box::pin(store.wait("owner", waiting("p", 35), Some("a")));
     poll_pending(waiter.as_mut()).await;
     store
-        .admin_send("owner", "q", "alice", "other-pool", None)
+        .admin_send("owner", "q", "alice", "other-pool")
         .unwrap();
     poll_pending(waiter.as_mut()).await;
     store
-        .admin_send("owner", "p", "alice", "selected-pool", None)
+        .admin_send("owner", "p", "alice", "selected-pool")
         .unwrap();
     let result = waiter.await.unwrap();
     assert_eq!(result.reason, PoolWaitReason::Message);
@@ -240,9 +240,7 @@ async fn wait_filters_pool_and_cancellation_keeps_unoffered_messages() {
     let mut cancelled = Box::pin(store.wait("owner", waiting("p", 35), Some("a")));
     poll_pending(cancelled.as_mut()).await;
     drop(cancelled);
-    store
-        .admin_send("owner", "p", "alice", "retain", None)
-        .unwrap();
+    store.admin_send("owner", "p", "alice", "retain").unwrap();
     let received = store
         .wait("owner", waiting("p", 35), Some("a"))
         .await
@@ -331,7 +329,7 @@ fn admin_global_broadcast_includes_all_active_members() {
     store.storage.begin_tool_state(owner, Some("a")).unwrap();
 
     let sent = store
-        .admin_send(owner, "project", "global", "notice", None)
+        .admin_send(owner, "project", "global", "notice")
         .unwrap();
     assert_eq!(sent.recipients, ["alice", "bob"]);
     assert!(sent.message_id.is_some());
@@ -696,7 +694,7 @@ async fn an_older_wait_still_receives_after_a_newer_call_finishes() {
     );
     drop(newer);
     store
-        .admin_send("owner", "p", "alice", "arrives during wait", None)
+        .admin_send("owner", "p", "alice", "arrives during wait")
         .unwrap();
     let received = waiter.await.unwrap();
     assert_eq!(received.reason, PoolWaitReason::Message);
@@ -709,9 +707,7 @@ async fn overlapping_calls_reoffer_and_do_not_retire_each_others_batches() {
     store
         .send("owner", send("p", "global", "join"), Some("a"))
         .unwrap();
-    store
-        .admin_send("owner", "p", "alice", "parallel", None)
-        .unwrap();
+    store.admin_send("owner", "p", "alice", "parallel").unwrap();
     let first = store.start_tool("owner", Some("a")).await.unwrap();
     let offered = store
         .finish_tool_turn("owner", Some("a"), first.as_ref())
@@ -745,7 +741,7 @@ async fn cancelling_a_newer_call_does_not_suppress_an_older_call() {
     let first = store.start_tool("owner", Some("a")).await.unwrap();
     let cancelled = store.start_tool("owner", Some("a")).await.unwrap();
     store
-        .admin_send("owner", "p", "alice", "retain after cancellation", None)
+        .admin_send("owner", "p", "alice", "retain after cancellation")
         .unwrap();
     drop(cancelled);
     let offered = store
@@ -763,7 +759,7 @@ async fn same_session_in_different_accounts_has_independent_turns_and_acks() {
             .send(principal, send("p", "global", "join"), Some("same-session"))
             .unwrap();
         store
-            .admin_send(principal, "p", "alice", principal, None)
+            .admin_send(principal, "p", "alice", principal)
             .unwrap();
     }
     let first = store.start_tool("one", Some("same-session")).await.unwrap();
@@ -930,7 +926,7 @@ fn hidden_admin_address_supports_bidirectional_messages_and_termination() {
     assert_eq!(inbox[0].message, "need human input");
 
     let from_admin = store
-        .admin_send(owner, "project", "alice", "continue", None)
+        .admin_send(owner, "project", "alice", "continue")
         .unwrap();
     assert_eq!(from_admin.recipients, ["alice"]);
 
@@ -1022,8 +1018,7 @@ fn admin_messages_are_removed_only_on_restart_after_ack() {
 fn legacy_admin_messages_gain_ack_state_without_losing_messages() {
     let (directory, store) = store();
     let path = directory.path().join("agent-pool.sqlite3");
-    let mut args = send("p", ADMIN_AGENT, "legacy message");
-    args.in_reply_to = Some("earlier".into());
+    let args = send("p", ADMIN_AGENT, "legacy message");
     let message_id = store
         .send("owner", args, Some("a"))
         .unwrap()
@@ -1043,7 +1038,6 @@ fn legacy_admin_messages_gain_ack_state_without_losing_messages() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].message_id, message_id);
     assert_eq!(messages[0].message, "legacy message");
-    assert_eq!(messages[0].in_reply_to.as_deref(), Some("earlier"));
     assert!(!messages[0].acknowledged);
     assert!(migrated.admin_ack("owner", &message_id).unwrap());
     drop(migrated);

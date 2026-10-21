@@ -38,7 +38,7 @@ fn add_obsolete_columns(connection: &Connection) {
 }
 
 #[test]
-fn obsolete_column_migration_preserves_oldest_database_and_reoffers() {
+fn obsolete_member_column_migration_preserves_database_and_reoffers() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = tempfile::Builder::new()
@@ -48,8 +48,8 @@ fn obsolete_column_migration_preserves_oldest_database_and_reoffers() {
     let path = directory.path().join("pool.sqlite3");
     let connection = Connection::open(&path).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    // The initial v0.2.1 layout predates sender IDs, receipts, revisions,
-    // acknowledged admin messages, and the incremental orphan trigger.
+    // Messages use the current layout; legacy membership state predates sender
+    // IDs, receipts, revisions, admin ACKs, and the incremental orphan trigger.
     connection
         .execute_batch(
             "PRAGMA foreign_keys=ON;
@@ -62,7 +62,7 @@ fn obsolete_column_migration_preserves_oldest_database_and_reoffers() {
          CREATE TABLE messages (
            id TEXT PRIMARY KEY, principal TEXT NOT NULL, pool TEXT NOT NULL,
            sender TEXT NOT NULL, target TEXT NOT NULL, body TEXT NOT NULL,
-           in_reply_to TEXT, created INTEGER NOT NULL);
+           created INTEGER NOT NULL);
          CREATE TABLE inbox (
            cursor INTEGER PRIMARY KEY AUTOINCREMENT,
            member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
@@ -70,12 +70,12 @@ fn obsolete_column_migration_preserves_oldest_database_and_reoffers() {
            UNIQUE(member_id,message_id));
          CREATE TABLE admin_messages (
            id TEXT PRIMARY KEY, principal TEXT NOT NULL, pool TEXT NOT NULL,
-           sender TEXT NOT NULL, body TEXT NOT NULL, in_reply_to TEXT,
+           sender TEXT NOT NULL, body TEXT NOT NULL,
            created INTEGER NOT NULL);
          INSERT INTO members VALUES
            (42,'owner','work','alice','alice',9223372036854775807,10,'gen',99,100);
          INSERT INTO messages VALUES
-           ('queued','owner','work','bob','alice','retained',NULL,10);
+           ('queued','owner','work','bob','alice','retained',10);
          INSERT INTO inbox VALUES(100,42,'queued');
          UPDATE sqlite_sequence SET seq=900 WHERE name='members';",
         )
@@ -398,14 +398,12 @@ fn committed_send_effects_distinguish_joins_active_leaves_and_noops() {
         pool: "work".into(),
         target: Some(target.into()),
         message: Some("hello".into()),
-        in_reply_to: None,
         action: None,
     };
     let leave = || PoolSendArgs {
         pool: "work".into(),
         target: None,
         message: None,
-        in_reply_to: None,
         action: Some(PoolAction::Leave),
     };
 
@@ -459,7 +457,7 @@ fn committed_send_effects_distinguish_joins_active_leaves_and_noops() {
     assert_eq!(expired.effect, MutationEffect::Wake);
 
     let admin = storage
-        .admin_send("owner", "work", "global", "broadcast", None)
+        .admin_send("owner", "work", "global", "broadcast")
         .unwrap();
     assert_eq!(admin.effect, MutationEffect::Wake);
     assert!(admin.value.message_id.is_none());
@@ -485,7 +483,6 @@ fn unrelated_expired_members_are_not_deleted_by_read_lookups() {
         storage
             .admin_messages_page("owner", 10, None)
             .unwrap()
-            .value
             .messages
             .is_empty()
     );
@@ -654,7 +651,6 @@ fn expired_name_and_session_can_rejoin_behind_an_expiry_backlog() {
         pool: "work".into(),
         target: Some("global".into()),
         message: Some("join".into()),
-        in_reply_to: None,
         action: None,
     };
     // A new session needs to reclaim an expired dictionary name after the

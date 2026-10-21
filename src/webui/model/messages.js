@@ -1,4 +1,4 @@
-import { eventStartId, messageSend, messageCompletion, peerMessages } from './events.js';
+import { eventStartId, messageSend, messageCompletion, eventMessages } from './events.js';
 
 export function messages(events, finishes, pools, adminMessages, starts = new Map()) {
   const rows = [], received = new Set();
@@ -49,7 +49,7 @@ export function messages(events, finishes, pools, adminMessages, starts = new Ma
         timestamp_ms: e.timestamp_ms, kind: 'message.send', agents, sessions: [], recipient_count: d.delivery_count,
         status: `Queued for ${d.delivery_count} recipient(s)`});
     }
-    for (const m of peerMessages(e)) {
+    for (const m of eventMessages(e)) {
       // Older snapshots use to=global. Event identities retain the recipient
       // even after that member has left or its name has been reused.
       const recipient = m.to === 'global' ? (e.agents || []).find(a => a.pool === m.pool)?.agent : m.to;

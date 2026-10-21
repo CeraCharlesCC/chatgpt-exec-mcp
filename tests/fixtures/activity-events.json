@@ -23,7 +23,7 @@
       "lifecycle": {
         "type": "message_send", "phase": "finish", "tool": "pool_send", "pool": "beta", "start_event_id": 100,
         "message": {"pool": "beta", "target": "Bob", "body": "typed body", "from": "Alice", "message_id": "message-100", "recipients": ["Bob"], "status": "queued"},
-        "peer_messages": [{"pool": "beta", "message_id": "message-recv", "from": "Cara", "to": "Bob", "target": "Bob", "sent_at_ms": 1001, "message": "typed incoming"}],
+        "messages": [{"pool": "beta", "message_id": "message-recv", "from": "Cara", "to": "Bob", "target": "Bob", "sent_at_ms": 1001, "message": "typed incoming"}],
         "delivery_receipts": [{"pool": "beta", "message_id": "message-100", "to": "Bob", "status": "offered", "offered_at_ms": 1001}]
       }
     },

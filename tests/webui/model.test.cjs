@@ -23,6 +23,8 @@ test('shared Rust serialized fixture normalizes versioned and historical sends a
   assert.equal(typedRows.find(m => m.kind === 'message.send')?.message, 'typed body');
   assert.equal(typedRows.find(m => m.kind === 'message.send')?.message_id, 'message-100');
   assert.equal(typedRows.find(m => m.kind === 'message.receive')?.message, 'typed incoming');
+  assert.equal(typedRows.find(m => m.kind === 'message.receive')?.sent_at_ms, 1001);
+  assert.equal(typedFinish.semantic.deliveryReceipts[0].offered_at_ms, 1001);
   assert.deepEqual([...new Set(eventIdentities(typedFinish, typed.starts, typed.finishes)
     .filter(a => a.pool === 'beta').map(a => a.agent))].sort(), ['Alice', 'Bob', 'Cara']);
   const older = pageEventContext([legacyStart], [legacyFinish]);
@@ -39,7 +41,7 @@ test('legacy nested result communications and errors normalize without reconstru
   const peer = {pool: 'alpha', message_id: 'nested', from: 'Alice', to: 'Bob', message: 'nested offer'};
   const receipt = {pool: 'alpha', message_id: 'nested', to: 'Alice', status: 'offered'};
   const nested = event(92, 'tool.finish', {tool: 'pool_members', result: {value: {
-    agents: ['Alice'], peer_messages: [peer], delivery_receipts: [receipt],
+    agents: ['Alice'], messages: [peer], delivery_receipts: [receipt],
   }}});
   assert.equal(isMessageEvent(nested, new Map()), true);
   assert.deepEqual([...eventPools(nested, new Map())], ['alpha']);
@@ -53,23 +55,25 @@ test('legacy nested result communications and errors normalize without reconstru
   }});
   const rows = messages([start, failure], new Map([[93, failure]]), [], []);
   assert.equal(rows.find(m => m.kind === 'message.send')?.status, 'Failed: recipient left');
-  const oldWait = event(96, 'tool.finish', {tool: 'pool_wait', result: {
-    peer_messages: [], value: {messages: [peer]},
+  const empty = event(96, 'tool.finish', {tool: 'pool_wait', result: {
+    messages: [], value: {messages: [peer]},
   }});
-  assert.deepEqual(messages([oldWait], new Map(), [], []).map(m => m.message), ['nested offer']);
+  assert.deepEqual(messages([empty], new Map(), [], []), [], 'an explicit empty messages array is authoritative');
 });
 
-test('pool_wait messages appear in conversations and offered receipts retain filter identities', () => {
+test('top-level messages from every response appear in conversations and receipts retain filter identities', () => {
   const peer = {pool: 'alpha', message_id: 'msg-wait', from: 'Alice', to: 'Bob', message: 'done'};
-  const received = event(1, 'tool.finish', {
-    tool: 'pool_wait', result: {reason: 'message', messages: [peer], membership_changed: true},
-  }, {session: 'bob-session'});
-  assert.equal(isMessageEvent(received, new Map()), true);
-  assert.deepEqual([...eventPools(received, new Map())], ['alpha']);
-  assert.deepEqual(messages([received], new Map(), [], []).map(m => m.message), ['done']);
-  assert.deepEqual(eventIdentities(received, new Map(), new Map()), [
-    {pool: 'alpha', agent: 'Alice'}, {pool: 'alpha', agent: 'Bob'},
-  ]);
+  for (const tool of ['exec_command', 'write_stdin', 'pool_members', 'pool_send', 'pool_wait']) {
+    const received = event(1, 'tool.finish', {
+      tool, result: {messages: [peer]},
+    }, {session: 'bob-session'});
+    assert.equal(isMessageEvent(received, new Map()), true, tool);
+    assert.deepEqual([...eventPools(received, new Map())], ['alpha'], tool);
+    assert.deepEqual(messages([received], new Map(), [], []).map(m => m.message), ['done'], tool);
+    assert.deepEqual(eventIdentities(received, new Map(), new Map()), [
+      {pool: 'alpha', agent: 'Alice'}, {pool: 'alpha', agent: 'Bob'},
+    ], tool);
+  }
   const receipt = event(2, 'tool.finish', {tool: 'exec_command', result: {
     delivery_receipts: [{pool: 'archived', to: 'Cara', message_id: 'old', status: 'offered'}],
   }});
@@ -114,9 +118,9 @@ test('four intervening rows can merge but five or more cannot', () => {
 test('repeat receipts deduplicate within a session but retain different recipient sessions', () => {
   const peer = {pool: 'alpha', message_id: 'same', from: 'Alice', to: 'Bob', message: 'hello'};
   const events = [
-    event(1, 'tool.finish', {result: {peer_messages: [peer]}}, {session: 'bob-1'}),
-    event(2, 'tool.finish', {result: {peer_messages: [peer]}}, {session: 'bob-1'}),
-    event(3, 'tool.finish', {result: {peer_messages: [peer]}}, {session: 'bob-2'}),
+    event(1, 'tool.finish', {result: {messages: [peer]}}, {session: 'bob-1'}),
+    event(2, 'tool.finish', {result: {messages: [peer]}}, {session: 'bob-1'}),
+    event(3, 'tool.finish', {result: {messages: [peer]}}, {session: 'bob-2'}),
   ];
   const result = messages(events, new Map(), [], []);
   assert.equal(result.length, 2);
@@ -134,9 +138,9 @@ test('multiple deliveries to a reused recipient name stay visible in a coalesced
     start_event_id: 10, result: {value: {assigned_agent: 'Alice', message_id: 'same', recipients: ['Bob']}},
   });
   const receipts = [
-    event(12, 'tool.finish', {result: {peer_messages: [peer]}}, {session: 'bob-1'}),
-    event(13, 'tool.finish', {result: {peer_messages: [peer]}}, {session: 'bob-2'}),
-    event(14, 'tool.finish', {result: {peer_messages: [peer]}}, {session: 'bob-1'}),
+    event(12, 'tool.finish', {result: {messages: [peer]}}, {session: 'bob-1'}),
+    event(13, 'tool.finish', {result: {messages: [peer]}}, {session: 'bob-2'}),
+    event(14, 'tool.finish', {result: {messages: [peer]}}, {session: 'bob-1'}),
   ];
   const result = messages([start, finish, ...receipts], new Map([[10, finish]]), [], []);
   assert.equal(result.length, 1);
@@ -149,10 +153,10 @@ test('multiple deliveries to a reused recipient name stay visible in a coalesced
 test('legacy global receipts resolve the historical event recipient and pool', () => {
   const peer = {pool: 'old-pool', message_id: 'legacy', from: 'Alice', to: 'global', message: 'hi'};
   const events = [
-    event(1, 'tool.finish', {result: {peer_messages: [peer]}}, {
+    event(1, 'tool.finish', {result: {messages: [peer]}}, {
       agents: [{pool: 'old-pool', agent: 'Bob'}], session: 'bob-session',
     }),
-    event(2, 'tool.finish', {result: {peer_messages: [peer]}}, {
+    event(2, 'tool.finish', {result: {messages: [peer]}}, {
       agents: [{pool: 'old-pool', agent: 'Cara'}], session: 'cara-session',
     }),
   ];
@@ -170,7 +174,7 @@ test('equal timestamps still merge sends before receipts regardless of input ord
     start_event_id: 1,
     result: {
       value: {assigned_agent: 'Alice', message_id: 'msg-1', recipients: ['Bob']},
-      peer_messages: [{pool: 'alpha', message_id: 'msg-1', from: 'Alice', to: 'Bob', message: 'hello'}],
+      messages: [{pool: 'alpha', message_id: 'msg-1', from: 'Alice', to: 'Bob', message: 'hello'}],
     },
   }, {timestamp_ms: 100, session: 'bob'});
   const result = messages([finish, start], new Map([[1, finish]]), [], []);
@@ -209,7 +213,7 @@ test('event models correlate start and finish pools, agents, recipients and leav
     start_event_id: 1,
     result: {
       value: {assigned_agent: 'Alice', recipients: ['Bob', 'Cara']},
-      peer_messages: [{pool: 'historic', from: 'Dana', to: 'Eve'}],
+      messages: [{pool: 'historic', from: 'Dana', to: 'Eve'}],
     },
   });
   const starts = new Map([[start.id, start]]);
@@ -239,7 +243,7 @@ test('page correlation enriches selected sends without projecting off-page event
     tool: 'pool_send', start_event_id: 10,
     result: {value: {assigned_agent: 'Alice', message_id: 'msg-10', recipients: ['Bob']}},
   });
-  const unrelated = event(12, 'tool.finish', {result: {peer_messages: [{
+  const unrelated = event(12, 'tool.finish', {result: {messages: [{
     pool: 'beta', from: 'Ghost', to: 'Bob', message_id: 'ghost', message: 'not on this page',
   }]}});
 
@@ -264,13 +268,13 @@ test('v1 lifecycle sends are authoritative and finish-only events render without
     tool: 'pool_send', arguments: {pool: 'wrong', target: 'Nobody', message: 'spoofed legacy detail'},
   }, {schema_version: 1, session: 'sender', lifecycle: {
     type: 'message_send', phase: 'start', tool: 'pool_send',
-    message: {pool: 'beta', target: 'Bob', body: 'typed body', in_reply_to: 'thread', status: 'sending'},
+    message: {pool: 'beta', target: 'Bob', body: 'typed body', status: 'sending'},
   }});
   const typedFinish = event(41, 'tool.finish', {
     start_event_id: 999, result: {value: {message_id: 'wrong', recipients: ['Nobody']}},
   }, {schema_version: 1, session: 'recipient', lifecycle: {
     type: 'message_send', phase: 'finish', tool: 'pool_send', start_event_id: 40,
-    message: {pool: 'beta', target: 'Bob', body: 'typed body', in_reply_to: 'thread',
+    message: {pool: 'beta', target: 'Bob', body: 'typed body',
       from: 'Alice', message_id: 'correct', recipients: ['Bob'], status: 'queued'},
   }});
 
@@ -282,7 +286,6 @@ test('v1 lifecycle sends are authoritative and finish-only events render without
   assert.equal(shown[0].from, 'Alice');
   assert.equal(shown[0].message_id, 'correct');
   assert.equal(shown[0].status, 'Queued for 1 recipient(s)');
-  assert.equal(shown[0].in_reply_to, 'thread');
   assert.deepEqual([...eventPools(typedFinish, finishOnly.starts)], ['beta']);
   assert.deepEqual(new Set(eventIdentities(typedFinish, finishOnly.starts, finishOnly.finishes)
     .map(a => a.agent)), new Set(['Alice', 'Bob']));
@@ -316,13 +319,13 @@ test('v1 typed peer messages and receipts supersede legacy detail for messages a
       delivery_receipts: [{pool: 'wrong', to: 'Nobody'}]},
   }, {schema_version: 1, session: 'bob-session', lifecycle: {
     type: 'tool', phase: 'finish', tool: 'pool_wait', start_event_id: 60,
-    peer_messages: [typedPeer], delivery_receipts: [{pool: 'beta', to: 'Cara'}],
+    messages: [typedPeer], delivery_receipts: [{pool: 'beta', to: 'Cara'}],
   }});
   assert.deepEqual(messages([e], new Map(), [], []).map(m => m.message), ['typed received']);
   assert.deepEqual([...eventPools(e, new Map())], ['beta']);
   assert.deepEqual(new Set(eventIdentities(e, new Map(), new Map()).map(x => x.agent)),
     new Set(['Alice', 'Bob', 'Cara']));
-  const noTypedPeers = {...e, lifecycle: {...e.lifecycle, peer_messages: [], delivery_receipts: []}};
+  const noTypedPeers = {...e, lifecycle: {...e.lifecycle, messages: [], delivery_receipts: []}};
   assert.equal(isMessageEvent(noTypedPeers, new Map()), false);
   assert.deepEqual(messages([noTypedPeers], new Map(), [], []), []);
 });

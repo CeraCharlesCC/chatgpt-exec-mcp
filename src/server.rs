@@ -189,10 +189,13 @@ impl ExecMcpServer {
         comms: &Communications,
     ) -> (bool, Value) {
         match result {
-            Ok(value) => (true, response::with_comms(json!({"value": value}), comms)),
+            Ok(value) => (
+                true,
+                response::with_internal_comms(json!({"value": value}), comms),
+            ),
             Err(error) => (
                 false,
-                response::with_comms(json!({"error": error.message.to_string()}), comms),
+                response::with_internal_comms(json!({"error": error.message.to_string()}), comms),
             ),
         }
     }
@@ -205,7 +208,7 @@ impl ExecMcpServer {
             Ok(response) => (true, Self::exec_response_detail(response, comms)),
             Err(error) => (
                 false,
-                response::with_comms(json!({"error": error.to_string()}), comms),
+                response::with_internal_comms(json!({"error": error.to_string()}), comms),
             ),
         }
     }
@@ -226,7 +229,7 @@ impl ExecMcpServer {
                 json!(response.call_wall_time_seconds),
             );
         }
-        response::with_comms(detail, comms)
+        response::with_internal_comms(detail, comms)
     }
 
     fn activity_preview(value: &str) -> String {
@@ -344,7 +347,7 @@ impl ExecMcpServer {
         call.finish_pool(result).await
     }
 
-    /// Wait for this pool's messages, offered receipts, membership changes, or timeout.
+    /// Wait for this pool's messages, membership changes, or timeout.
     /// Returns messages directly; timeout is a normal result. Does not join.
     #[tool(output_schema = schema_for_output::<PoolWaitResult>(), annotations(read_only_hint = true))]
     async fn pool_wait(
@@ -398,7 +401,10 @@ impl ExecMcpServer {
             },
         )
         .await;
-        response::pool_result(result, Communications::default())
+        response::pool_result(
+            result.map(|value| PoolWaitResult::from(&value)),
+            Communications::default(),
+        )
     }
 
     /// Queue a message; first send joins and assigns a name. Messages arrive on

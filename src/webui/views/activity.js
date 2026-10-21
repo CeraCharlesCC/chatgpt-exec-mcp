@@ -67,7 +67,7 @@ function updateEvent(node, html) {
   }
 }
 function messageMarkup(m) {
-  return `<article class="event lvl-${esc(m.level || 'info')}"><div class="event-head"><span class="event-kind">${esc(m.from)} → ${esc(m.to)}</span>${time(m.timestamp_ms)}</div><div class="chips"><span class="chip">${esc(m.pool)}</span><span class="chip">${esc(m.kind)}</span>${m.message_id ? `<span class="chip">${esc(m.message_id)}</span>` : ''}${m.in_reply_to ? `<span class="chip">reply to ${esc(m.in_reply_to)}</span>` : ''}</div><div class="message-body">${esc(m.message)}</div><div class="message-status">${esc(m.status)}</div></article>`;
+  return `<article class="event lvl-${esc(m.level || 'info')}"><div class="event-head"><span class="event-kind">${esc(m.from)} → ${esc(m.to)}</span>${time(m.timestamp_ms)}</div><div class="chips"><span class="chip">${esc(m.pool)}</span><span class="chip">${esc(m.kind)}</span>${m.message_id ? `<span class="chip">${esc(m.message_id)}</span>` : ''}</div><div class="message-body">${esc(m.message)}</div><div class="message-status">${esc(m.status)}</div></article>`;
 }
 function updateMessage(node, html) {
   if (!node.firstElementChild) {

@@ -400,7 +400,7 @@ fn disk_budget_discards_oldest_archives() {
 fn typed_message_lifecycle_preserves_legacy_fields_and_is_self_contained() {
     let hub = ActivityHub::new(3);
     let args: PoolSendArgs = serde_json::from_value(json!({
-        "pool":"team", "target":"Bob", "message":"hello", "in_reply_to":"m0"
+        "pool":"team", "target":"Bob", "message":"hello"
     }))
     .unwrap();
     let message_context = ActivityMessage::from_pool_send_args(&args).unwrap();
@@ -461,7 +461,6 @@ fn typed_message_lifecycle_preserves_legacy_fields_and_is_self_contained() {
     assert_eq!(message.pool.as_deref(), Some("team"));
     assert_eq!(message.target.as_deref(), Some("Bob"));
     assert_eq!(message.body.as_deref(), Some("hello"));
-    assert_eq!(message.in_reply_to.as_deref(), Some("m0"));
     assert_eq!(message.from.as_deref(), Some("Alice"));
     assert_eq!(message.message_id.as_deref(), Some("m1"));
     assert_eq!(message.recipients, Some(vec!["Bob".to_owned()]));
@@ -494,14 +493,24 @@ fn typed_message_error_and_tool_receives_use_explicit_lifecycle() {
     assert_eq!(message.error.as_deref(), Some("not allowed"));
     assert_eq!(message.body.as_deref(), Some("hi"));
 
-    hub.emit("tool.finish", "info", None, vec![],
-            json!({"tool":"pool_wait", "start_event_id":123,
-                "result":{"messages":[{"message_id":"m2", "pool":"team", "from":"Bob", "to":"Alice"}],
-                    "delivery_receipts":[{"message_id":"m1", "pool":"team", "to":"Bob"}]}}));
-    let lifecycle = hub.snapshot(1).pop().unwrap().lifecycle.unwrap();
-    assert_eq!(lifecycle.event_type, ActivityLifecycleType::Tool);
-    assert_eq!(lifecycle.peer_messages[0]["message_id"], "m2");
-    assert_eq!(lifecycle.delivery_receipts[0]["message_id"], "m1");
+    for tool in [
+        "exec_command",
+        "write_stdin",
+        "pool_members",
+        "pool_send",
+        "pool_wait",
+    ] {
+        hub.emit("tool.finish", "info", None, vec![],
+                json!({"tool":tool, "start_event_id":123,
+                    "result":{"messages":[{"message_id":"m2", "pool":"team", "from":"Bob", "to":"Alice", "sent_at_ms":42}],
+                        "delivery_receipts":[{"message_id":"m1", "pool":"team", "to":"Bob", "offered_at_ms":43}]}}));
+        let lifecycle = hub.snapshot(1).pop().unwrap().lifecycle.unwrap();
+        assert_eq!(lifecycle.event_type, ActivityLifecycleType::Tool);
+        assert_eq!(lifecycle.messages[0]["message_id"], "m2");
+        assert_eq!(lifecycle.messages[0]["sent_at_ms"], 42);
+        assert_eq!(lifecycle.delivery_receipts[0]["message_id"], "m1");
+        assert_eq!(lifecycle.delivery_receipts[0]["offered_at_ms"], 43);
+    }
 
     hub.emit(
         "tool.start",
@@ -662,7 +671,7 @@ fn shared_v1_and_legacy_activity_event_fixture_is_wire_compatible() {
 /// conflicting fields happen to be present in presentation-oriented JSON.
 #[test]
 fn typed_completion_context_overrides_misleading_legacy_result_and_comms() {
-    use crate::agent_pool::{Communications, DeliveryReceipt, PeerMessage, ReceiptStatus};
+    use crate::agent_pool::{Communications, MessageRecord, ReceiptRecord, ReceiptStatus};
 
     let fixture: Value =
         serde_json::from_str(include_str!("../../../tests/fixtures/activity-events.json")).unwrap();
@@ -693,7 +702,7 @@ fn typed_completion_context_overrides_misleading_legacy_result_and_comms() {
     );
 
     let communications = Communications {
-        messages: vec![PeerMessage {
+        messages: vec![MessageRecord {
             pool: "beta".to_owned(),
             message_id: "message-recv".to_owned(),
             from: "Cara".to_owned(),
@@ -701,9 +710,8 @@ fn typed_completion_context_overrides_misleading_legacy_result_and_comms() {
             target: "Bob".to_owned(),
             sent_at_ms: 1001,
             message: "typed incoming".to_owned(),
-            in_reply_to: None,
         }],
-        delivery_receipts: vec![DeliveryReceipt {
+        delivery_receipts: vec![ReceiptRecord {
             pool: "beta".to_owned(),
             message_id: "message-100".to_owned(),
             to: "Bob".to_owned(),
@@ -751,6 +759,6 @@ fn typed_completion_context_overrides_misleading_legacy_result_and_comms() {
         },
     );
     let empty = hub.snapshot(1).pop().unwrap().lifecycle.unwrap();
-    assert!(empty.peer_messages.is_empty());
+    assert!(empty.messages.is_empty());
     assert!(empty.delivery_receipts.is_empty());
 }

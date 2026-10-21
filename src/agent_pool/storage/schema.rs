@@ -42,7 +42,6 @@ pub(super) fn initialize(connection: &mut Connection) -> anyhow::Result<()> {
                sender TEXT NOT NULL,
                target TEXT NOT NULL,
                body TEXT NOT NULL,
-               in_reply_to TEXT,
                created INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS inbox (
@@ -59,7 +58,6 @@ pub(super) fn initialize(connection: &mut Connection) -> anyhow::Result<()> {
                pool TEXT NOT NULL,
                sender TEXT NOT NULL,
                body TEXT NOT NULL,
-               in_reply_to TEXT,
                created INTEGER NOT NULL,
                acknowledged INTEGER NOT NULL DEFAULT 0
              );

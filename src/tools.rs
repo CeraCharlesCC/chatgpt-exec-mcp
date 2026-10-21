@@ -218,7 +218,7 @@ pub struct ExecResponse {
     pub output_ref: Option<OutputRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<PeerMessage>", default)]
-    pub peer_messages: Option<Vec<PeerMessage>>,
+    pub messages: Option<Vec<PeerMessage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<DeliveryReceipt>", default)]
     pub delivery_receipts: Option<Vec<DeliveryReceipt>>,

@@ -44,6 +44,7 @@ pub(super) struct MembersState {
     pub(super) result: PoolMembersResult,
     pub(super) membership_revision: i64,
     pub(super) next_expiry_ms: Option<i64>,
+    /// Only peer inbox messages can make a wait return before its deadline.
     pub(super) pending: bool,
 }
 
@@ -51,8 +52,6 @@ pub(super) struct MembersState {
 /// caller needs a second membership query after a transaction commits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MutationEffect {
-    /// Only the returned data changed; waiting peers need no notification.
-    None,
     /// Wake observers to recheck queues (also preserves legacy no-op wakes).
     Wake,
     /// A member was added or an active member was removed from this pool.
@@ -77,7 +76,6 @@ struct MemberMessage<'a> {
     sender_member_id: Option<i64>,
     target: &'a str,
     body: &'a str,
-    in_reply_to: Option<&'a str>,
     created_ms: i64,
 }
 

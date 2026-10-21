@@ -36,7 +36,6 @@ pub(super) fn send(pool: &str, target: &str, body: &str) -> PoolSendArgs {
         pool: pool.into(),
         target: Some(target.into()),
         message: Some(body.into()),
-        in_reply_to: None,
         action: None,
     }
 }
@@ -46,7 +45,6 @@ pub(super) fn leave(pool: &str) -> PoolSendArgs {
         pool: pool.into(),
         target: None,
         message: None,
-        in_reply_to: None,
         action: Some(PoolAction::Leave),
     }
 }

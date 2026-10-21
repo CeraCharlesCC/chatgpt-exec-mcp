@@ -138,8 +138,6 @@ struct SendRequest {
     pool: String,
     target: String,
     message: String,
-    #[serde(default)]
-    in_reply_to: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -384,7 +382,6 @@ async fn send(
             &request.pool,
             &request.target,
             &request.message,
-            request.in_reply_to.as_deref(),
         )
         .await
         .map_err(pool_error)?;
@@ -405,7 +402,6 @@ async fn send(
             "pool": request.pool,
             "target": request.target,
             "message": request.message,
-            "in_reply_to": request.in_reply_to,
             "message_id": result.message_id.clone(),
             "delivery_count": result.recipients.len(),
         }),

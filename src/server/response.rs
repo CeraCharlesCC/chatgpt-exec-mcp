@@ -6,16 +6,47 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::agent_pool::Communications;
+use crate::agent_pool::{Communications, DeliveryReceipt, PeerMessage};
 use crate::tools::ExecResponse;
 
-pub(super) fn with_comms(mut detail: Value, comms: &Communications) -> Value {
+/// Activity diagnostics retain internal delivery timestamps.
+pub(super) fn with_internal_comms(mut detail: Value, comms: &Communications) -> Value {
     if let Some(object) = detail.as_object_mut() {
         if !comms.messages.is_empty() {
-            object.insert("peer_messages".into(), json!(comms.messages));
+            object.insert("messages".into(), json!(comms.messages));
         }
         if !comms.delivery_receipts.is_empty() {
             object.insert("delivery_receipts".into(), json!(comms.delivery_receipts));
+        }
+    }
+    detail
+}
+
+fn with_agent_comms(mut detail: Value, comms: &Communications) -> Value {
+    if let Some(object) = detail.as_object_mut() {
+        if !comms.messages.is_empty() {
+            object.insert(
+                "messages".into(),
+                json!(
+                    comms
+                        .messages
+                        .iter()
+                        .map(PeerMessage::from)
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        if !comms.delivery_receipts.is_empty() {
+            object.insert(
+                "delivery_receipts".into(),
+                json!(
+                    comms
+                        .delivery_receipts
+                        .iter()
+                        .map(DeliveryReceipt::from)
+                        .collect::<Vec<_>>()
+                ),
+            );
         }
     }
     detail
@@ -30,7 +61,7 @@ pub(super) fn pool_result<T: Serialize>(
             let mut structured = serde_json::to_value(value).map_err(|_| {
                 McpError::internal_error("pool response serialization failed", None)
             })?;
-            structured = with_comms(structured, &comms);
+            structured = with_agent_comms(structured, &comms);
             let mut result =
                 CallToolResult::success(vec![ContentBlock::text(structured.to_string())]);
             result.structured_content = Some(structured);
@@ -41,7 +72,7 @@ pub(super) fn pool_result<T: Serialize>(
             append_comms_block(&mut text, &comms);
             let mut result = CallToolResult::error(vec![ContentBlock::text(text)]);
             if !comms.is_empty() {
-                result.structured_content = Some(with_comms(json!({}), &comms));
+                result.structured_content = Some(with_agent_comms(json!({}), &comms));
             }
             Ok(result)
         }
@@ -63,10 +94,16 @@ pub(super) fn success(
     comms: Communications,
 ) -> Result<CallToolResult, McpError> {
     if !comms.messages.is_empty() {
-        response.peer_messages = Some(comms.messages.clone());
+        response.messages = Some(comms.messages.iter().map(PeerMessage::from).collect());
     }
     if !comms.delivery_receipts.is_empty() {
-        response.delivery_receipts = Some(comms.delivery_receipts.clone());
+        response.delivery_receipts = Some(
+            comms
+                .delivery_receipts
+                .iter()
+                .map(DeliveryReceipt::from)
+                .collect(),
+        );
     }
     let structured = serde_json::to_value(&response)
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
@@ -101,24 +138,21 @@ fn response_summary(response: &ExecResponse) -> String {
 
 fn append_comms_block(text: &mut String, comms: &Communications) {
     if !comms.messages.is_empty() {
-        text.push_str("\n\n=== PEER MESSAGES ===");
+        text.push_str("\n\n=== MESSAGES ===");
         for message in &comms.messages {
             text.push_str(&format!(
                 "\n[{} {} -> {} in {}] {}",
                 message.message_id, message.from, message.to, message.pool, message.message
             ));
-            if let Some(reply) = message.in_reply_to.as_deref() {
-                text.push_str(&format!(" (in_reply_to={reply})"));
-            }
         }
-        text.push_str("\n=== END PEER MESSAGES ===");
+        text.push_str("\n=== END MESSAGES ===");
     }
     if !comms.delivery_receipts.is_empty() {
         text.push_str("\n\n=== DELIVERY RECEIPTS (offered, not read or accepted) ===");
         for receipt in &comms.delivery_receipts {
             text.push_str(&format!(
-                "\n[{} in {}] offered to {} at {}",
-                receipt.message_id, receipt.pool, receipt.to, receipt.offered_at_ms
+                "\n[{} in {}] offered to {}",
+                receipt.message_id, receipt.pool, receipt.to
             ));
         }
         text.push_str("\n=== END DELIVERY RECEIPTS ===");
@@ -130,7 +164,7 @@ pub(super) fn tool_error(error: anyhow::Error, comms: Communications) -> CallToo
     append_comms_block(&mut text, &comms);
     let mut result = CallToolResult::error(vec![ContentBlock::text(text)]);
     if !comms.is_empty() {
-        result.structured_content = Some(with_comms(json!({}), &comms));
+        result.structured_content = Some(with_agent_comms(json!({}), &comms));
     }
     result
 }

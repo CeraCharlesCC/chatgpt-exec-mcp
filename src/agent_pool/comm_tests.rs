@@ -18,8 +18,8 @@ fn join_pair(store: &AgentPoolStore) {
         .unwrap();
 }
 
-#[tokio::test]
-async fn offered_receipt_wakes_sender_without_a_reply_and_is_not_recursive() {
+#[tokio::test(start_paused = true)]
+async fn offered_receipt_waits_for_timeout_and_is_not_recursive() {
     let (_directory, store) = store();
     join_pair(&store);
     collect(&store, "a").await;
@@ -28,6 +28,8 @@ async fn offered_receipt_wakes_sender_without_a_reply_and_is_not_recursive() {
         .unwrap();
     let mut waiter = Box::pin(store.wait("owner", waiting("p", 35), Some("a")));
     poll_pending(waiter.as_mut()).await;
+    let mut changes = store.coordinator.notification_sender().subscribe();
+    changes.borrow_and_update();
     let recipient = store.start_tool("owner", Some("b")).await.unwrap();
     let first = store
         .finish_tool_turn("owner", Some("b"), recipient.as_ref())
@@ -46,8 +48,25 @@ async fn offered_receipt_wakes_sender_without_a_reply_and_is_not_recursive() {
     assert_eq!(first.messages[0].from, "alice");
     assert_eq!(first.messages[0].to, "bob");
     assert_eq!(first.messages, repeated.messages);
+    assert!(
+        !changes.has_changed().unwrap(),
+        "receipts must not notify waiters"
+    );
+    assert!(
+        !store
+            .storage
+            .members_state("owner", &PoolMembersArgs { pool: "p".into() }, Some("a"))
+            .unwrap()
+            .pending
+    );
+    poll_pending(waiter.as_mut()).await;
+    let before = tokio::time::Instant::now();
     let received = waiter.await.unwrap();
-    assert_eq!(received.reason, PoolWaitReason::Receipt);
+    assert_eq!(received.reason, PoolWaitReason::Timeout);
+    assert_eq!(
+        tokio::time::Instant::now() - before,
+        Duration::from_secs(35)
+    );
     assert!(!received.membership_changed && received.messages.is_empty());
     assert_eq!(received.delivery_receipts.len(), 1);
     let receipt = &received.delivery_receipts[0];
@@ -65,6 +84,119 @@ async fn offered_receipt_wakes_sender_without_a_reply_and_is_not_recursive() {
     assert!(collect(&store, "a").await.is_empty());
     drop(recipient);
     assert!(collect(&store, "b").await.is_empty());
+}
+
+#[tokio::test]
+async fn stale_message_pending_snapshot_does_not_offer_a_receipt_when_wait_continues() {
+    let (_directory, store) = store();
+    join_pair(&store);
+    collect(&store, "a").await;
+    collect(&store, "a").await;
+    store
+        .send("owner", send("p", "bob", "offered"), Some("a"))
+        .unwrap();
+    collect(&store, "b").await;
+    let incoming = store
+        .admin_send("owner", "p", "alice", "already retired")
+        .unwrap();
+    assert!(
+        store
+            .storage
+            .members_state("owner", &PoolMembersArgs { pool: "p".into() }, Some("a"))
+            .unwrap()
+            .pending
+    );
+    // Simulate retirement between the pending snapshot and collection.
+    store
+        .storage
+        .connection()
+        .unwrap()
+        .execute(
+            "DELETE FROM inbox WHERE message_id=?1",
+            [incoming.message_id.unwrap()],
+        )
+        .unwrap();
+    let comms = store
+        .storage
+        .collect_tool_comms_if_ready("owner", Some("a"), Some("p"), false)
+        .unwrap();
+    assert!(comms.is_empty());
+    let cursor: Option<i64> = store
+        .storage
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT receipt_offered_cursor FROM members WHERE session='a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cursor, None);
+    assert_eq!(collect(&store, "a").await.delivery_receipts.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_receipt_is_piggybacked_only_when_a_wait_times_out() {
+    let (_directory, store) = store();
+    join_pair(&store);
+    collect(&store, "a").await;
+    let sent = store
+        .send("owner", send("p", "bob", "offered before wait"), Some("a"))
+        .unwrap();
+    collect(&store, "b").await;
+    let before = tokio::time::Instant::now();
+    let outcome = store
+        .wait("owner", waiting("p", 5), Some("a"))
+        .await
+        .unwrap();
+    assert_eq!(tokio::time::Instant::now() - before, Duration::from_secs(5));
+    assert_eq!(outcome.reason, PoolWaitReason::Timeout);
+    assert!(outcome.messages.is_empty() && !outcome.membership_changed);
+    assert_eq!(outcome.delivery_receipts.len(), 1);
+    assert_eq!(
+        Some(&outcome.delivery_receipts[0].message_id),
+        sent.message_id.as_ref()
+    );
+    assert!(collect(&store, "a").await.is_empty());
+}
+
+#[tokio::test]
+async fn pending_receipt_is_piggybacked_when_a_message_or_membership_change_completes_wait() {
+    for message in [false, true] {
+        let (_directory, store) = store();
+        join_pair(&store);
+        collect(&store, "a").await;
+        let sent = store
+            .send("owner", send("p", "bob", "do work"), Some("a"))
+            .unwrap();
+        let mut wait = Box::pin(store.wait("owner", waiting("p", 35), Some("a")));
+        poll_pending(wait.as_mut()).await;
+        collect(&store, "b").await;
+        poll_pending(wait.as_mut()).await;
+        if message {
+            store
+                .send("owner", send("p", "alice", "reply"), Some("b"))
+                .unwrap();
+        } else {
+            store.send("owner", leave("p"), Some("b")).unwrap();
+        }
+        let outcome = wait.await.unwrap();
+        assert_eq!(
+            outcome.reason,
+            if message {
+                PoolWaitReason::Message
+            } else {
+                PoolWaitReason::MembershipChanged
+            }
+        );
+        assert_eq!(outcome.membership_changed, !message);
+        assert_eq!(outcome.messages.len(), usize::from(message));
+        assert_eq!(outcome.delivery_receipts.len(), 1);
+        assert_eq!(
+            Some(&outcome.delivery_receipts[0].message_id),
+            sent.message_id.as_ref()
+        );
+    }
 }
 
 #[tokio::test]
@@ -181,18 +313,30 @@ async fn message_reason_preserves_a_simultaneous_membership_change() {
     assert_eq!(result.messages[0].message, "new member");
 }
 
-#[tokio::test]
-async fn admin_snapshot_offer_not_manual_ack_generates_one_receipt() {
+#[tokio::test(start_paused = true)]
+async fn admin_snapshot_receipt_waits_for_timeout_and_ack_does_not_repeat_it() {
     let (_directory, store) = store();
     store
         .send("owner", send("p", "admin", "human input"), Some("a"))
         .unwrap();
     let mut wait = Box::pin(store.wait("owner", waiting("p", 35), Some("a")));
     poll_pending(wait.as_mut()).await;
+    let mut changes = store.coordinator.notification_sender().subscribe();
+    changes.borrow_and_update();
     let inbox = store.admin_messages("owner", 10).unwrap();
     assert!(!inbox[0].acknowledged);
+    assert!(
+        !changes.has_changed().unwrap(),
+        "admin offers must not notify waiters"
+    );
+    poll_pending(wait.as_mut()).await;
+    let before = tokio::time::Instant::now();
     let result = wait.await.unwrap();
-    assert_eq!(result.reason, PoolWaitReason::Receipt);
+    assert_eq!(result.reason, PoolWaitReason::Timeout);
+    assert_eq!(
+        tokio::time::Instant::now() - before,
+        Duration::from_secs(35)
+    );
     assert_eq!(result.delivery_receipts[0].to, "admin");
     collect(&store, "a").await;
     store.admin_messages("owner", 10).unwrap();
