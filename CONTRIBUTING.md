@@ -17,6 +17,22 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 CI runs on pull requests and pushes to main. It tests, lints, and builds the
 standalone binary using the locked dependency graph.
 
+For a shorter local feedback loop, select the affected unit module or integration
+target before running the full suite:
+
+```bash
+cargo test --lib agent_pool --locked
+cargo test --lib process_manager --locked
+cargo test --test mcp_stdio --locked
+cargo test --test webui_http --locked
+```
+
+Keep private unit tests in child `tests` modules beside their implementation.
+Split integration scenarios into child modules of the existing test target when
+they grow; this preserves one Cargo target and shared setup. Share small fixture
+helpers, and keep scenario assertions and synchronization visible in the tests.
+Focused runs complement the full workspace suite required above.
+
 ## Browser tests
 
 The WebUI regression tests require Node.js 20+ and Playwright:
@@ -34,9 +50,11 @@ To use an existing Chrome installation instead of downloading Chromium:
 WEBUI_BROWSER=/absolute/path/to/chrome npm test
 ```
 
-`npm test` runs both the Playwright UI regressions (`ui.test.cjs`) and the
-browser-independent conversation model tests (`model.test.cjs`). To run only
-the model tests, use `npm run test:model`. From the repository root, run
+`npm test` runs the Playwright UI regressions (`ui.test.cjs`) and the
+browser-independent model and controller tests. Use `npm run test:unit` for
+all Node unit tests, `npm run test:model` for models only, or
+`npm run test:controllers` for pagination and request invalidation tests.
+From the repository root, run
 `cargo test --test webui_http --locked` for HTTP routing, asset, and admin API
 coverage. The Rust and browser suites are complementary: run both when changing
 the WebUI.
@@ -47,14 +65,18 @@ The WebUI uses browser-native ES modules in `src/webui/`, with markup in
 `src/webui.html` and styles in `src/webui/styles.css`. These assets are embedded
 in the Rust binary by `src/webui.rs`; no frontend build step is required.
 
-Keep application coordination in `app.js`, rendering in `views/`, and
-browser-independent logic in `model/`. When changing polling or rendering,
+Keep application coordination in `app.js`, rendering in `views/`, request and
+pagination state in `controllers/`, and pure event projections in `model/`.
+When changing polling or rendering,
 preserve user interactions such as scrolling and text selection, and guard
 against stale responses restoring cleared history.
 
-When adding an asset, register it in `src/webui.rs` and the Playwright HTTP
-fixture in `tests/webui/ui.test.cjs`. Cover UI changes with browser tests and
-model changes with Node tests, using the commands above.
+When adding an asset, register its relative path and content type in
+`src/webui/assets.rs`. Keep the macro body valid JSON: Rust expands it into
+compile-time embedded assets and the Playwright HTTP fixture reads the same
+allowlist. Cover UI changes with browser tests and model/controller changes
+with Node tests, using the commands above. Controller tests use deferred
+responses to exercise request races without browser timing or a live server.
 
 ## Release artifact
 

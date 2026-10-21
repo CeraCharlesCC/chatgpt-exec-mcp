@@ -29,12 +29,13 @@ jobs:
           fi
       - name: Install fixed Rust toolchain
         run: |
-          rustup toolchain install 1.93.1 --profile minimal --component clippy
+          rustup toolchain install 1.93.1 --profile minimal --component clippy --component rustfmt
           rustup override set 1.93.1
       - name: Fetch locked dependencies
         run: cargo fetch --locked
       - name: Test and lint
         run: |
+          cargo fmt --all --check
           cargo test --workspace --all-targets --locked --offline
           cargo clippy --workspace --all-targets --locked --offline -- -D warnings
       - name: Prepare release files

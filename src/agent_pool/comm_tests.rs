@@ -1,4 +1,4 @@
-use super::tests::{leave, poll_pending, send, store, waiting};
+use super::test_support::{leave, poll_pending, send, store, waiting};
 use super::*;
 
 async fn collect(store: &AgentPoolStore, session: &str) -> Communications {

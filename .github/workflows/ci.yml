@@ -18,7 +18,7 @@ jobs:
           persist-credentials: false
       - name: Install fixed Rust toolchain
         run: |
-          rustup toolchain install 1.93.1 --profile minimal --component clippy
+          rustup toolchain install 1.93.1 --profile minimal --component clippy --component rustfmt
           rustup override set 1.93.1
       - name: Fetch locked dependencies
         run: cargo fetch --locked
@@ -30,6 +30,7 @@ jobs:
           setsid true
       - name: Test and lint
         run: |
+          cargo fmt --all --check
           cargo test --workspace --all-targets --locked --offline
           cargo clippy --workspace --all-targets --locked --offline -- -D warnings
       - name: Prepare build files
@@ -43,7 +44,7 @@ jobs:
           if-no-files-found: error
 
   webui:
-    name: WebUI browser and model tests
+    name: WebUI browser, model, and controller tests
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     defaults:
@@ -63,5 +64,5 @@ jobs:
         run: npm ci
       - name: Install Playwright Chromium and system libraries
         run: npx playwright install --with-deps chromium
-      - name: Run browser and pure-model regression suites
+      - name: Run browser, model, and controller regression suites
         run: npm test

@@ -2,9 +2,12 @@
 
 use std::time::Duration;
 
+use chatgpt_exec_mcp::ProcessManager;
 use chatgpt_exec_mcp::tools::{ExecCommandArgs, ExecResponse, WriteStdinArgs};
-use chatgpt_exec_mcp::{Config, ProcessManager};
 use tempfile::TempDir;
+
+mod support;
+use support::{test_config, wait_for_captured_output};
 
 fn gate(workspace: &TempDir, name: &str) {
     use std::os::unix::ffi::OsStrExt;
@@ -44,19 +47,7 @@ async fn release(workspace: &TempDir, name: &str) {
 }
 
 fn manager(workspace: &TempDir) -> std::sync::Arc<ProcessManager> {
-    let path = workspace.path().join("config.json");
-    std::fs::write(
-        &path,
-        serde_json::json!({
-            "version": 1, "workspace": ".", "shell": "/bin/bash", "output_store_dir": "outputs",
-            "child_env": { "inherit": [], "rules": [] },
-            "session_idle_timeout": 60,
-            "output_store_retention": 60, "output_store_max_bytes": 67108864
-        })
-        .to_string(),
-    )
-    .unwrap();
-    ProcessManager::new(Config::load(&path).unwrap()).unwrap()
+    ProcessManager::new(test_config(workspace)).unwrap()
 }
 
 fn args(cmd: &str, tokens: usize) -> ExecCommandArgs {
@@ -103,27 +94,6 @@ async fn terminal(
     .expect("command did not finish")
 }
 
-// Observe the spool itself to establish that the incomplete bytes are captured;
-// a wall-clock delay or a missing replacement character alone is insufficient.
-async fn captured_bytes(workspace: &TempDir, expected: &[u8]) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let found = std::fs::read_dir(workspace.path().join("outputs"))
-                .unwrap()
-                .filter_map(Result::ok)
-                .any(|entry| {
-                    std::fs::read(entry.path().join("raw.log")).is_ok_and(|bytes| bytes == expected)
-                });
-            if found {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("expected raw bytes were not captured");
-}
-
 #[tokio::test]
 async fn split_scalar_defers_incomplete_bytes_then_preserves_malformed_raw_output() {
     let workspace = TempDir::new().unwrap();
@@ -138,7 +108,7 @@ async fn split_scalar_defers_incomplete_bytes_then_preserves_malformed_raw_outpu
         .unwrap();
     let id = first.session_id.as_ref().unwrap().clone();
     let mut delivered = first.output.clone();
-    captured_bytes(&workspace, b"prefix\xe2").await;
+    wait_for_captured_output(&workspace, b"prefix\xe2", Duration::from_secs(10)).await;
     let remaining = poll(&manager, &id, "").await;
     delivered.push_str(&remaining.output);
     assert_eq!(delivered, "prefix");
@@ -153,7 +123,7 @@ async fn split_scalar_defers_incomplete_bytes_then_preserves_malformed_raw_outpu
 
     let raw = b"prefix\xe2\x82\xacsuffix\xff";
     release(&workspace, "scalar-gate").await;
-    captured_bytes(&workspace, raw).await;
+    wait_for_captured_output(&workspace, raw, Duration::from_secs(10)).await;
     let second = poll(&manager, &id, "").await;
     assert_eq!(second.output, "€suffix�");
     assert!(second.output_encoding_loss);
@@ -219,7 +189,7 @@ async fn boundary_truncation_keeps_valid_scalars_and_exact_retained_raw_bytes() 
     assert!(response.output.is_empty());
     let id = response.session_id.unwrap();
     release(&workspace, "output-gate").await;
-    captured_bytes(&workspace, raw.as_bytes()).await;
+    wait_for_captured_output(&workspace, raw.as_bytes(), Duration::from_secs(10)).await;
     let response = manager
         .write_stdin(WriteStdinArgs {
             session_id: id.clone(),

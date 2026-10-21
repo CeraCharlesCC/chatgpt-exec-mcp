@@ -1,7 +1,20 @@
 //! Member lifecycle, active membership snapshots, joining, and name allocation.
 
 use super::messages::ensure_pending_capacity;
-use super::*;
+use rmcp::ErrorData as McpError;
+use rusqlite::{Connection, OptionalExtension, params};
+use uuid::Uuid;
+
+use crate::agent_pool::{
+    ADMIN_AGENT, AgentIdentity, PoolAction, PoolMembersArgs, PoolMembersResult, PoolSendArgs,
+    PoolSendResult, invalid, now_ms, storage_error, validate_name, validate_session,
+};
+use crate::config::AgentNameAllocation;
+
+use super::{
+    EXPIRY_BATCH_SIZE, MAX_ADMIN_MESSAGES, MAX_MESSAGE_BYTES, MemberMessage, MembersState,
+    Mutation, MutationEffect, PoolStorage,
+};
 use rmcp::model::ErrorCode;
 use serde_json::json;
 

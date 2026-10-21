@@ -290,6 +290,7 @@ async fn assert_embedded_assets(server: &Dashboard) {
         "/_admin/assets/views/missing.js",
         "/_admin/assets/vendor/prism.css",
         "/_admin/assets/package.json",
+        "/_admin/assets/assets.rs",
     ] {
         let response = server
             .client

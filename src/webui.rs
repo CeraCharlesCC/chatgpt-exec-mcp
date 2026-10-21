@@ -192,78 +192,35 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("webui.html"))
 }
 
+// The JSON-shaped manifest is shared with the browser HTTP fixture. Expanding
+// include_str! here keeps every allowlisted asset embedded in standalone builds.
+macro_rules! webui_assets {
+    ($($path:literal: $content_type:literal),* $(,)?) => {
+        &[$((
+            $path,
+            $content_type,
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/webui/", $path)),
+        )),*]
+    };
+}
+
+const ASSETS: &[(&str, &str, &str)] = include!("webui/assets.rs");
+
 async fn asset(Path(path): Path<String>) -> Response {
-    // Explicitly register each browser asset so a standalone binary never has
-    // to read front-end files from the working directory at runtime.
-    let (content_type, contents) = match path.trim_start_matches('/') {
-        "styles.css" => ("text/css; charset=utf-8", include_str!("webui/styles.css")),
-        "app.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/app.js"),
-        ),
-        "state.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/state.js"),
-        ),
-        "api.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/api.js"),
-        ),
-        "dom.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/dom.js"),
-        ),
-        "model/events.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/model/events.js"),
-        ),
-        "model/messages.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/model/messages.js"),
-        ),
-        "controllers/activity.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/controllers/activity.js"),
-        ),
-        "controllers/inbox.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/controllers/inbox.js"),
-        ),
-        "views/activity.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/views/activity.js"),
-        ),
-        "views/pools.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/views/pools.js"),
-        ),
-        "views/inbox.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/views/inbox.js"),
-        ),
-        "views/menu.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/views/menu.js"),
-        ),
-        "views/tool-output.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/views/tool-output.js"),
-        ),
-        "vendor/prism.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("webui/vendor/prism.js"),
-        ),
-        // Add future native ES modules to this allowlist when they are extracted.
-        _ => return StatusCode::NOT_FOUND.into_response(),
+    let Some((_, content_type, contents)) = ASSETS
+        .iter()
+        .find(|(name, _, _)| *name == path.trim_start_matches('/'))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
     };
 
     (
         [
-            (header::CONTENT_TYPE, content_type),
+            (header::CONTENT_TYPE, *content_type),
             (header::CACHE_CONTROL, "no-store"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
-        contents,
+        *contents,
     )
         .into_response()
 }

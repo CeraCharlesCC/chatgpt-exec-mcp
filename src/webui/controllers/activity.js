@@ -15,7 +15,7 @@ function normalizePage(page) {
 
 // Activity page requests have their own invalidation generation, independent
 // from snapshot/inbox requests. History clear invalidates both controllers.
-export function createActivityController() {
+export function createActivityController({fetchEvents: loadEvents = fetchEvents} = {}) {
   let cursors = [null], pageIndex = 0, nextBeforeId = null, loading = false, epoch = 0;
   return {
     get cursors() { return cursors; },
@@ -70,7 +70,7 @@ export function createActivityController() {
         return;
       }
       try {
-        const response = await fetchEvents(cursors[pageIndex]);
+        const response = await loadEvents(cursors[pageIndex]);
         if (!response.ok) throw new Error(await response.text());
         const page = await response.json();
         if (requestEpoch !== epoch || isClearing()) return;
@@ -103,7 +103,7 @@ export function createActivityController() {
       const index = pageIndex, requestEpoch = epoch, cursor = cursors[index];
       if (cursor == null) return;
       try {
-        const response = await fetchEvents(cursor);
+        const response = await loadEvents(cursor);
         if (!response.ok) return;
         const page = await response.json();
         if (!isSnapshotCurrent() || requestEpoch !== epoch || isClearing() ||

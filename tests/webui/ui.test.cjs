@@ -7,23 +7,11 @@ const {chromium} = require('playwright');
 
 const html = readFileSync(join(__dirname, '../../src/webui.html'));
 const assetDir = join(__dirname, '../../src/webui');
-const assets = new Map([
-  ['/_admin/assets/styles.css', ['styles.css', 'text/css; charset=utf-8']],
-  ['/_admin/assets/app.js', ['app.js', 'text/javascript; charset=utf-8']],
-  ['/_admin/assets/state.js', ['state.js', 'text/javascript; charset=utf-8']],
-  ['/_admin/assets/api.js', ['api.js', 'text/javascript; charset=utf-8']],
-  ['/_admin/assets/dom.js', ['dom.js', 'text/javascript; charset=utf-8']],
-  ['/_admin/assets/model/events.js', ['model/events.js', 'text/javascript; charset=utf-8']],
-  ['/_admin/assets/model/messages.js', ['model/messages.js', 'text/javascript; charset=utf-8']],
-  ['/_admin/assets/controllers/activity.js', ['controllers/activity.js', 'text/javascript; charset=utf-8']],
-  ['/_admin/assets/controllers/inbox.js', ['controllers/inbox.js', 'text/javascript; charset=utf-8']],
-  ['/_admin/assets/views/activity.js', ['views/activity.js', 'text/javascript; charset=utf-8']],
-  ['/_admin/assets/views/pools.js', ['views/pools.js', 'text/javascript; charset=utf-8']],
-  ['/_admin/assets/views/inbox.js', ['views/inbox.js', 'text/javascript; charset=utf-8']],
-  ['/_admin/assets/views/menu.js', ['views/menu.js', 'text/javascript; charset=utf-8']],
-  ['/_admin/assets/views/tool-output.js', ['views/tool-output.js', 'text/javascript; charset=utf-8']],
-  ['/_admin/assets/vendor/prism.js', ['vendor/prism.js', 'text/javascript; charset=utf-8']],
-]);
+// This JSON-shaped Rust macro also generates the binary's embedded allowlist.
+const manifest = JSON.parse(readFileSync(join(assetDir, 'assets.rs'), 'utf8')
+  .replace(/^webui_assets!\s*/, ''));
+const assets = new Map(Object.entries(manifest).map(([path, mime]) =>
+  [`/_admin/assets/${path}`, [path, mime]]));
 let browser, server, url;
 before(async () => {
   browser = await chromium.launch({

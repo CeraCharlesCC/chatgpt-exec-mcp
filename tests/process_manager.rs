@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{future::Future, pin::Pin, task::Poll};
 
-use chatgpt_exec_mcp::Config;
 use chatgpt_exec_mcp::ProcessManager;
 use chatgpt_exec_mcp::tools::ExecCommandArgs;
 use chatgpt_exec_mcp::tools::ExecResponse;
@@ -10,22 +9,8 @@ use chatgpt_exec_mcp::tools::WaitForExitArgs;
 use chatgpt_exec_mcp::tools::WriteStdinArgs;
 use tempfile::TempDir;
 
-fn test_config(workspace: &TempDir) -> Config {
-    let path = workspace.path().join("config.json");
-    std::fs::write(
-        &path,
-        serde_json::json!({
-            "version": 1, "workspace": ".", "shell": "/bin/bash", "output_store_dir": "outputs",
-            "child_env": { "inherit": [], "rules": [] },
-            "session_idle_timeout": 60,
-            "output_store_retention": 60,
-            "output_store_max_bytes": 67108864
-        })
-        .to_string(),
-    )
-    .unwrap();
-    Config::load(&path).unwrap()
-}
+mod support;
+use support::{test_config, wait_for_captured_output};
 
 fn exec_args(cmd: &str) -> ExecCommandArgs {
     ExecCommandArgs {
@@ -160,25 +145,6 @@ async fn wait_for_ready_file(path: &std::path::Path) {
     .expect("child readiness signal timed out");
 }
 
-async fn wait_for_captured_output(workspace: &TempDir, expected: &[u8]) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let captured = std::fs::read_dir(workspace.path().join("outputs"))
-                .unwrap()
-                .filter_map(Result::ok)
-                .any(|entry| {
-                    std::fs::read(entry.path().join("raw.log")).is_ok_and(|bytes| bytes == expected)
-                });
-            if captured {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("output capture readiness timed out");
-}
-
 #[tokio::test]
 async fn wait_for_exit_returns_on_exit_and_does_not_wake_on_output() {
     let workspace = TempDir::new().unwrap();
@@ -202,7 +168,7 @@ async fn wait_for_exit_returns_on_exit_and_does_not_wake_on_output() {
     poll_pending(waiter.as_mut()).await;
     std::fs::write(workspace.path().join("emit-first"), "").unwrap();
     wait_for_ready_file(&workspace.path().join("first-produced")).await;
-    wait_for_captured_output(&workspace, b"first").await;
+    wait_for_captured_output(&workspace, b"first", Duration::from_secs(5)).await;
     // Ordinary output must leave the completion waiter pending, even after
     // capture has visibly completed. Only the explicit exit gate releases it.
     poll_pending(waiter.as_mut()).await;
@@ -235,7 +201,7 @@ async fn wait_for_exit_returns_output_pending_before_and_produced_during_wait() 
 
     std::fs::write(workspace.path().join("emit-before"), "").unwrap();
     wait_for_ready_file(&workspace.path().join("before-produced")).await;
-    wait_for_captured_output(&workspace, b"before").await;
+    wait_for_captured_output(&workspace, b"before", Duration::from_secs(5)).await;
     let waiter = manager.wait_for_exit(wait_args(&session_id, 15));
     tokio::pin!(waiter);
     poll_pending(waiter.as_mut()).await;
@@ -675,7 +641,21 @@ async fn idle_reaper_expires_and_kills_session() {
     let session_id = started.session_id.unwrap();
     let reaper = manager.spawn_reaper();
 
-    tokio::time::sleep(Duration::from_millis(2200)).await;
+    // Observe cleanup without accessing the session: polling write_stdin would
+    // refresh its idle timer and prevent the expiration under test.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let retained = std::fs::read_dir(workspace.path().join("outputs"))
+                .unwrap()
+                .any(|entry| entry.unwrap().file_type().unwrap().is_dir());
+            if !retained {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("idle reaper did not clean up the expired session");
     let error = manager
         .write_stdin(write_args(&session_id, ""))
         .await

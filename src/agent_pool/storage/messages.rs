@@ -1,7 +1,18 @@
 //! Durable peer inbox offers, receipts, and common transactional fanout.
 
 use super::membership::expire_members_batch;
-use super::*;
+use std::collections::HashMap;
+
+use rmcp::ErrorData as McpError;
+use rusqlite::{Connection, params};
+use uuid::Uuid;
+
+use crate::agent_pool::{
+    Communications, DeliveryReceipt, PeerMessage, ReceiptStatus, invalid, now_ms, storage_error,
+    validate_name, validate_session,
+};
+
+use super::{MAX_BATCH_BYTES, MAX_BATCH_COUNT, MAX_PENDING, MemberMessage, PoolStorage};
 
 impl PoolStorage {
     /// Collect a bounded batch for this session and persist the highest cursor
