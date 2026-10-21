@@ -177,7 +177,7 @@ fn rejects_schema_errors_and_invalid_paths_and_limits() {
 }
 
 #[test]
-fn removed_session_config_requires_explicit_migration_before_startup() {
+fn removed_session_settings_are_rejected() {
     for field in [
         "max_explicit_sessions",
         "max_exec_continuations",
@@ -193,7 +193,7 @@ fn removed_session_config_requires_explicit_migration_before_startup() {
                     value["max_sessions"] = json!(6);
                     value["session_idle_timeout"] = json!(3600);
                 }
-                rejected(&value.to_string(), &[], "docs/compatibility-migrations.md");
+                rejected(&value.to_string(), &[], "docs/configuration.md");
             }
         }
     }
@@ -202,7 +202,7 @@ fn removed_session_config_requires_explicit_migration_before_startup() {
         "tool":"start_session", "workdir_under":".", "set_from_env":{"TARGET":"SOURCE"}
     }]);
     for env in [vec![], vec![("SOURCE", "SECRET_SENTINEL")]] {
-        rejected(&value.to_string(), &env, "docs/compatibility-migrations.md");
+        rejected(&value.to_string(), &env, "docs/configuration.md");
     }
 }
 

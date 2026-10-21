@@ -14,9 +14,6 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-CI runs on pull requests and pushes to main. It tests, lints, and builds the
-standalone binary using the locked dependency graph.
-
 For a shorter local feedback loop, select the affected unit module or integration
 target before running the full suite:
 
@@ -72,11 +69,11 @@ preserve user interactions such as scrolling and text selection, and guard
 against stale responses restoring cleared history.
 
 When adding an asset, register its relative path and content type in
-`src/webui/assets.rs`. Keep the macro body valid JSON: Rust expands it into
-compile-time embedded assets and the Playwright HTTP fixture reads the same
-allowlist. Cover UI changes with browser tests and model/controller changes
-with Node tests, using the commands above. Controller tests use deferred
-responses to exercise request races without browser timing or a live server.
+`src/webui/assets.rs`. Cover UI changes with browser tests and model/controller
+changes with Node tests, using the commands above.
+
+The WebUI also includes a vendored Prism.js module in `src/webui/vendor/prism.js`.
+Keep [third-party notices](THIRD_PARTY_NOTICES.md) in sync when updating vendored assets.
 
 ## Release artifact
 

@@ -122,4 +122,4 @@ artifact instructions.
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE), [NOTICE](NOTICE), and
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for vendored OpenAI Codex code.
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party components.

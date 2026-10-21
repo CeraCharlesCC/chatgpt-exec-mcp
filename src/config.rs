@@ -256,7 +256,7 @@ impl Config {
             .context("config JSON has trailing input")?;
         // Serde errors can include an offending scalar. Never echo config values.
         let raw: FileConfig = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!(
-            "config schema invalid: unknown/missing field or invalid field type (see docs/configuration.md and docs/compatibility-migrations.md)"))?;
+            "config schema invalid: unknown/missing field or invalid field type (see docs/configuration.md)"))?;
         if raw.version != 1 {
             bail!("config version must be 1");
         }

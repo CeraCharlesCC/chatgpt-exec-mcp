@@ -36,8 +36,9 @@ storage and the Web UI, and are omitted from agent-facing messages and receipts.
 defaults to 35 (range 5–45). Its result contains `reason` (`message`,
 `membership_changed`, or `timeout`), `messages`, and `membership_changed`.
 Changes are measured from the start of the wait; timeout is a normal result.
-Receipt-only updates do not wake or complete the wait. Pending receipts can be
-included when it completes for a message, membership change, or timeout.
+An offered receipt is not a `reason`: receipt-only updates do not wake or
+complete the wait. Pending receipts can accompany completion for a message,
+membership change, or timeout.
 Activity in other pools does not wake it.
 
 ## Delivery receipts

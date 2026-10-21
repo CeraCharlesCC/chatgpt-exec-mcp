@@ -102,8 +102,8 @@ are removed after this interval.
 
 `agent_name_dictionary` is an ordered, nonempty list of unique names. Names must
 contain 1–128 characters, without control characters or surrounding whitespace;
-`global` and `admin` are reserved. The default dictionary lists Roman rulers,
-starting with `Caesar`, `Augustus`, and `Tiberius`.
+`global` and `admin` are reserved. When omitted, core uses a built-in dictionary.
+Set this field explicitly if a deployment requires specific names.
 
 `agent_name_allocation` controls name assignment on a chat's first `pool_send`:
 
@@ -129,9 +129,9 @@ Use `/readyz` to check local readiness.
 With Unix Streamable HTTP enabled, `--webui-listen 127.0.0.1:19162` enables the
 optional debug WebUI. The address must be loopback. The WebUI port serves only
 the human administration surface; `/mcp` remains on the private Unix socket.
-Recent activity history keeps up to 500 recent events in memory. On reaching 500,
-the oldest 250 move to an asynchronous, level-1 zstd-compressed temporary
-chunk (up to eight 250-event chunks).
+Activity history is temporary and bounded; older events are evicted, and clearing
+history or restarting core removes the retained events. The WebUI snapshot API
+can export the events still available for inspection.
 
 The Admin inbox provides an ACK button for each message. ACKed messages stay
 visible, including after a browser reload, until history is cleared or core
