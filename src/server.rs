@@ -6,13 +6,12 @@ use rmcp::handler::server::{
     router::tool::ToolRouter, tool::schema_for_output, wrapper::Parameters,
 };
 use rmcp::model::{
-    CallToolResult, ContentBlock, ErrorCode, Implementation, ProtocolVersion, ServerCapabilities,
-    ServerConfig,
+    CallToolResult, ErrorCode, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
-use crate::activity::{ActivityContext, ActivityHub, ActivityMessage};
+use crate::activity::{ActivityContext, ActivityEmissionContext, ActivityHub, ActivityMessage};
 use crate::agent_pool::{
     AgentIdentity, AgentPoolStore, Communications, PoolMembersArgs, PoolMembersResult,
     PoolSendArgs, PoolSendResult, PoolWaitArgs, PoolWaitResult, SessionTurn,
@@ -20,6 +19,10 @@ use crate::agent_pool::{
 use crate::agent_pool_context::AgentPoolContext;
 use crate::process_manager::ProcessManager;
 use crate::tools::{ExecCommandArgs, ExecResponse, WaitForExitArgs, WriteStdinArgs};
+
+mod coordination;
+mod response;
+use coordination::ToolCall;
 
 #[derive(Clone)]
 pub struct ExecMcpServer {
@@ -112,6 +115,7 @@ impl ExecMcpServer {
         )
     }
 
+    #[cfg(test)]
     async fn tool_finished(
         &self,
         tool: &str,
@@ -140,10 +144,33 @@ impl ExecMcpServer {
         activity_context: ActivityContext,
         detail: impl FnOnce() -> Value,
     ) {
+        self.tool_finished_with_context_and_communications(
+            tool,
+            session,
+            start_event_id,
+            success,
+            ActivityEmissionContext {
+                activity: activity_context,
+                communications: None,
+            },
+            detail,
+        )
+        .await;
+    }
+
+    async fn tool_finished_with_context_and_communications(
+        &self,
+        tool: &str,
+        session: Option<&str>,
+        start_event_id: u64,
+        success: bool,
+        emission: ActivityEmissionContext<'_>,
+        detail: impl FnOnce() -> Value,
+    ) {
         if !self.activity.is_enabled() {
             return;
         }
-        self.activity.emit_with_context(
+        self.activity.emit_with_context_and_communications(
             if success { "tool.finish" } else { "tool.error" },
             if success { "info" } else { "error" },
             session,
@@ -153,7 +180,7 @@ impl ExecMcpServer {
                 "start_event_id": start_event_id,
                 "result": detail(),
             }),
-            activity_context,
+            emission,
         );
     }
 
@@ -162,13 +189,10 @@ impl ExecMcpServer {
         comms: &Communications,
     ) -> (bool, Value) {
         match result {
-            Ok(value) => (
-                true,
-                Self::activity_with_comms(json!({"value": value}), comms),
-            ),
+            Ok(value) => (true, response::with_comms(json!({"value": value}), comms)),
             Err(error) => (
                 false,
-                Self::activity_with_comms(json!({"error": error.message.to_string()}), comms),
+                response::with_comms(json!({"error": error.message.to_string()}), comms),
             ),
         }
     }
@@ -181,7 +205,7 @@ impl ExecMcpServer {
             Ok(response) => (true, Self::exec_response_detail(response, comms)),
             Err(error) => (
                 false,
-                Self::activity_with_comms(json!({"error": error.to_string()}), comms),
+                response::with_comms(json!({"error": error.to_string()}), comms),
             ),
         }
     }
@@ -202,19 +226,7 @@ impl ExecMcpServer {
                 json!(response.call_wall_time_seconds),
             );
         }
-        Self::activity_with_comms(detail, comms)
-    }
-
-    fn activity_with_comms(mut detail: Value, comms: &Communications) -> Value {
-        if let Some(object) = detail.as_object_mut() {
-            if !comms.messages.is_empty() {
-                object.insert("peer_messages".into(), json!(comms.messages));
-            }
-            if !comms.delivery_receipts.is_empty() {
-                object.insert("delivery_receipts".into(), json!(comms.delivery_receipts));
-            }
-        }
-        detail
+        response::with_comms(detail, comms)
     }
 
     fn activity_preview(value: &str) -> String {
@@ -310,7 +322,6 @@ impl ExecMcpServer {
         Parameters(args): Parameters<PoolMembersArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let session = Self::session(&context);
         let activity_context = if self.activity.is_enabled() {
             ActivityContext {
                 pool: Some(args.pool.clone()),
@@ -319,29 +330,18 @@ impl ExecMcpServer {
         } else {
             ActivityContext::default()
         };
-        let started = self
-            .tool_started("pool_members", session.as_deref(), || {
-                serde_json::to_value(&args).unwrap_or(Value::Null)
-            })
-            .await;
-        let turn = self.begin_tool(session.as_deref()).await?;
-        let (pool, principal) = self.agent_pool_context()?;
-        let result = pool
-            .members_async(principal, args, session.as_deref())
-            .await;
-        let comms = self
-            .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
-            .await;
-        self.tool_finished_with_context(
+        let call = ToolCall::begin(
+            self,
             "pool_members",
-            session.as_deref(),
-            started,
-            result.is_ok(),
+            &context,
+            || serde_json::to_value(&args).unwrap_or(Value::Null),
             activity_context,
-            || Self::pool_activity_detail(&result, &comms).1,
+            false,
         )
-        .await;
-        Self::pool_result(result, comms)
+        .await?;
+        let (pool, principal) = self.agent_pool_context()?;
+        let result = pool.members_async(principal, args, call.session()).await;
+        call.finish_pool(result).await
     }
 
     /// Wait for this pool's messages, offered receipts, membership changes, or timeout.
@@ -374,19 +374,31 @@ impl ExecMcpServer {
             },
             result = pool.wait(principal, args, session.as_deref()) => result,
         };
-        self.tool_finished_with_context(
+        // A wait's own typed operation result is the source of peer messages.
+        // It is not a piggyback turn and must not collect communications again.
+        let lifecycle_comms = match &result {
+            Ok(value) => Communications {
+                messages: value.messages.clone(),
+                delivery_receipts: value.delivery_receipts.clone(),
+            },
+            Err(_) => Communications::default(),
+        };
+        self.tool_finished_with_context_and_communications(
             "pool_wait",
             session.as_deref(),
             started,
             result.is_ok(),
-            activity_context,
+            ActivityEmissionContext {
+                activity: activity_context,
+                communications: Some(&lifecycle_comms),
+            },
             || match &result {
                 Ok(value) => json!(value),
                 Err(error) => json!({"error": error.message.to_string()}),
             },
         )
         .await;
-        Self::pool_result(result, Communications::default())
+        response::pool_result(result, Communications::default())
     }
 
     /// Queue a message; first send joins and assigns a name. Messages arrive on
@@ -398,7 +410,6 @@ impl ExecMcpServer {
         Parameters(args): Parameters<PoolSendArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let session = Self::session(&context);
         // PoolSendArgs is consumed by send_async. Keep its message metadata
         // only for opted-in activity so completion events are self-contained.
         let activity_context = if self.activity.is_enabled() {
@@ -409,82 +420,21 @@ impl ExecMcpServer {
         } else {
             ActivityContext::default()
         };
-        let started = self
-            .tool_started("pool_send", session.as_deref(), || {
-                serde_json::to_value(&args).unwrap_or(Value::Null)
-            })
-            .await;
-        let turn = match self.begin_tool(session.as_deref()).await {
-            Ok(turn) => turn,
-            Err(error) => {
-                self.tool_finished_with_context(
-                    "pool_send",
-                    session.as_deref(),
-                    started,
-                    false,
-                    activity_context,
-                    || json!({"error": error.message.to_string()}),
-                )
-                .await;
-                return Err(error);
-            }
-        };
+        let call = ToolCall::begin(
+            self,
+            "pool_send",
+            &context,
+            || serde_json::to_value(&args).unwrap_or(Value::Null),
+            activity_context,
+            true,
+        )
+        .await?;
         let (pool, principal) = match self.agent_pool_context() {
             Ok(pool) => pool,
-            Err(error) => {
-                self.tool_finished_with_context(
-                    "pool_send",
-                    session.as_deref(),
-                    started,
-                    false,
-                    activity_context,
-                    || json!({"error": error.message.to_string()}),
-                )
-                .await;
-                return Err(error);
-            }
+            Err(error) => return Err(call.fail(error).await),
         };
-        let result = pool.send_async(principal, args, session.as_deref()).await;
-        let comms = self
-            .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
-            .await;
-        self.tool_finished_with_context(
-            "pool_send",
-            session.as_deref(),
-            started,
-            result.is_ok(),
-            activity_context,
-            || Self::pool_activity_detail(&result, &comms).1,
-        )
-        .await;
-        Self::pool_result(result, comms)
-    }
-
-    fn pool_result<T: serde::Serialize>(
-        result: Result<T, McpError>,
-        comms: Communications,
-    ) -> Result<CallToolResult, McpError> {
-        match result {
-            Ok(value) => {
-                let mut structured = serde_json::to_value(value).map_err(|_| {
-                    McpError::internal_error("pool response serialization failed", None)
-                })?;
-                structured = Self::activity_with_comms(structured, &comms);
-                let mut result =
-                    CallToolResult::success(vec![ContentBlock::text(structured.to_string())]);
-                result.structured_content = Some(structured);
-                Ok(result)
-            }
-            Err(error) => {
-                let mut text = error.message.to_string();
-                Self::append_comms_block(&mut text, &comms);
-                let mut result = CallToolResult::error(vec![ContentBlock::text(text)]);
-                if !comms.is_empty() {
-                    result.structured_content = Some(Self::activity_with_comms(json!({}), &comms));
-                }
-                Ok(result)
-            }
-        }
+        let result = pool.send_async(principal, args, call.session()).await;
+        call.finish_pool_send(result).await
     }
 
     /// Start a command, shell, or REPL. Returns exit_code when done, session_id while running.
@@ -494,9 +444,11 @@ impl ExecMcpServer {
         Parameters(args): Parameters<ExecCommandArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let session = Self::session(&context);
-        let started = self
-            .tool_started("exec_command", session.as_deref(), || {
+        let call = ToolCall::begin(
+            self,
+            "exec_command",
+            &context,
+            || {
                 json!({
                     "cmd": &args.cmd,
                     "workdir": &args.workdir,
@@ -504,22 +456,13 @@ impl ExecMcpServer {
                     "yield_time_ms": args.yield_time_ms,
                     "max_output_tokens": args.max_output_tokens,
                 })
-            })
-            .await;
-        let turn = self.begin_tool(session.as_deref()).await?;
-        let response = self.manager.exec_command(args).await;
-        let comms = self
-            .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
-            .await;
-        self.tool_finished(
-            "exec_command",
-            session.as_deref(),
-            started,
-            response.is_ok(),
-            || Self::exec_activity_detail(&response, &comms).1,
+            },
+            ActivityContext::default(),
+            false,
         )
-        .await;
-        Self::respond(response, comms)
+        .await?;
+        let response = self.manager.exec_command(args).await;
+        call.finish_exec(response).await
     }
 
     /// Send raw input or poll output; Ctrl-C alone interrupts the process group.
@@ -529,30 +472,23 @@ impl ExecMcpServer {
         Parameters(args): Parameters<WriteStdinArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let session = Self::session(&context);
-        let started = self
-            .tool_started("write_stdin", session.as_deref(), || {
+        let call = ToolCall::begin(
+            self,
+            "write_stdin",
+            &context,
+            || {
                 json!({
                     "session_id": &args.session_id,
                     "chars": &args.chars,
                     "max_output_tokens": args.max_output_tokens,
                 })
-            })
-            .await;
-        let turn = self.begin_tool(session.as_deref()).await?;
-        let response = self.manager.write_stdin(args).await;
-        let comms = self
-            .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
-            .await;
-        self.tool_finished(
-            "write_stdin",
-            session.as_deref(),
-            started,
-            response.is_ok(),
-            || Self::exec_activity_detail(&response, &comms).1,
+            },
+            ActivityContext::default(),
+            false,
         )
-        .await;
-        Self::respond(response, comms)
+        .await?;
+        let response = self.manager.write_stdin(args).await;
+        call.finish_exec(response).await
     }
 
     /// Wait for process exit or timeout; ordinary output does not wake the wait.
@@ -562,141 +498,30 @@ impl ExecMcpServer {
         Parameters(args): Parameters<WaitForExitArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let session = Self::session(&context);
-        let started = self
-            .tool_started("wait_for_exit", session.as_deref(), || {
+        let call = ToolCall::begin(
+            self,
+            "wait_for_exit",
+            &context,
+            || {
                 json!({
                     "session_id": &args.session_id,
                     "wait_seconds": args.wait_seconds,
                     "max_output_tokens": args.max_output_tokens,
                 })
-            })
-            .await;
-        let turn = self.begin_tool(session.as_deref()).await?;
+            },
+            ActivityContext::default(),
+            false,
+        )
+        .await?;
         let response = self
             .manager
             .wait_for_exit_cancellable(args, context.ct.cancelled())
             .await;
         match response {
-            Ok(Some(response)) => {
-                let comms = self
-                    .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
-                    .await;
-                self.tool_finished("wait_for_exit", session.as_deref(), started, true, || {
-                    Self::exec_response_detail(&response, &comms)
-                })
-                .await;
-                Self::success(response, comms)
-            }
-            Ok(None) => {
-                self.tool_finished(
-                    "wait_for_exit",
-                    session.as_deref(),
-                    started,
-                    false,
-                    || json!({"error": "wait_for_exit cancelled"}),
-                )
-                .await;
-                Err(McpError::internal_error("wait_for_exit cancelled", None))
-            }
-            Err(error) => {
-                let comms = self
-                    .finish_tool_preserving_result(session.as_deref(), turn.as_ref())
-                    .await;
-                self.tool_finished("wait_for_exit", session.as_deref(), started, false, || {
-                    Self::activity_with_comms(json!({"error": error.to_string()}), &comms)
-                })
-                .await;
-                Ok(Self::tool_error(error, comms))
-            }
+            Ok(Some(response)) => call.finish_wait_success(response).await,
+            Ok(None) => call.cancelled("wait_for_exit cancelled").await,
+            Err(error) => call.finish_wait_error(error).await,
         }
-    }
-
-    fn respond(
-        result: anyhow::Result<ExecResponse>,
-        comms: Communications,
-    ) -> Result<CallToolResult, McpError> {
-        match result {
-            Ok(response) => Self::success(response, comms),
-            Err(error) => Ok(Self::tool_error(error, comms)),
-        }
-    }
-
-    fn success(
-        mut response: ExecResponse,
-        comms: Communications,
-    ) -> Result<CallToolResult, McpError> {
-        if !comms.messages.is_empty() {
-            response.peer_messages = Some(comms.messages.clone());
-        }
-        if !comms.delivery_receipts.is_empty() {
-            response.delivery_receipts = Some(comms.delivery_receipts.clone());
-        }
-        let structured = serde_json::to_value(&response)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let mut text = Self::response_summary(&response);
-        Self::append_comms_block(&mut text, &comms);
-        let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-        result.structured_content = Some(structured);
-        Ok(result)
-    }
-
-    fn response_summary(response: &ExecResponse) -> String {
-        let mut parts = Vec::with_capacity(6);
-        if let Some(exit_code) = response.exit_code {
-            parts.push(format!("exit_code={exit_code}"));
-        } else if let Some(session_id) = response.session_id.as_deref() {
-            parts.push(format!("session_id={session_id}"));
-        }
-        if response.output_truncated {
-            parts.push("output_truncated=true".into());
-        }
-        if response.output_encoding_loss {
-            parts.push("output_encoding_loss=true".into());
-        }
-        if response.capture_error.is_some() {
-            parts.push("capture_error=present".into());
-        }
-        if let Some(output_ref) = response.output_ref.as_ref() {
-            parts.push(format!("output_ref={}", output_ref.path));
-        }
-        parts.join("; ")
-    }
-
-    fn append_comms_block(text: &mut String, comms: &Communications) {
-        if !comms.messages.is_empty() {
-            text.push_str("\n\n=== PEER MESSAGES ===");
-            for message in &comms.messages {
-                text.push_str(&format!(
-                    "\n[{} {} -> {} in {}] {}",
-                    message.message_id, message.from, message.to, message.pool, message.message
-                ));
-                if let Some(reply) = message.in_reply_to.as_deref() {
-                    text.push_str(&format!(" (in_reply_to={reply})"));
-                }
-            }
-            text.push_str("\n=== END PEER MESSAGES ===");
-        }
-        if !comms.delivery_receipts.is_empty() {
-            text.push_str("\n\n=== DELIVERY RECEIPTS (offered, not read or accepted) ===");
-            for receipt in &comms.delivery_receipts {
-                text.push_str(&format!(
-                    "\n[{} in {}] offered to {} at {}",
-                    receipt.message_id, receipt.pool, receipt.to, receipt.offered_at_ms
-                ));
-            }
-            text.push_str("\n=== END DELIVERY RECEIPTS ===");
-        }
-    }
-
-    fn tool_error(error: anyhow::Error, comms: Communications) -> CallToolResult {
-        let mut text = error.to_string();
-        Self::append_comms_block(&mut text, &comms);
-        let mut result = CallToolResult::error(vec![ContentBlock::text(text)]);
-        if !comms.is_empty() {
-            result.structured_content = Some(Self::activity_with_comms(json!({}), &comms));
-        }
-        result
     }
 }
 

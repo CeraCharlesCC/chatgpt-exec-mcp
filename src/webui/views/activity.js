@@ -1,5 +1,5 @@
 import { $, esc, interacting, syncList, time, syncOptions, clearSelection } from '../dom.js';
-import { eventPools, isMessageEvent, eventIdentities, pageEventContext } from '../model/events.js';
+import { eventPools, isMessageEvent, eventIdentities, pageEventContext, eventStartId, eventTool } from '../model/events.js';
 import { messages } from '../model/messages.js';
 import { toolDetail, handleCodeAction } from './tool-output.js';
 
@@ -45,7 +45,7 @@ function eventMarkup(e, state) {
 function groupMarkup(item, state) {
   if (!item.start) return eventMarkup(item, state);
   const finish = item.finish;
-  return `<article class="event${finish?.kind === 'tool.error' ? ' lvl-error' : ''}"><details class="tool-group" open><summary>${esc(item.start.detail?.tool || 'Tool call')}<span class="chip">${finish ? esc(finish.kind) : 'In progress'}</span></summary><div data-group-part="start">${eventMarkup(item.start, state)}</div><div data-group-part="finish">${finish ? eventMarkup(finish, state) : ''}</div></details></article>`;
+  return `<article class="event${finish?.kind === 'tool.error' ? ' lvl-error' : ''}"><details class="tool-group" open><summary>${esc(eventTool(item.start) || 'Tool call')}<span class="chip">${finish ? esc(finish.kind) : 'In progress'}</span></summary><div data-group-part="start">${eventMarkup(item.start, state)}</div><div data-group-part="finish">${finish ? eventMarkup(finish, state) : ''}</div></details></article>`;
 }
 function updateEvent(node, html) {
   const group = node.querySelector('.tool-group');
@@ -115,10 +115,10 @@ export function renderEvents(state) {
   let rows = shown;
   if (grouping) {
     const visible = new Set(shown.map(e => e.id));
-    const paired = new Map(shown.filter(e => ['tool.finish', 'tool.error'].includes(e.kind) && visible.has(e.detail?.start_event_id))
-      .map(e => [e.detail.start_event_id, e]));
+    const paired = new Map(shown.filter(e => ['tool.finish', 'tool.error'].includes(e.kind) && visible.has(eventStartId(e)))
+      .map(e => [eventStartId(e), e]));
     rows = shown.filter(e => !paired.has(e.id)).map(e => {
-      const start = starts.get(e.detail?.start_event_id);
+      const start = starts.get(eventStartId(e));
       if (start && paired.get(start.id) === e) return {key: `group:${start.id}`, start, finish: e};
       if (e.kind === 'tool.start') return {key: `group:${e.id}`, start: e};
       return e;

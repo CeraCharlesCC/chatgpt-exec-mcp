@@ -15,6 +15,8 @@ const assets = new Map([
   ['/_admin/assets/dom.js', ['dom.js', 'text/javascript; charset=utf-8']],
   ['/_admin/assets/model/events.js', ['model/events.js', 'text/javascript; charset=utf-8']],
   ['/_admin/assets/model/messages.js', ['model/messages.js', 'text/javascript; charset=utf-8']],
+  ['/_admin/assets/controllers/activity.js', ['controllers/activity.js', 'text/javascript; charset=utf-8']],
+  ['/_admin/assets/controllers/inbox.js', ['controllers/inbox.js', 'text/javascript; charset=utf-8']],
   ['/_admin/assets/views/activity.js', ['views/activity.js', 'text/javascript; charset=utf-8']],
   ['/_admin/assets/views/pools.js', ['views/pools.js', 'text/javascript; charset=utf-8']],
   ['/_admin/assets/views/inbox.js', ['views/inbox.js', 'text/javascript; charset=utf-8']],
@@ -303,6 +305,52 @@ test('activity pages keep only 200 events and survive polling, filtering, and Ol
   assert.equal(await page.locator('#events > [data-key]').count(), 200);
   assert.deepEqual(requests, [{cursor: 401, limit: '200'}, {cursor: 201, limit: '200'},
     {cursor: 401, limit: '200'}]);
+});
+
+test('activity navigation applies results and rollback to the current snapshot after polling', async t => {
+  for (const succeeds of [true, false]) {
+    await t.test(succeeds ? 'successful page load' : 'failed page load', async t => {
+      const data = fixture();
+      const event = id => ({...data.events[0], id, kind: 'custom.event', detail: {sequence: id}});
+      data.events = [event(300)];
+      data.events_has_more = true;
+      data.events_next_before_id = 300;
+      const {page, poll} = await open(t, data);
+      let release, markRequested;
+      const gate = new Promise(resolve => { release = resolve; });
+      const requested = new Promise(resolve => { markRequested = resolve; });
+      t.after(() => release());
+      await page.route('**/_admin/api/events*', async route => {
+        const cursor = Number(new URL(route.request().url()).searchParams.get('before_id'));
+        if (cursor === 300) {
+          return route.fulfill({json: {events: [event(200)], next_before_id: 200, has_more: true}});
+        }
+        assert.equal(cursor, 200);
+        markRequested();
+        await gate;
+        await route.fulfill(succeeds ?
+          {json: {events: [event(100)], next_before_id: null, has_more: false}} :
+          {status: 500, body: 'Archive unavailable'});
+      });
+      await page.locator('#activityOlder').click();
+      await page.waitForFunction(() => !state.activityLoading && state.activityPageIndex === 1);
+      await page.locator('#activityOlder').click();
+      await requested;
+      await page.evaluate(() => { window.navigationSnapshot = state.data; });
+      await poll();
+      assert.equal(await page.evaluate(() => state.data !== window.navigationSnapshot), true);
+      assert.equal(await page.evaluate(() => state.activityLoading), true);
+      release();
+      await page.waitForFunction(() => !state.activityLoading);
+      const expectedId = succeeds ? 100 : 200;
+      assert.deepEqual(await page.evaluate(() => state.data.events.map(e => e.id)), [expectedId]);
+      assert.equal(await page.locator(`[data-key="activity:event:${expectedId}"]`).count(), 1);
+      assert.equal(await page.evaluate(() => state.activityPageIndex), succeeds ? 2 : 1);
+      assert.equal(await page.evaluate(() => state.activityNextBeforeId), succeeds ? null : 200);
+      await poll();
+      assert.deepEqual(await page.evaluate(() => state.data.events.map(e => e.id)), [expectedId]);
+    });
+  }
 });
 
 test('a delayed off-page finish updates a selected send without adding raw events or replacing the message body', async t => {

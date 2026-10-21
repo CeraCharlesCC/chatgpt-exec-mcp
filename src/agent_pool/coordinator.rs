@@ -114,15 +114,6 @@ impl PoolCoordinator {
         }
     }
 
-    pub(super) fn committed_change(&self) {
-        self.notifications.committed_change();
-    }
-
-    pub(super) fn committed_membership_change(&self, principal: &str, pool: &str) {
-        self.notifications
-            .committed_membership_change(principal, pool);
-    }
-
     pub(super) fn observe_membership(
         &self,
         principal: &str,

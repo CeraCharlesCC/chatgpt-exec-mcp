@@ -1,0 +1,49 @@
+{
+  "events": [
+    {
+      "id": 100,
+      "timestamp_ms": 1000,
+      "schema_version": 1,
+      "kind": "tool.start",
+      "level": "info",
+      "session": "chat-beta",
+      "agents": [],
+      "detail": {"tool": "pool_send", "arguments": {"pool": "wrong", "target": "Ghost", "message": "wrong legacy body"}},
+      "lifecycle": {"type": "message_send", "phase": "start", "tool": "pool_send", "pool": "beta", "message": {"pool": "beta", "target": "Bob", "body": "typed body", "status": "sending"}}
+    },
+    {
+      "id": 101,
+      "timestamp_ms": 1001,
+      "schema_version": 1,
+      "kind": "tool.finish",
+      "level": "info",
+      "session": "chat-beta",
+      "agents": [],
+      "detail": {"tool": "pool_send", "start_event_id": 999, "result": {"value": {"assigned_agent": "Ghost", "message_id": "wrong", "recipients": ["Nobody"]}}},
+      "lifecycle": {
+        "type": "message_send", "phase": "finish", "tool": "pool_send", "pool": "beta", "start_event_id": 100,
+        "message": {"pool": "beta", "target": "Bob", "body": "typed body", "from": "Alice", "message_id": "message-100", "recipients": ["Bob"], "status": "queued"},
+        "peer_messages": [{"pool": "beta", "message_id": "message-recv", "from": "Cara", "to": "Bob", "target": "Bob", "sent_at_ms": 1001, "message": "typed incoming"}],
+        "delivery_receipts": [{"pool": "beta", "message_id": "message-100", "to": "Bob", "status": "offered", "offered_at_ms": 1001}]
+      }
+    },
+    {
+      "id": 200,
+      "timestamp_ms": 2000,
+      "kind": "tool.start",
+      "level": "info",
+      "session": "older-chat",
+      "agents": [{"pool": "old", "agent": "OlderAgent"}],
+      "detail": {"tool": "pool_send", "arguments": {"pool": "old", "target": "Peer", "message": "legacy body"}}
+    },
+    {
+      "id": 201,
+      "timestamp_ms": 2001,
+      "kind": "tool.finish",
+      "level": "info",
+      "session": "older-chat",
+      "agents": [],
+      "detail": {"tool": "pool_send", "start_event_id": 200, "result": {"value": {"assigned_agent": "OlderAgent", "message_id": "legacy-201", "recipients": ["Peer"]}}}
+    }
+  ]
+}

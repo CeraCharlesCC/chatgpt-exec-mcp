@@ -1,43 +1,60 @@
-// Versioned event fields are authoritative for newly written events. Persisted
-// pre-v1 history retains only the loose detail payload, read below as a fallback.
-const lifecycle = e => e?.schema_version === 1 ? e.lifecycle : null;
-
-export const eventStartId = e => e?.schema_version === 1 ?
-  lifecycle(e)?.start_event_id : e?.detail?.start_event_id;
-
-export function messageSend(e) {
-  if (!e) return null;
-  if (e.schema_version === 1) {
-    const value = lifecycle(e);
-    if (value?.type !== 'message_send' || !value.message ||
-      typeof value.message.body !== 'string') return null;
-    const m = value.message;
-    return {pool: m.pool, target: m.target, message: m.body, in_reply_to: m.in_reply_to,
-      from: m.from, message_id: m.message_id, recipients: m.recipients,
-      error: m.error, status: m.status};
+// Event transport compatibility lives here, at the browser boundary. A v1
+// lifecycle is authoritative even if legacy detail fields disagree. Historic
+// unversioned events are mapped once to the same semantic shape.
+export function normalizeEvent(event) {
+  if (!event || event.semantic) return event;
+  const detail = event.detail || {};
+  const typed = event.schema_version === 1;
+  const lifecycle = typed ? event.lifecycle : null;
+  const result = detail.result;
+  const legacySend = !typed && event.kind === 'tool.start' && detail.tool === 'pool_send' &&
+    typeof detail.arguments?.message === 'string' && !detail.arguments.action;
+  const message = typed ? (lifecycle?.type === 'message_send' &&
+    typeof lifecycle.message?.body === 'string' ? {
+      pool: lifecycle.message.pool, target: lifecycle.message.target,
+      message: lifecycle.message.body, in_reply_to: lifecycle.message.in_reply_to,
+      from: lifecycle.message.from, message_id: lifecycle.message.message_id,
+      recipients: lifecycle.message.recipients, error: lifecycle.message.error,
+      status: lifecycle.message.status,
+    } : null) : (legacySend ? detail.arguments : null);
+  const completion = !typed && ['tool.finish', 'tool.error'].includes(event.kind) ? {
+    from: result?.value?.assigned_agent, recipients: result?.value?.recipients,
+    message_id: result?.value?.message_id, error: result?.error || result?.value?.error,
+    status: event.kind === 'tool.error' ? 'failed' : 'queued',
+  } : null;
+  // Old pool_wait results can use `messages` rather than `peer_messages`.
+  // Follow the Rust archive fallback even if an empty peer_messages array is
+  // explicitly present; all versioned events ignore these legacy fields.
+  let legacyPeers = result?.peer_messages || result?.value?.peer_messages || [];
+  if (!legacyPeers.length && detail.tool === 'pool_wait') {
+    legacyPeers = result?.messages || result?.value?.messages || [];
   }
-  if (e.kind !== 'tool.start' || e.detail?.tool !== 'pool_send' ||
-    typeof e.detail.arguments?.message !== 'string' || e.detail.arguments.action) return null;
-  return e.detail.arguments;
+  return {...event, semantic: {
+    startId: typed ? lifecycle?.start_event_id : detail.start_event_id,
+    tool: typed ? lifecycle?.tool : detail.tool,
+    pools: event.kind === 'admin.message.send' ? [detail.pool] :
+      typed ? [lifecycle?.pool] : [detail.pool, detail.arguments?.pool],
+    message, completion,
+    peerMessages: typed ? lifecycle?.peer_messages || [] : legacyPeers,
+    deliveryReceipts: typed ? lifecycle?.delivery_receipts || [] :
+      result?.delivery_receipts || result?.value?.delivery_receipts || [],
+  }};
 }
 
-export function peerMessages(e) {
-  if (e.schema_version === 1) return lifecycle(e)?.peer_messages || [];
-  const result = e.detail?.result;
-  return result?.peer_messages || (e.detail?.tool === 'pool_wait' ? result?.messages : null) || [];
-}
+export const normalizeEvents = events => (events || []).map(normalizeEvent);
+export const eventStartId = e => normalizeEvent(e)?.semantic.startId;
+export const eventTool = e => normalizeEvent(e)?.semantic.tool;
+export const messageSend = e => normalizeEvent(e)?.semantic.message || null;
+export const messageCompletion = e => normalizeEvent(e)?.semantic.completion || null;
+export const peerMessages = e => normalizeEvent(e)?.semantic.peerMessages || [];
+export const deliveryReceipts = e => normalizeEvent(e)?.semantic.deliveryReceipts || [];
 
-export function deliveryReceipts(e) {
-  return e.schema_version === 1 ? lifecycle(e)?.delivery_receipts || [] :
-    e.detail?.result?.delivery_receipts || [];
-}
-
-export function eventPools(e, starts) {
+export function eventPools(event, starts) {
+  const e = normalizeEvent(event);
   const pools = new Set((e.agents || []).map(a => a.pool));
-  const start = starts.get(eventStartId(e));
-  const names = e.kind === 'admin.message.send' ? [e.detail?.pool] : e.schema_version === 1 ?
-    [lifecycle(e)?.pool, lifecycle(start)?.pool, messageSend(e)?.pool, messageSend(start)?.pool] :
-    [e.detail?.pool, e.detail?.arguments?.pool, start?.detail?.arguments?.pool];
+  const start = normalizeEvent(starts.get(eventStartId(e)));
+  const names = [...e.semantic.pools, ...(start?.semantic.pools || []),
+    messageSend(e)?.pool, messageSend(start)?.pool];
   for (const name of names) if (name) pools.add(name);
   for (const m of peerMessages(e)) pools.add(m.pool);
   for (const receipt of deliveryReceipts(e)) pools.add(receipt.pool);
@@ -55,15 +72,12 @@ export function eventIdentities(e, starts, finishes) {
   const finish = e.kind === 'tool.start' ? finishes.get(e.id) : e;
   const agents = [...(e.agents || []), ...(start?.agents || []), ...(finish?.agents || [])];
   const send = messageSend(start) || messageSend(e) || messageSend(finish);
-  const completed = messageSend(finish);
-  const value = finish?.schema_version === 1 ? null : finish?.detail?.result?.value;
+  const completed = messageSend(finish) || messageCompletion(finish);
   if (send?.pool) {
-    const from = completed?.from || send.from || value?.assigned_agent;
+    const from = completed?.from || send.from;
     if (from) agents.push({pool: send.pool, agent: from});
     if (send.target && send.target !== 'global') agents.push({pool: send.pool, agent: send.target});
-    for (const agent of completed?.recipients || value?.recipients || []) {
-      agents.push({pool: send.pool, agent});
-    }
+    for (const agent of completed?.recipients || []) agents.push({pool: send.pool, agent});
   }
   if (e.kind === 'admin.message.send') {
     agents.push({pool: e.detail.pool, agent: 'admin'});
@@ -82,11 +96,12 @@ export function eventIdentities(e, starts, finishes) {
 // selected finish can borrow its off-page start for legacy message projection;
 // a selected start borrows an off-page finish only for status and identities.
 export function pageEventContext(events, correlatedEvents = []) {
-  const selectedIds = new Set(events.map(e => e.id));
-  const selectedStarts = new Set(events.filter(e => e.kind === 'tool.start').map(e => e.id));
-  const selectedFinishes = new Set(events.map(eventStartId).filter(id => id != null));
+  const selected = normalizeEvents(events), correlated = normalizeEvents(correlatedEvents);
+  const selectedIds = new Set(selected.map(e => e.id));
+  const selectedStarts = new Set(selected.filter(e => e.kind === 'tool.start').map(e => e.id));
+  const selectedFinishes = new Set(selected.map(eventStartId).filter(id => id != null));
   const includedIds = new Set(selectedIds), counterparts = [];
-  for (const e of correlatedEvents || []) {
+  for (const e of correlated) {
     if (includedIds.has(e.id)) continue;
     if (e.kind === 'tool.start' && !selectedFinishes.has(e.id)) continue;
     if (['tool.finish', 'tool.error'].includes(e.kind) && !selectedStarts.has(eventStartId(e))) continue;
@@ -94,18 +109,19 @@ export function pageEventContext(events, correlatedEvents = []) {
     includedIds.add(e.id);
     counterparts.push(e);
   }
-  const related = [...events, ...counterparts];
+  const related = [...selected, ...counterparts];
   const starts = new Map(related.filter(e => e.kind === 'tool.start').map(e => [e.id, e]));
   const finishes = new Map(related.filter(e =>
     ['tool.finish', 'tool.error'].includes(e.kind) && eventStartId(e) != null)
     .map(e => [eventStartId(e), e]));
   const extraStarts = counterparts.filter(e => e.kind === 'tool.start' &&
-    !events.some(selected => eventStartId(selected) === e.id && messageSend(selected)));
-  return {starts, finishes, messageEvents: [...events, ...extraStarts]};
+    !selected.some(e => eventStartId(e) === e.id && messageSend(e)));
+  return {starts, finishes, messageEvents: [...selected, ...extraStarts]};
 }
 
 export function hasPendingSends(events, correlatedEvents = []) {
-  const {finishes} = pageEventContext(events, correlatedEvents);
-  return events.some(e => e.kind === 'tool.start' && messageSend(e) &&
+  const selected = normalizeEvents(events);
+  const {finishes} = pageEventContext(selected, correlatedEvents);
+  return selected.some(e => e.kind === 'tool.start' && messageSend(e) &&
     !finishes.has(e.id) && messageSend(e)?.status !== 'queued' && messageSend(e)?.status !== 'failed');
 }

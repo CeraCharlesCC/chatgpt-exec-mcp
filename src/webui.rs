@@ -221,6 +221,14 @@ async fn asset(Path(path): Path<String>) -> Response {
             "text/javascript; charset=utf-8",
             include_str!("webui/model/messages.js"),
         ),
+        "controllers/activity.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("webui/controllers/activity.js"),
+        ),
+        "controllers/inbox.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("webui/controllers/inbox.js"),
+        ),
         "views/activity.js" => (
             "text/javascript; charset=utf-8",
             include_str!("webui/views/activity.js"),

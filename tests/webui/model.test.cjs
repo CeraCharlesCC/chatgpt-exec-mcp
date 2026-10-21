@@ -1,14 +1,62 @@
 const {test, before} = require('node:test');
 const assert = require('node:assert/strict');
+const {readFileSync} = require('node:fs');
+const {join} = require('node:path');
 
 let eventPools, isMessageEvent, eventIdentities, pageEventContext, messages, coalesceMessages;
+let normalizeEvents, eventStartId;
 before(async () => {
-  ({eventPools, isMessageEvent, eventIdentities, pageEventContext} = await import('../../src/webui/model/events.js'));
+  ({eventPools, isMessageEvent, eventIdentities, pageEventContext, normalizeEvents, eventStartId} = await import('../../src/webui/model/events.js'));
   ({messages, coalesceMessages} = await import('../../src/webui/model/messages.js'));
+});
+
+test('shared Rust serialized fixture normalizes versioned and historical sends at ingress', () => {
+  const {events: wireEvents} = JSON.parse(readFileSync(join(__dirname, '../fixtures/activity-events.json')));
+  const events = normalizeEvents(wireEvents);
+  const [typedStart, typedFinish, legacyStart, legacyFinish] = events;
+  assert.equal(eventStartId(typedFinish), 100, 'typed correlation overrides legacy detail');
+  assert.deepEqual([...eventPools(typedFinish, new Map())], ['beta']);
+  assert.deepEqual([...eventPools(legacyStart, new Map())], ['old']);
+  assert.equal(events[0], normalizeEvents([events[0]])[0], 'an event is normalized only once');
+  const typed = pageEventContext([typedFinish], [typedStart]);
+  const typedRows = messages(typed.messageEvents, typed.finishes, [], [], typed.starts);
+  assert.equal(typedRows.find(m => m.kind === 'message.send')?.message, 'typed body');
+  assert.equal(typedRows.find(m => m.kind === 'message.send')?.message_id, 'message-100');
+  assert.equal(typedRows.find(m => m.kind === 'message.receive')?.message, 'typed incoming');
+  assert.deepEqual([...new Set(eventIdentities(typedFinish, typed.starts, typed.finishes)
+    .filter(a => a.pool === 'beta').map(a => a.agent))].sort(), ['Alice', 'Bob', 'Cara']);
+  const older = pageEventContext([legacyStart], [legacyFinish]);
+  const oldRows = messages(older.messageEvents, older.finishes, [], [], older.starts);
+  assert.equal(oldRows[0].message, 'legacy body');
+  assert.equal(oldRows[0].message_id, 'legacy-201');
 });
 
 const event = (id, kind, detail = {}, other = {}) => ({
   id, kind, detail, timestamp_ms: id, agents: [], session: null, ...other,
+});
+
+test('legacy nested result communications and errors normalize without reconstructing delivery in views', () => {
+  const peer = {pool: 'alpha', message_id: 'nested', from: 'Alice', to: 'Bob', message: 'nested offer'};
+  const receipt = {pool: 'alpha', message_id: 'nested', to: 'Alice', status: 'offered'};
+  const nested = event(92, 'tool.finish', {tool: 'pool_members', result: {value: {
+    agents: ['Alice'], peer_messages: [peer], delivery_receipts: [receipt],
+  }}});
+  assert.equal(isMessageEvent(nested, new Map()), true);
+  assert.deepEqual([...eventPools(nested, new Map())], ['alpha']);
+  assert.deepEqual([...new Set(eventIdentities(nested, new Map(), new Map()).map(a => a.agent))],
+    ['Alice', 'Bob']);
+  assert.deepEqual(messages([nested], new Map(), [], []).map(m => m.message), ['nested offer']);
+  const failure = event(94, 'tool.error', {tool: 'pool_send', start_event_id: 93,
+    result: {value: {error: 'recipient left'}}});
+  const start = event(93, 'tool.start', {tool: 'pool_send', arguments: {
+    pool: 'alpha', target: 'Bob', message: 'failed send',
+  }});
+  const rows = messages([start, failure], new Map([[93, failure]]), [], []);
+  assert.equal(rows.find(m => m.kind === 'message.send')?.status, 'Failed: recipient left');
+  const oldWait = event(96, 'tool.finish', {tool: 'pool_wait', result: {
+    peer_messages: [], value: {messages: [peer]},
+  }});
+  assert.deepEqual(messages([oldWait], new Map(), [], []).map(m => m.message), ['nested offer']);
 });
 
 test('pool_wait messages appear in conversations and offered receipts retain filter identities', () => {

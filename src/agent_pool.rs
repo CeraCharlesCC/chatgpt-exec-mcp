@@ -23,9 +23,9 @@ mod comm_tests;
 mod coordinator;
 mod storage;
 
-use coordinator::PoolCoordinator;
 pub use coordinator::SessionTurn;
-use storage::PoolStorage;
+use coordinator::{ChangeNotifier, PoolCoordinator};
+use storage::{MutationEffect, PoolStorage};
 
 const DEFAULT_TTL_MS: i64 = 86_400_000;
 const MAX_NAME_CHARS: usize = 128;
@@ -311,32 +311,23 @@ async fn blocking_storage<T: Send + 'static>(
         .map_err(|_| storage_error())?
 }
 
-/// A leave result has no affected-row count, so check the old membership only
-/// for leaves. No-op leaves must not masquerade as membership changes.
-fn send_with_membership_change(
-    storage: &PoolStorage,
+/// Run notifications only after storage has committed. Call this on the
+/// blocking worker for async mutations so cancellation of an awaiting caller
+/// cannot hide a committed membership or delivery change.
+fn notify_after_commit(
+    notifier: &ChangeNotifier,
     principal: &str,
-    args: PoolSendArgs,
-    session: Option<&str>,
-) -> Result<(PoolSendResult, bool), McpError> {
-    let was_member = if matches!(args.action, Some(PoolAction::Leave)) {
-        storage
-            .members_state(
-                principal,
-                &PoolMembersArgs {
-                    pool: args.pool.clone(),
-                },
-                session,
-            )?
-            .result
-            .self_agent
-            .is_some()
-    } else {
-        false
-    };
-    let result = storage.send(principal, args, session)?;
-    let changed = was_member || result.assigned_agent.is_some();
-    Ok((result, changed))
+    pool: Option<&str>,
+    effect: MutationEffect,
+) {
+    match effect {
+        MutationEffect::None => {}
+        MutationEffect::Wake => notifier.committed_change(),
+        MutationEffect::MembershipChanged => notifier.committed_membership_change(
+            principal,
+            pool.expect("membership change must identify its pool"),
+        ),
+    }
 }
 
 impl AgentPoolStore {
@@ -449,11 +440,14 @@ impl AgentPoolStore {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<AdminMessagesPage, McpError> {
-        let (page, changed) = self.storage.admin_messages_page(principal, limit, cursor)?;
-        if changed {
-            self.coordinator.committed_change();
-        }
-        Ok(page)
+        let mutation = self.storage.admin_messages_page(principal, limit, cursor)?;
+        notify_after_commit(
+            &self.coordinator.notification_sender(),
+            principal,
+            None,
+            mutation.effect,
+        );
+        Ok(mutation.value)
     }
 
     pub async fn admin_messages_page_async(
@@ -465,12 +459,10 @@ impl AgentPoolStore {
         let principal = principal.to_owned();
         let cursor = cursor.map(str::to_owned);
         let notifications = self.coordinator.notification_sender();
-        let (page, _) = blocking_storage(Arc::clone(&self.storage), move |storage| {
-            let result = storage.admin_messages_page(&principal, limit, cursor.as_deref())?;
-            if result.1 {
-                notifications.committed_change();
-            }
-            Ok(result)
+        let page = blocking_storage(Arc::clone(&self.storage), move |storage| {
+            let mutation = storage.admin_messages_page(&principal, limit, cursor.as_deref())?;
+            notify_after_commit(&notifications, &principal, None, mutation.effect);
+            Ok(mutation.value)
         })
         .await?;
         // Notification is emitted in the blocking task after the commit,
@@ -517,11 +509,16 @@ impl AgentPoolStore {
         message: &str,
         in_reply_to: Option<&str>,
     ) -> Result<PoolSendResult, McpError> {
-        let result = self
+        let mutation = self
             .storage
             .admin_send(principal, pool, target, message, in_reply_to)?;
-        self.coordinator.committed_change();
-        Ok(result)
+        notify_after_commit(
+            &self.coordinator.notification_sender(),
+            principal,
+            Some(pool),
+            mutation.effect,
+        );
+        Ok(mutation.value)
     }
 
     pub async fn admin_send_async(
@@ -539,10 +536,10 @@ impl AgentPoolStore {
         let in_reply_to = in_reply_to.map(str::to_owned);
         let notifications = self.coordinator.notification_sender();
         let result = blocking_storage(Arc::clone(&self.storage), move |storage| {
-            let result =
+            let mutation =
                 storage.admin_send(&principal, &pool, &target, &message, in_reply_to.as_deref())?;
-            notifications.committed_change();
-            Ok(result)
+            notify_after_commit(&notifications, &principal, Some(&pool), mutation.effect);
+            Ok(mutation.value)
         })
         .await?;
         Ok(result)
@@ -554,14 +551,14 @@ impl AgentPoolStore {
         pool: &str,
         agent: &str,
     ) -> Result<bool, McpError> {
-        let result = self.storage.admin_terminate(principal, pool, agent)?;
-        if result {
-            self.coordinator
-                .committed_membership_change(principal, pool);
-        } else {
-            self.coordinator.committed_change();
-        }
-        Ok(result)
+        let mutation = self.storage.admin_terminate(principal, pool, agent)?;
+        notify_after_commit(
+            &self.coordinator.notification_sender(),
+            principal,
+            Some(pool),
+            mutation.effect,
+        );
+        Ok(mutation.value)
     }
 
     pub async fn admin_terminate_async(
@@ -575,13 +572,9 @@ impl AgentPoolStore {
         let agent = agent.to_owned();
         let notifications = self.coordinator.notification_sender();
         let result = blocking_storage(Arc::clone(&self.storage), move |storage| {
-            let result = storage.admin_terminate(&principal, &pool, &agent)?;
-            if result {
-                notifications.committed_membership_change(&principal, &pool);
-            } else {
-                notifications.committed_change();
-            }
-            Ok(result)
+            let mutation = storage.admin_terminate(&principal, &pool, &agent)?;
+            notify_after_commit(&notifications, &principal, Some(&pool), mutation.effect);
+            Ok(mutation.value)
         })
         .await?;
         Ok(result)
@@ -644,15 +637,14 @@ impl AgentPoolStore {
         session: Option<&str>,
     ) -> Result<PoolSendResult, McpError> {
         let pool = args.pool.clone();
-        let (result, membership_changed) =
-            send_with_membership_change(&self.storage, principal, args, session)?;
-        if membership_changed {
-            self.coordinator
-                .committed_membership_change(principal, &pool);
-        } else {
-            self.coordinator.committed_change();
-        }
-        Ok(result)
+        let mutation = self.storage.send_with_effects(principal, args, session)?;
+        notify_after_commit(
+            &self.coordinator.notification_sender(),
+            principal,
+            Some(&pool),
+            mutation.effect,
+        );
+        Ok(mutation.value)
     }
 
     pub async fn send_async(
@@ -666,14 +658,9 @@ impl AgentPoolStore {
         let pool = args.pool.clone();
         let notifications = self.coordinator.notification_sender();
         let result = blocking_storage(Arc::clone(&self.storage), move |storage| {
-            let (result, membership_changed) =
-                send_with_membership_change(storage, &principal, args, session.as_deref())?;
-            if membership_changed {
-                notifications.committed_membership_change(&principal, &pool);
-            } else {
-                notifications.committed_change();
-            }
-            Ok(result)
+            let mutation = storage.send_with_effects(&principal, args, session.as_deref())?;
+            notify_after_commit(&notifications, &principal, Some(&pool), mutation.effect);
+            Ok(mutation.value)
         })
         .await?;
         Ok(result)
