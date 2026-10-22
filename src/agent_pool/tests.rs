@@ -489,6 +489,223 @@ fn default_name_allocation_reuses_first_available_gap() {
 }
 
 #[test]
+fn rejoin_prefers_previous_name_without_advancing_rotation() {
+    for policy in [
+        AgentNameAllocation::FirstAvailable,
+        AgentNameAllocation::RoundRobin,
+    ] {
+        for target in ["global", "admin"] {
+            let (_directory, store) = store_with_allocation(policy);
+            let assigned = |session: &str| {
+                store
+                    .send("owner", send("p", target, "join"), Some(session))
+                    .unwrap()
+                    .assigned_agent
+                    .unwrap()
+            };
+            assert_eq!(assigned("a"), "alice");
+            assert_eq!(assigned("b"), "bob");
+            assert_eq!(assigned("c"), "carol");
+            for session in ["a", "b", "c"] {
+                store.send("owner", leave("p"), Some(session)).unwrap();
+            }
+            // An earlier dictionary gap must not take precedence over bob.
+            assert_eq!(assigned("b"), "bob");
+            assert_eq!(
+                assigned("d"),
+                if policy == AgentNameAllocation::RoundRobin {
+                    "dave"
+                } else {
+                    "alice"
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn occupied_previous_name_falls_back_and_remembers_the_new_name() {
+    for policy in [
+        AgentNameAllocation::FirstAvailable,
+        AgentNameAllocation::RoundRobin,
+    ] {
+        let (_directory, store) = store_with_allocation(policy);
+        let assigned = |session: &str| {
+            store
+                .send("owner", send("p", "global", "join"), Some(session))
+                .unwrap()
+                .assigned_agent
+                .unwrap()
+        };
+        for (session, name) in [("a", "alice"), ("b", "bob"), ("c", "carol"), ("d", "dave")] {
+            assert_eq!(assigned(session), name);
+        }
+        store.send("owner", leave("p"), Some("b")).unwrap();
+        assert_eq!(assigned("replacement"), "bob"); // No reservation.
+        store.send("owner", leave("p"), Some("c")).unwrap();
+        assert_eq!(assigned("b"), "carol");
+        store.send("owner", leave("p"), Some("b")).unwrap();
+        store
+            .send("owner", leave("p"), Some("replacement"))
+            .unwrap();
+        assert_eq!(assigned("b"), "carol"); // Latest name wins, even with bob free.
+    }
+}
+
+#[test]
+fn failed_rejoin_preserves_previous_name_and_rotation() {
+    for policy in [
+        AgentNameAllocation::FirstAvailable,
+        AgentNameAllocation::RoundRobin,
+    ] {
+        for preferred_available in [false, true] {
+            let (_directory, store) = store_with_allocation(policy);
+            let assigned = |session: &str| {
+                store
+                    .send("owner", send("p", "global", "join"), Some(session))
+                    .unwrap()
+                    .assigned_agent
+                    .unwrap()
+            };
+            for session in ["a", "b", "c", "d"] {
+                assigned(session);
+            }
+            store.send("owner", leave("p"), Some("b")).unwrap();
+            assert_eq!(assigned("replacement"), "bob");
+            store.send("owner", leave("p"), Some("c")).unwrap();
+            if preferred_available {
+                store
+                    .send("owner", leave("p"), Some("replacement"))
+                    .unwrap();
+            }
+            // This would restore bob or fall back to carol, then fails resolving its target.
+            assert!(
+                store
+                    .send("owner", send("p", "missing", "fail"), Some("b"))
+                    .is_err()
+            );
+            assert!(
+                store
+                    .members("owner", PoolMembersArgs { pool: "p".into() }, Some("b"))
+                    .unwrap()
+                    .self_agent
+                    .is_none()
+            );
+            if !preferred_available {
+                store
+                    .send("owner", leave("p"), Some("replacement"))
+                    .unwrap();
+            }
+            assert_eq!(assigned("b"), "bob");
+            assert_eq!(assigned("next"), "carol");
+        }
+    }
+}
+
+#[test]
+fn previous_names_are_scoped_to_account_pool_and_session() {
+    let (_directory, store) = store();
+    let assigned = |owner: &str, pool: &str, session: &str| {
+        store
+            .send(owner, send(pool, "global", "join"), Some(session))
+            .unwrap()
+            .assigned_agent
+            .unwrap()
+    };
+    assert_eq!(assigned("owner", "p", "a"), "alice");
+    assert_eq!(assigned("owner", "p", "shared"), "bob");
+    for session in ["a", "shared"] {
+        store.send("owner", leave("p"), Some(session)).unwrap();
+    }
+    assert_eq!(assigned("owner", "q", "shared"), "alice");
+    assert_eq!(assigned("other", "p", "shared"), "alice");
+    assert_eq!(assigned("owner", "p", "new"), "alice");
+    assert_eq!(assigned("owner", "p", "shared"), "bob");
+}
+
+#[test]
+fn restart_forgets_previous_names_but_leave_remembers_surviving_memberships() {
+    for leave_before_restart in [false, true] {
+        let (directory, store) = store();
+        for session in ["a", "b"] {
+            store
+                .send("owner", send("p", "global", "join"), Some(session))
+                .unwrap();
+        }
+        store.send("owner", leave("p"), Some("a")).unwrap();
+        if leave_before_restart {
+            store.send("owner", leave("p"), Some("b")).unwrap();
+        }
+        drop(store);
+        let resumed = AgentPoolStore::open_with_names(
+            &directory.path().join("agent-pool.sqlite3"),
+            Duration::from_millis(DEFAULT_TTL_MS as u64),
+            ["alice", "bob", "carol", "dave"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+        .unwrap();
+        if !leave_before_restart {
+            // No send after restart: leaving the persisted membership must remember bob.
+            resumed.send("owner", leave("p"), Some("b")).unwrap();
+        }
+        assert_eq!(
+            resumed
+                .send("owner", send("p", "global", "back"), Some("b"))
+                .unwrap()
+                .assigned_agent
+                .as_deref(),
+            Some(if leave_before_restart { "alice" } else { "bob" })
+        );
+    }
+}
+
+#[test]
+fn lease_expiry_preserves_preferred_name_with_a_fresh_membership() {
+    for policy in [
+        AgentNameAllocation::FirstAvailable,
+        AgentNameAllocation::RoundRobin,
+    ] {
+        let (_directory, store) = store_with_allocation(policy);
+        for session in ["a", "b"] {
+            store
+                .send("owner", send("p", "global", "join"), Some(session))
+                .unwrap();
+        }
+        let old_id: i64 = {
+            let connection = store.storage.connection().unwrap();
+            let id = connection
+                .query_row("SELECT id FROM members WHERE session='b'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            connection
+                .execute("UPDATE members SET expires=?1", [now_ms() - 1])
+                .unwrap();
+            id
+        };
+        assert_eq!(
+            store
+                .send("owner", send("p", "global", "back"), Some("b"))
+                .unwrap()
+                .assigned_agent
+                .as_deref(),
+            Some("bob")
+        );
+        let new_id: i64 = store
+            .storage
+            .connection()
+            .unwrap()
+            .query_row("SELECT id FROM members WHERE session='b'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_ne!(old_id, new_id);
+    }
+}
+
+#[test]
 fn name_rotation_skips_earlier_gaps_and_wraps() {
     let (_directory, store) = store_with_allocation(AgentNameAllocation::RoundRobin);
     let assigned = |session: &str| {

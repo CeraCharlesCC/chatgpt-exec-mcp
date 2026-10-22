@@ -115,6 +115,12 @@ Existing memberships keep their names under either policy. When all names are
 in use, new memberships are rejected until a member expires or leaves with
 `pool_send(pool=..., action="leave")`.
 
+Under either policy, rejoining with the same account, pool, and `openai/session`
+prefers the previously assigned name when free, then falls back to the configured
+policy. Restoring the previous name does not advance round-robin rotation.
+Name preferences are bounded and kept only until core restart; see
+[Membership](agent-pools.md#membership).
+
 ## Unix Streamable HTTP
 
 Add `--listen-unix /absolute/path/mcp.sock` to serve HTTP. The socket's parent

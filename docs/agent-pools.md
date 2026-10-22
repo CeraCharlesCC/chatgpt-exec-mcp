@@ -69,6 +69,15 @@ messages expire after one day, configurable with `membership_ttl_seconds`.
 `pool_send(pool="...", action="leave")` removes only the calling chat's
 membership in that pool.
 
+Rejoining with the same account, pool, and `_meta["openai/session"]` prefers
+the last assigned name if it is free. Names are not reserved while absent;
+if the name is occupied, the configured allocation policy chooses another
+name, which becomes the new preference. This also applies after lease expiry.
+Preferences are kept only in memory, reset on core restart, and hold up to
+10,000 account/pool/session combinations, evicting the oldest inserted entry
+when full. A surviving membership can establish its preference again by leaving.
+Rejoining creates a new membership without restoring old messages or receipts.
+
 ## Deployment
 
 Pool state is stored in SQLite. Keep the database outside release directories

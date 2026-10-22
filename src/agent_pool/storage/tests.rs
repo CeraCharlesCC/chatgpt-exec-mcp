@@ -38,6 +38,23 @@ fn add_obsolete_columns(connection: &Connection) {
 }
 
 #[test]
+fn remembered_names_are_bounded_and_updates_do_not_duplicate_eviction_entries() {
+    let mut allocation = NameAllocationState::default();
+    let key = |session: usize| ("owner".to_owned(), "p".to_owned(), session.to_string());
+    for session in 0..MAX_REMEMBERED_NAMES {
+        allocation.remember(key(session), 0);
+    }
+    allocation.remember(key(1), 1);
+    assert_eq!(allocation.previous_names[&key(1)], 1);
+    assert_eq!(allocation.previous_name_order.len(), MAX_REMEMBERED_NAMES);
+    allocation.remember(key(MAX_REMEMBERED_NAMES), 0);
+    assert!(!allocation.previous_names.contains_key(&key(0)));
+    assert_eq!(allocation.previous_names[&key(1)], 1);
+    assert_eq!(allocation.previous_names.len(), MAX_REMEMBERED_NAMES);
+    assert_eq!(allocation.previous_name_order.len(), MAX_REMEMBERED_NAMES);
+}
+
+#[test]
 fn obsolete_member_column_migration_preserves_database_and_reoffers() {
     use std::os::unix::fs::PermissionsExt;
 

@@ -260,11 +260,7 @@ async fn piggyback_agent_pool_round_robin_acceptance_path() {
 
 async fn agent_pool_acceptance_path(allocation: Option<&str>) {
     let mut server = Server::with_name_allocation(allocation).await;
-    let rejoined_agent = if allocation == Some("round_robin") {
-        "Livia"
-    } else {
-        "Augustus"
-    };
+    let rejoined_agent = "Augustus";
 
     let empty = server.exec("unjoined").await;
     assert_eq!(structured(&empty), &json!({"exit_code": 0}));

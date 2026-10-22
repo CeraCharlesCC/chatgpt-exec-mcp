@@ -267,19 +267,33 @@ impl PoolStorage {
         // Observe the deleted row as part of this *same* transaction, rather
         // than reading membership in the facade and racing the actual leave.
         // Expired rows can also be deleted, but were never active observers.
-        let left_active: Option<bool> = transaction
+        let left: Option<(bool, String)> = transaction
             .query_row(
                 "DELETE FROM members WHERE principal=?1 AND pool=?2 AND session=?3
-                 RETURNING expires>?4",
+                 RETURNING expires>?4,agent",
                 params![principal, pool, session, now],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|_| storage_error())?;
+        // Lock before commit so no fallible operation separates a committed
+        // leave from remembering a membership loaded from an earlier run.
+        let mut allocation = self
+            .name_allocation_state
+            .lock()
+            .map_err(|_| storage_error())?;
         transaction.commit().map_err(|_| storage_error())?;
+        if let Some((_, agent)) = &left
+            && let Some(index) = self.agent_names.iter().position(|name| name == agent)
+        {
+            allocation.remember(
+                (principal.to_owned(), pool.to_owned(), session.to_owned()),
+                index,
+            );
+        }
         Ok(Mutation::new(
             PoolSendResult::default(),
-            if left_active.unwrap_or(false) {
+            if left.is_some_and(|(active, _)| active) {
                 MutationEffect::MembershipChanged
             } else {
                 MutationEffect::Wake
@@ -330,21 +344,30 @@ impl PoolStorage {
             .map_err(|_| storage_error())?;
 
         let cursor_key = (principal.to_owned(), pool.to_owned());
-        // Advance rotation only after a successful first send commits.
-        let mut name_cursors =
-            if bound.is_none() && self.name_allocation == AgentNameAllocation::RoundRobin {
-                Some(self.name_cursors.lock().map_err(|_| storage_error())?)
-            } else {
-                None
-            };
-        let (sender_id, sender, assigned_agent, allocated_index) = match bound {
+        let preference_key = (principal.to_owned(), pool.to_owned(), session.to_owned());
+        // Always acquire SQLite before this lock, and publish memory changes
+        // only after commit. A failed send must preserve both preferences and rotation.
+        let mut allocation = self
+            .name_allocation_state
+            .lock()
+            .map_err(|_| storage_error())?;
+        let (sender_id, sender, assigned_agent, assignment) = match bound {
             Some((member_id, agent)) => (member_id, agent, None, None),
             None => {
-                let last_index = name_cursors
-                    .as_ref()
-                    .and_then(|cursors| cursors.get(&cursor_key).copied());
-                let (index, agent) =
-                    self.allocate_agent_name(&transaction, principal, pool, last_index, now)?;
+                let last_index = if self.name_allocation == AgentNameAllocation::RoundRobin {
+                    allocation.cursors.get(&cursor_key).copied()
+                } else {
+                    None
+                };
+                let preferred_index = allocation.previous_names.get(&preference_key).copied();
+                let (index, agent) = self.allocate_agent_name(
+                    &transaction,
+                    principal,
+                    pool,
+                    preferred_index,
+                    last_index,
+                    now,
+                )?;
                 transaction
                     .execute(
                         "INSERT INTO members(principal,pool,agent,session,expires,last_seen)
@@ -363,7 +386,7 @@ impl PoolStorage {
                     transaction.last_insert_rowid(),
                     agent.clone(),
                     Some(agent),
-                    Some(index),
+                    Some((index, preferred_index != Some(index))),
                 )
             }
         };
@@ -403,8 +426,11 @@ impl PoolStorage {
                 )
                 .map_err(|_| storage_error())?;
             transaction.commit().map_err(|_| storage_error())?;
-            if let (Some(cursors), Some(index)) = (name_cursors.as_mut(), allocated_index) {
-                cursors.insert(cursor_key, index);
+            if let Some((index, rotate)) = assignment {
+                if rotate && self.name_allocation == AgentNameAllocation::RoundRobin {
+                    allocation.cursors.insert(cursor_key, index);
+                }
+                allocation.remember(preference_key, index);
             }
             let effect = if assigned_agent.is_some() {
                 MutationEffect::MembershipChanged
@@ -445,8 +471,11 @@ impl PoolStorage {
             &targets,
         )?;
         transaction.commit().map_err(|_| storage_error())?;
-        if let (Some(cursors), Some(index)) = (name_cursors.as_mut(), allocated_index) {
-            cursors.insert(cursor_key, index);
+        if let Some((index, rotate)) = assignment {
+            if rotate && self.name_allocation == AgentNameAllocation::RoundRobin {
+                allocation.cursors.insert(cursor_key, index);
+            }
+            allocation.remember(preference_key, index);
         }
         let effect = if assigned_agent.is_some() {
             MutationEffect::MembershipChanged
@@ -470,12 +499,15 @@ impl PoolStorage {
         transaction: &rusqlite::Transaction<'_>,
         principal: &str,
         pool: &str,
+        preferred_index: Option<usize>,
         last_index: Option<usize>,
         now: i64,
     ) -> Result<(usize, String), McpError> {
         let start = last_index.map_or(0, |index| (index + 1) % self.agent_names.len());
-        for offset in 0..self.agent_names.len() {
-            let index = (start + offset) % self.agent_names.len();
+        let normal_order = (0..self.agent_names.len())
+            .map(|offset| (start + offset) % self.agent_names.len())
+            .filter(|index| Some(*index) != preferred_index);
+        for index in preferred_index.into_iter().chain(normal_order) {
             let candidate = &self.agent_names[index];
             let occupied: Option<(i64, i64)> = transaction
                 .query_row(

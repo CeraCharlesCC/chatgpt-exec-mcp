@@ -1,7 +1,7 @@
 //! Atomic pool persistence: membership, message fanout, inbox offers and ACKs.
 //! This component never awaits or owns notification subscriptions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -25,6 +25,7 @@ const MAX_BATCH_COUNT: usize = 32;
 const MAX_BATCH_BYTES: usize = 128 * 1024;
 const MAX_MESSAGE_BYTES: usize = 65_536;
 const MAX_ADMIN_MESSAGES: i64 = 1_000;
+const MAX_REMEMBERED_NAMES: usize = 10_000;
 // Keep routine reads free of global cleanup. The detached maintenance loop
 // works in small transactions and releases its connection when the store dies.
 const EXPIRY_BATCH_SIZE: i64 = 128;
@@ -35,9 +36,29 @@ pub(super) struct PoolStorage {
     lease_ttl_ms: i64,
     agent_names: Arc<[String]>,
     name_allocation: AgentNameAllocation,
-    // Last successfully assigned dictionary index for each account/pool.
-    // Memberships are durable, but the rotation itself resets on core restart.
-    name_cursors: Mutex<HashMap<(String, String), usize>>,
+    // Memberships are durable; rotation and name preferences reset on restart.
+    name_allocation_state: Mutex<NameAllocationState>,
+}
+
+#[derive(Default)]
+struct NameAllocationState {
+    cursors: HashMap<(String, String), usize>,
+    previous_names: HashMap<(String, String, String), usize>,
+    previous_name_order: VecDeque<(String, String, String)>,
+}
+
+impl NameAllocationState {
+    fn remember(&mut self, key: (String, String, String), index: usize) {
+        if !self.previous_names.contains_key(&key) {
+            if self.previous_names.len() == MAX_REMEMBERED_NAMES
+                && let Some(oldest) = self.previous_name_order.pop_front()
+            {
+                self.previous_names.remove(&oldest);
+            }
+            self.previous_name_order.push_back(key.clone());
+        }
+        self.previous_names.insert(key, index);
+    }
 }
 
 pub(super) struct MembersState {
@@ -172,7 +193,7 @@ impl PoolStorage {
             lease_ttl_ms,
             agent_names: agent_names.into(),
             name_allocation,
-            name_cursors: Mutex::new(HashMap::new()),
+            name_allocation_state: Mutex::new(NameAllocationState::default()),
         })
     }
 

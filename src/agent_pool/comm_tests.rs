@@ -251,34 +251,42 @@ async fn receipt_survives_original_message_pruning_and_restart() {
 #[tokio::test]
 async fn reused_sender_names_never_receive_the_previous_memberships_receipts() {
     for offer_before_leave in [false, true] {
-        let (_directory, store) = store();
-        join_pair(&store);
-        collect(&store, "a").await;
-        store
-            .send("owner", send("p", "bob", "old sender"), Some("a"))
-            .unwrap();
-        if offer_before_leave {
-            collect(&store, "b").await;
+        for session in ["a", "replacement"] {
+            let (_directory, store) = store();
+            join_pair(&store);
+            collect(&store, "a").await;
+            store
+                .send("owner", send("p", "bob", "old sender"), Some("a"))
+                .unwrap();
+            if offer_before_leave {
+                collect(&store, "b").await;
+            }
+            store.send("owner", leave("p"), Some("a")).unwrap();
+            let new = store
+                .send("owner", send("p", "global", "new sender"), Some(session))
+                .unwrap();
+            assert_eq!(new.assigned_agent.as_deref(), Some("alice"));
+            if !offer_before_leave {
+                collect(&store, "b").await;
+            }
+            assert!(collect(&store, session).await.delivery_receipts.is_empty());
         }
-        store.send("owner", leave("p"), Some("a")).unwrap();
-        let new = store
-            .send(
-                "owner",
-                send("p", "global", "new sender"),
-                Some("replacement"),
-            )
-            .unwrap();
-        assert_eq!(new.assigned_agent.as_deref(), Some("alice"));
-        if !offer_before_leave {
-            collect(&store, "b").await;
-        }
-        assert!(
-            collect(&store, "replacement")
-                .await
-                .delivery_receipts
-                .is_empty()
-        );
     }
+}
+
+#[tokio::test]
+async fn rejoining_same_session_and_name_does_not_restore_old_inbox() {
+    let (_directory, store) = store();
+    join_pair(&store);
+    store
+        .send("owner", send("p", "bob", "old unread message"), Some("a"))
+        .unwrap();
+    store.send("owner", leave("p"), Some("b")).unwrap();
+    let rejoined = store
+        .send("owner", send("p", "global", "back"), Some("b"))
+        .unwrap();
+    assert_eq!(rejoined.assigned_agent.as_deref(), Some("bob"));
+    assert!(collect(&store, "b").await.is_empty());
 }
 
 #[tokio::test]
