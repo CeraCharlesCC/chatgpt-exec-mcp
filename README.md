@@ -57,6 +57,7 @@ See [Configuration](docs/configuration.md) for all settings.
 | `exec_command` | Run a shell command. Long-running commands can continue through a session ID. |
 | `write_stdin` | Send input, interrupt a process, or poll pending output. |
 | `wait_for_exit` | Wait for a running process to finish without polling ordinary output. |
+| `view_image` (opt-in) | Return a local image as MCP image content. Enable with `"view_image": true` in the server configuration. |
 
 `exec_command` also starts interactive shells and REPLs. Set `tty=true` when
 a terminal is needed. If a process is still running, use its returned
@@ -64,6 +65,11 @@ a terminal is needed. If a process is still running, use its returned
 
 Large outputs are bounded in MCP responses. When the complete capture is stored
 separately, the result includes an `output_ref` that points to the retained log.
+
+`view_image(path="screenshots/result.png")` accepts workspace-relative or absolute
+paths to PNG, JPEG, GIF, and WebP files up to 10 MiB. It returns the original
+image without resizing; the MCP client must support image content. See
+[Image viewing](docs/configuration.md#image-viewing).
 
 ## Agent pools
 

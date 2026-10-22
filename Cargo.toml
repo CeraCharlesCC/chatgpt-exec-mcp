@@ -1,6 +1,6 @@
 [package]
 name = "chatgpt-exec-mcp"
-version = "0.4.2"
+version = "0.4.4"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -15,6 +15,7 @@ resolver = "3"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 codex-utils-pty = { path = "vendor/codex-utils-pty" }
 rand = "0.9"
 libc = "0.2"

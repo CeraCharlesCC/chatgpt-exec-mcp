@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use crate::agent_pool::{Communications, DeliveryReceipt, PeerMessage};
 use crate::tools::ExecResponse;
+use crate::view_image::LoadedImage;
 
 /// Activity diagnostics retain internal delivery timestamps.
 pub(super) fn with_internal_comms(mut detail: Value, comms: &Communications) -> Value {
@@ -76,6 +77,26 @@ pub(super) fn pool_result<T: Serialize>(
             }
             Ok(result)
         }
+    }
+}
+
+pub(super) fn image_result(
+    result: anyhow::Result<LoadedImage>,
+    comms: Communications,
+) -> CallToolResult {
+    match result {
+        Ok(image) => {
+            let mut result =
+                CallToolResult::success(vec![ContentBlock::image(image.data, image.mime_type)]);
+            if !comms.is_empty() {
+                let mut text = String::new();
+                append_comms_block(&mut text, &comms);
+                result.content.push(ContentBlock::text(text));
+                result.structured_content = Some(with_agent_comms(json!({}), &comms));
+            }
+            result
+        }
+        Err(error) => tool_error(error, comms),
     }
 }
 

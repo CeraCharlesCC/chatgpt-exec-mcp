@@ -18,6 +18,7 @@ pub struct Config {
     pub output_store_retention: Duration,
     pub output_store_max_bytes: u64,
     pub agent_pool: Option<AgentPoolConfig>,
+    pub view_image: bool,
     pub(crate) additional_instructions: Option<String>,
     pub(crate) child_env: ChildEnv,
 }
@@ -68,6 +69,8 @@ struct FileConfig {
     shell: PathBuf,
     output_store_dir: PathBuf,
     child_env: EnvConfig,
+    #[serde(default)]
+    view_image: bool,
     #[serde(default, deserialize_with = "present_agent_pool")]
     agent_pool: Option<FileAgentPoolConfig>,
     #[serde(default, deserialize_with = "present_path")]
@@ -341,6 +344,7 @@ impl Config {
             output_store_retention: Duration::from_secs(raw.output_store_retention),
             output_store_max_bytes: raw.output_store_max_bytes,
             agent_pool,
+            view_image: raw.view_image,
         };
         config.validate_limits()?;
         Ok(config)

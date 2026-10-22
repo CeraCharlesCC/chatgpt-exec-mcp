@@ -18,7 +18,7 @@ use crate::agent_pool::{
 };
 use crate::agent_pool_context::AgentPoolContext;
 use crate::process_manager::ProcessManager;
-use crate::tools::{ExecCommandArgs, ExecResponse, WaitForExitArgs, WriteStdinArgs};
+use crate::tools::{ExecCommandArgs, ExecResponse, ViewImageArgs, WaitForExitArgs, WriteStdinArgs};
 
 mod coordination;
 mod response;
@@ -40,6 +40,9 @@ impl ExecMcpServer {
         tool_router.disable_route("pool_members");
         tool_router.disable_route("pool_send");
         tool_router.disable_route("pool_wait");
+        if manager.view_image_workspace().is_none() {
+            tool_router.disable_route("view_image");
+        }
         Self {
             manager,
             tool_router,
@@ -316,6 +319,30 @@ impl ExecMcpServer {
                 Communications::default()
             }
         }
+    }
+
+    /// View a local image as MCP image content. Returns original bytes without resizing.
+    #[tool(annotations(read_only_hint = true))]
+    async fn view_image(
+        &self,
+        Parameters(args): Parameters<ViewImageArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let workspace = self
+            .manager
+            .view_image_workspace()
+            .ok_or_else(|| McpError::invalid_params("view_image is disabled", None))?;
+        let call = ToolCall::begin(
+            self,
+            "view_image",
+            &context,
+            || json!({"path": &args.path}),
+            ActivityContext::default(),
+            false,
+        )
+        .await?;
+        let result = crate::view_image::load(workspace, args.path).await;
+        call.finish_image(result).await
     }
 
     /// List leased members immediately. Does not join; use pool_wait to wait.

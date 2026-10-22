@@ -18,6 +18,16 @@ pub const MIN_YIELD_MS: u64 = 10;
 pub const MAX_YIELD_MS: u64 = 120_000;
 pub const MIN_WAIT_SECONDS: u64 = 15;
 pub const MAX_WAIT_SECONDS: u64 = 100;
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ViewImageArgs {
+    /// Local PNG, JPEG, GIF, or WebP file (at most 10 MiB). Relative to workspace; absolute paths are accepted. Not a sandbox boundary.
+    #[schemars(length(min = 1))]
+    pub path: String,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]

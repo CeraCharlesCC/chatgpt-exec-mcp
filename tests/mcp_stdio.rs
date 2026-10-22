@@ -63,3 +63,5 @@ mod discovery;
 #[cfg(unix)]
 #[path = "mcp_stdio/environment.rs"]
 mod environment;
+#[path = "mcp_stdio/view_image.rs"]
+mod view_image;

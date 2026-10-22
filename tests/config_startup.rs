@@ -177,6 +177,28 @@ fn rejects_schema_errors_and_invalid_paths_and_limits() {
 }
 
 #[test]
+fn view_image_is_an_opt_in_boolean() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("config.json");
+    for enabled in [None, Some(false), Some(true)] {
+        let mut value = config();
+        if let Some(enabled) = enabled {
+            value["view_image"] = json!(enabled);
+        }
+        std::fs::write(&path, value.to_string()).unwrap();
+        assert_eq!(
+            chatgpt_exec_mcp::Config::load(&path).unwrap().view_image,
+            enabled.unwrap_or(false)
+        );
+    }
+    for invalid in [Value::Null, json!("true"), json!(1), json!({})] {
+        let mut value = config();
+        value["view_image"] = invalid;
+        rejected(&value.to_string(), &[], "config schema invalid");
+    }
+}
+
+#[test]
 fn removed_session_settings_are_rejected() {
     for field in [
         "max_explicit_sessions",

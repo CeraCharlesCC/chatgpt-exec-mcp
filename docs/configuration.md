@@ -22,6 +22,26 @@ Optional `instructions_file` points to a UTF-8 file whose contents are appended
 to the server's instructions. Use only the documented fields, and omit unused
 optional fields rather than setting them to null.
 
+## Image viewing
+
+The optional `view_image` boolean defaults to `false`. Add `"view_image": true`
+to the top-level configuration and restart to expose the `view_image` tool.
+When disabled, the tool is absent from `tools/list` and cannot be called.
+
+Call `view_image(path="screenshots/result.png")` to view a local image. Relative
+paths resolve against `workspace`; absolute paths and symlinks are accepted with
+the server process's filesystem permissions, just like shell commands.
+
+PNG, JPEG, GIF, and WebP files up to 10 MiB (10485760 bytes, before Base64 encoding)
+are supported. The MIME type is detected from the file signature, not its
+extension. Files must be regular files. Missing files, unsupported signatures,
+and files above the size limit return tool errors.
+
+The tool passes the original bytes through without decoding, resizing, or
+conversion, using the standard MCP `image` content block with Base64 `data` and
+`mimeType`. Image display requires a client that supports MCP image content.
+Image bytes are not retained in the diagnostic activity feed.
+
 ## Optional limits
 
 Durations are integer seconds. Omitted fields use these defaults.

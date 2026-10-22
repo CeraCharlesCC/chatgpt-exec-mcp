@@ -115,6 +115,10 @@ impl ProcessManager {
         }))
     }
 
+    pub(crate) fn view_image_workspace(&self) -> Option<&Path> {
+        self.config.view_image.then_some(&self.config.workspace)
+    }
+
     pub(crate) fn instructions(&self) -> String {
         let default_instructions = concat!(
             "Use exec_command to start commands, shells, and REPLs; tty only selects a PTY. Reuse session_id with write_stdin to preserve process state. ",

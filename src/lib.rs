@@ -14,6 +14,7 @@ pub mod session_id;
 pub mod tools;
 #[cfg(unix)]
 pub mod transport;
+mod view_image;
 pub mod webui;
 
 pub use config::Config;

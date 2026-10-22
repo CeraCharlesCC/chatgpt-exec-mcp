@@ -12,6 +12,7 @@ use super::{ExecMcpServer, response};
 use crate::activity::{ActivityContext, ActivityEmissionContext, ActivityMessageStatus};
 use crate::agent_pool::{Communications, PoolSendResult, SessionTurn};
 use crate::tools::ExecResponse;
+use crate::view_image::LoadedImage;
 
 pub(super) struct ToolCall<'a> {
     server: &'a ExecMcpServer,
@@ -148,6 +149,23 @@ impl<'a> ToolCall<'a> {
         })
         .await;
         response::respond(result, comms)
+    }
+
+    pub(super) async fn finish_image(
+        mut self,
+        result: anyhow::Result<LoadedImage>,
+    ) -> Result<CallToolResult, McpError> {
+        let comms = self.collect().await;
+        self.record(result.is_ok(), Some(&comms), || {
+            // Keep image bytes out of diagnostic activity history.
+            let detail = match &result {
+                Ok(image) => json!({"mime_type": image.mime_type, "bytes": image.byte_len}),
+                Err(error) => json!({"error": error.to_string()}),
+            };
+            response::with_internal_comms(detail, &comms)
+        })
+        .await;
+        Ok(response::image_result(result, comms))
     }
 
     pub(super) async fn finish_wait_success(

@@ -10,6 +10,9 @@ use tempfile::TempDir;
 
 const PRINCIPAL: &str = "account-a";
 
+#[path = "mcp_agent_pool_http/view_image.rs"]
+mod view_image;
+
 struct Server {
     child: Option<Child>,
     workspace: TempDir,
