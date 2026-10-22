@@ -164,7 +164,7 @@ impl OutputStoreManager {
     fn reserve_bytes(&self, bytes: u64) -> io::Result<()> {
         self.inner
             .used_bytes
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current
                     .checked_add(bytes)
                     .filter(|next| *next <= self.inner.max_bytes)
